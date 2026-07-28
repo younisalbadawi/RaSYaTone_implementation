@@ -7,13 +7,15 @@ import shutil
 import shlex
 import subprocess
 import sys
-import tempfile
 import textwrap
 from typing import Iterable, Mapping, Sequence
 
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+
+LATEST_PG_MAJOR = 18
+PG_MAJOR_COUNT = 5
 
 
 def is_windows() -> bool:
@@ -62,6 +64,25 @@ def prompt_choice(title: str, options: Sequence[str]) -> int:
             if 1 <= idx <= len(options):
                 return idx - 1
         print("Invalid selection.")
+
+
+def default_postgres_majors() -> list[int]:
+    latest = LATEST_PG_MAJOR
+    return list(range(latest, latest - PG_MAJOR_COUNT, -1))
+
+
+def prompt_postgres_major() -> int:
+    majors = default_postgres_majors()
+    options = [f"{m} (recommended)" if i == 0 else str(m) for i, m in enumerate(majors)]
+    options.append("Other (enter manually)")
+    idx = prompt_choice("Select PostgreSQL major version", options)
+    if idx < len(majors):
+        return majors[idx]
+    while True:
+        raw = input("PostgreSQL major version (e.g., 18): ").strip()
+        if raw.isdigit() and 9 <= int(raw) <= 99:
+            return int(raw)
+        print("Invalid major version.")
 
 
 def run_cmd(
@@ -189,6 +210,31 @@ def format_tcp_ports(ports: Sequence[int]) -> str:
     return ", ".join(f"TCP/{p}" for p in ports)
 
 
+def print_progress(step: int, total: int, label: str) -> None:
+    print(f"[{step}/{total}] {label}")
+
+
+def file_has_exact_line(path: str, needle: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip() == needle.strip():
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def backup_file(path: str) -> str:
+    backup_path = f"{path}.trae.bak"
+    shutil.copy2(path, backup_path)
+    return backup_path
+
+
+def restore_file(backup_path: str, target_path: str) -> None:
+    shutil.copy2(backup_path, target_path)
+
+
 def detect_linux_pkg_manager() -> str | None:
     if which("apt-get"):
         return "apt"
@@ -211,13 +257,64 @@ def linux_install_postgres() -> None:
         )
         return
 
+    pg_major = prompt_postgres_major()
     needs_sudo = os.geteuid() != 0
     sudo = ["sudo"] if needs_sudo and which("sudo") else []
 
     if mgr == "apt":
-        cmds: list[list[str]] = [
+        pgdg_list = "/etc/apt/sources.list.d/pgdg.list"
+        keyring = "/usr/share/keyrings/postgresql.gpg"
+        codename = ""
+        try:
+            if os.path.isfile("/etc/os-release"):
+                with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("VERSION_CODENAME="):
+                            codename = line.split("=", 1)[1].strip().strip('"')
+                            break
+        except Exception:
+            codename = ""
+        if not codename:
+            codename = "stable"
+
+        needs_repo = True
+        try:
+            if os.path.isfile(pgdg_list):
+                with open(pgdg_list, "r", encoding="utf-8", errors="ignore") as f:
+                    if "apt.postgresql.org" in f.read():
+                        needs_repo = False
+        except Exception:
+            needs_repo = True
+
+        cmds: list[list[str]] = []
+        if needs_repo:
+            cmds += [
+                sudo + ["apt-get", "update"],
+                sudo + ["apt-get", "install", "-y", "ca-certificates", "curl", "gnupg", "lsb-release"],
+                sudo + ["bash", "-lc", f"install -d -m 0755 /usr/share/keyrings"],
+                sudo
+                + [
+                    "bash",
+                    "-lc",
+                    f"test -f {shlex.quote(keyring)} || (curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee {shlex.quote(keyring)} >/dev/null)",
+                ],
+                sudo
+                + [
+                    "bash",
+                    "-lc",
+                    f'echo "deb [signed-by={keyring}] http://apt.postgresql.org/pub/repos/apt {codename}-pgdg main" | tee {shlex.quote(pgdg_list)} >/dev/null',
+                ],
+            ]
+        cmds += [
             sudo + ["apt-get", "update"],
-            sudo + ["apt-get", "install", "-y", "postgresql", "postgresql-contrib"],
+            sudo
+            + [
+                "apt-get",
+                "install",
+                "-y",
+                f"postgresql-{pg_major}",
+                f"postgresql-contrib-{pg_major}",
+            ],
         ]
     else:
         cmds = [
@@ -226,7 +323,7 @@ def linux_install_postgres() -> None:
 
     print_block(
         "Plan",
-        "\n".join(" ".join(c) for c in cmds),
+        f"PostgreSQL major: {pg_major}\n\n" + "\n".join(" ".join(c) for c in cmds),
     )
     if not yes_no("Run these commands now?", default=True):
         return
@@ -288,6 +385,8 @@ def windows_install_postgres() -> None:
         "EnterpriseDB.PostgreSQL",
     ]
 
+    pg_major = prompt_postgres_major()
+
     print()
     print("Trying winget package IDs:")
     for c in candidates:
@@ -305,24 +404,61 @@ def windows_install_postgres() -> None:
             """,
         )
 
-    for pkg_id in candidates:
+    def parse_winget_versions(output: str) -> list[str]:
+        out: list[str] = []
+        for line in output.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.lower().startswith("version"):
+                continue
+            if re.fullmatch(r"[0-9][0-9A-Za-z.\-+]*", s):
+                out.append(s)
+        return out
+
+    def version_key(v: str) -> tuple[int, ...]:
+        nums = re.findall(r"\d+", v)
+        return tuple(int(n) for n in nums[:4]) if nums else (0,)
+
+    def resolve_winget_version(pkg_id: str, major: int) -> str | None:
         p = run_cmd(
-            [
-                "winget",
-                "install",
-                "-e",
-                "--id",
-                pkg_id,
-                "--accept-package-agreements",
-                "--accept-source-agreements",
-            ],
+            ["winget", "show", "-e", "--id", pkg_id, "--versions"],
+            capture=True,
+            check=False,
+        )
+        if p.returncode != 0:
+            return None
+        versions = parse_winget_versions((p.stdout or "") + "\n" + (p.stderr or ""))
+        filtered = [v for v in versions if re.match(rf"^{major}\D|^{major}$", v)]
+        if not filtered:
+            filtered = [v for v in versions if v.startswith(f"{major}.")]
+        if not filtered:
+            return None
+        return sorted(filtered, key=version_key, reverse=True)[0]
+
+    for pkg_id in candidates:
+        selected = resolve_winget_version(pkg_id, pg_major)
+        args = [
+            "winget",
+            "install",
+            "-e",
+            "--id",
+            pkg_id,
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ]
+        if selected:
+            args += ["--version", selected]
+        p = run_cmd(
+            args,
             check=False,
         )
         if p.returncode == 0:
             print_block(
                 "Done",
                 f"""
-                Installed via winget: {pkg_id}
+                PostgreSQL major requested: {pg_major}
+                Installed via winget: {pkg_id}{f' (version {selected})' if selected else ''}
 
                 If psql is still not detected, open a new terminal or re-login, then use:
                 - Configure (create DB/user)
@@ -349,7 +485,20 @@ def install_postgres() -> None:
 
 
 def ssh_base_args(host: str, port: int, user: str, identity_file: str | None) -> list[str]:
-    args = ["ssh", "-p", str(port)]
+    args = [
+        "ssh",
+        "-p",
+        str(port),
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "RequestTTY=no",
+        "-T",
+    ]
     if identity_file:
         args += ["-i", identity_file]
     args.append(f"{user}@{host}")
@@ -384,7 +533,7 @@ def detect_remote_linux_pkg_manager(
     port: int,
     user: str,
     identity_file: str | None,
-) -> str | None:
+) -> tuple[str | None, str]:
     cmd = (
         "if command -v apt-get >/dev/null 2>&1; then echo __PKG__=apt; "
         "elif command -v dnf >/dev/null 2>&1; then echo __PKG__=dnf; "
@@ -399,14 +548,14 @@ def detect_remote_linux_pkg_manager(
         remote_command=f"sh -lc {shlex.quote(cmd)}",
         capture=True,
     )
-    if p.returncode != 0:
-        return None
     out = (p.stdout or "") + "\n" + (p.stderr or "")
+    if p.returncode != 0:
+        return None, out.strip()
     m = re.search(r"__PKG__=(apt|dnf|yum|unknown)", out)
     if not m:
-        return None
+        return None, out.strip()
     pkg = m.group(1)
-    return pkg if pkg in {"apt", "dnf", "yum"} else None
+    return (pkg if pkg in {"apt", "dnf", "yum"} else None), out.strip()
 
 
 def remote_install_postgres_ssh() -> None:
@@ -425,20 +574,23 @@ def remote_install_postgres_ssh() -> None:
         return
 
     host, ssh_port, ssh_user, identity_file, use_sudo = prompt_ssh_connection()
+    pg_major = prompt_postgres_major()
     sudo = "sudo " if use_sudo else ""
 
-    mgr = detect_remote_linux_pkg_manager(
+    mgr, diag = detect_remote_linux_pkg_manager(
         host=host,
         port=ssh_port,
         user=ssh_user,
         identity_file=identity_file,
     )
     if not mgr:
+        diag_block = "\nSSH diagnostic output:\n" + diag if diag else ""
         print_block(
             "Unsupported remote host",
-            """
+            f"""
             Could not detect apt/dnf/yum on the remote machine, or SSH failed.
             Verify SSH connectivity and install PostgreSQL using your distribution docs.
+            {diag_block}
             """,
         )
         return
@@ -446,8 +598,9 @@ def remote_install_postgres_ssh() -> None:
     remote_script_lines: list[str] = []
     if mgr == "apt":
         remote_script_lines += [
+            f'{sudo}bash -lc \'if [ -f /etc/apt/sources.list.d/pgdg.list ] && grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.list; then exit 0; fi; apt-get update; apt-get install -y ca-certificates curl gnupg lsb-release; install -d -m 0755 /usr/share/keyrings; if [ ! -f /usr/share/keyrings/postgresql.gpg ]; then curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /usr/share/keyrings/postgresql.gpg >/dev/null; fi; CODENAME="$(lsb_release -cs 2>/dev/null || true)"; if [ -z "$CODENAME" ] && [ -f /etc/os-release ]; then . /etc/os-release; CODENAME="$VERSION_CODENAME"; fi; echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list >/dev/null\'',
             f"{sudo}apt-get update",
-            f"{sudo}apt-get install -y postgresql postgresql-contrib",
+            f"{sudo}apt-get install -y postgresql-{pg_major} postgresql-contrib-{pg_major}",
             f"{sudo}systemctl enable --now postgresql || {sudo}service postgresql start || true",
         ]
     else:
@@ -465,6 +618,7 @@ def remote_install_postgres_ssh() -> None:
         f"""
         Target: {ssh_user}@{host}:{ssh_port}
         Package manager: {mgr}
+        PostgreSQL major: {pg_major}
 
         Remote commands:
         {remote_commands_indented}
@@ -495,6 +649,452 @@ def remote_install_postgres_ssh() -> None:
         - Use "Verify" from this script to test connectivity (host/port/user/password).
         - Use "Enable remote access (server)" on the server itself to edit config files,
           or tell me to add a remote-enabled version over SSH.
+        """,
+    )
+
+
+REMOTE_FIREWALL_SETUP_SNIPPET = """
+    ensure_firewall_ports() {
+      if command -v ufw >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1; then
+          if ! $SUDO systemctl is-enabled ufw >/dev/null 2>&1; then
+            $SUDO systemctl enable ufw || true
+          fi
+          if ! $SUDO systemctl is-active ufw >/dev/null 2>&1; then
+            $SUDO systemctl start ufw || true
+          fi
+        elif command -v service >/dev/null 2>&1; then
+          $SUDO service ufw start || true
+        fi
+        $SUDO ufw allow "${SSH_PORT}/tcp" || true
+        $SUDO ufw allow "${PG_PORT}/tcp" || true
+        return
+      fi
+
+      if command -v firewall-cmd >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1; then
+          if ! $SUDO systemctl is-enabled firewalld >/dev/null 2>&1; then
+            $SUDO systemctl enable firewalld || true
+          fi
+          if ! $SUDO systemctl is-active firewalld >/dev/null 2>&1; then
+            $SUDO systemctl start firewalld || true
+          fi
+        elif command -v service >/dev/null 2>&1; then
+          $SUDO service firewalld start || true
+        fi
+        $SUDO firewall-cmd --add-port "${SSH_PORT}/tcp" --permanent || true
+        $SUDO firewall-cmd --add-port "${PG_PORT}/tcp" --permanent || true
+        $SUDO firewall-cmd --reload || true
+      fi
+    }
+"""
+
+
+REMOTE_CONFIG_FAILSAFE_SNIPPET = """
+    CONFIG_BACKUP=""
+    HBA_BACKUP=""
+    rollback_remote_config() {
+      set +e
+      if [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ]; then
+        $SUDO cp "$CONFIG_BACKUP" "$CONFIG_FILE"
+      fi
+      if [ -n "$HBA_BACKUP" ] && [ -f "$HBA_BACKUP" ]; then
+        $SUDO cp "$HBA_BACKUP" "$HBA_FILE"
+      fi
+      if [ -n "$CONFIG_BACKUP" ] || [ -n "$HBA_BACKUP" ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+          $SUDO systemctl restart postgresql || true
+        elif command -v service >/dev/null 2>&1; then
+          $SUDO service postgresql restart || true
+        elif command -v pg_ctl >/dev/null 2>&1 && [ -n "$DATA_DIR" ]; then
+          as_postgres pg_ctl restart -D "$DATA_DIR" -m fast || true
+        fi
+      fi
+    }
+
+    backup_remote_config() {
+      CONFIG_BACKUP="${CONFIG_FILE}.trae.bak"
+      HBA_BACKUP="${HBA_FILE}.trae.bak"
+      $SUDO cp "$CONFIG_FILE" "$CONFIG_BACKUP"
+      $SUDO cp "$HBA_FILE" "$HBA_BACKUP"
+    }
+"""
+
+
+def remote_full_setup_ssh() -> None:
+    if not which("ssh"):
+        print_block(
+            "ssh not found",
+            """
+            OpenSSH client is required to configure a remote Linux host via SSH.
+
+            Windows:
+              Settings -> Optional features -> Add a feature -> OpenSSH Client
+            Linux:
+              Install the 'openssh-client' package.
+            """,
+        )
+        return
+
+    host, ssh_port, ssh_user, identity_file, use_sudo = prompt_ssh_connection()
+    pg_major = prompt_postgres_major()
+    db_name = prompt_identifier("Database name", default="app_db")
+    app_user = prompt_identifier("App username", default="app_user")
+    app_pass = getpass.getpass("App user password (leave blank to prompt later): ")
+    if not app_pass:
+        app_pass = getpass.getpass("App user password: ")
+
+    listen_addresses = input("listen_addresses value [*]: ").strip() or "*"
+    pg_port = prompt_port(5432)
+    cidr = prompt_cidr("0.0.0.0/0")
+    if cidr == "0.0.0.0/0":
+        print_block(
+            "Security warning",
+            """
+            You selected 0.0.0.0/0 (any IP).
+            This exposes PostgreSQL to the internet if your network allows it.
+            """,
+        )
+        if not yes_no("Proceed anyway?", default=False):
+            return
+
+    auth = prompt_auth_method("scram-sha-256")
+    mgr, diag = detect_remote_linux_pkg_manager(
+        host=host,
+        port=ssh_port,
+        user=ssh_user,
+        identity_file=identity_file,
+    )
+    if not mgr:
+        diag_block = "\nSSH diagnostic output:\n" + diag if diag else ""
+        print_block(
+            "Unsupported remote host",
+            f"""
+            Could not detect apt/dnf/yum on the remote machine, or SSH failed.
+            Verify SSH connectivity and install PostgreSQL using your distribution docs.
+            {diag_block}
+            """,
+        )
+        return
+
+    firewall_ports = [ssh_port, pg_port]
+    print_block(
+        "Plan",
+        f"""
+        Target (SSH): {ssh_user}@{host}:{ssh_port}
+        Package manager: {mgr}
+        PostgreSQL major: {pg_major}
+
+        Steps to run:
+        1. Ensure PGDG repo (apt only)
+        2. Install PostgreSQL packages
+        3. Start/restart PostgreSQL service
+        4. Create/update role: {app_user}
+        5. Create database: {db_name}
+        6. Back up PostgreSQL config files
+        7. Set listen_addresses = '{listen_addresses}'
+        8. Add pg_hba.conf rule: host all all {cidr} {auth}
+        9. Ensure firewall service is enabled/running when present
+        10. Open firewall ports: {format_tcp_ports(firewall_ports)}
+        11. Validate PostgreSQL health, else roll config changes back
+        """,
+    )
+    if not yes_no("Run the full remote setup now?", default=True):
+        return
+
+    role_sql = " ".join(textwrap.dedent(build_role_sql(app_user, app_pass)).splitlines())
+    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
+    db_exists_sql = build_db_exists_sql(db_name)
+    create_db_sql = build_create_db_sql(db_name, app_user)
+    grant_sql = build_grant_sql(db_name, app_user)
+
+    remote_script = f"""
+    set -e
+
+    REPORT_FILE="$(mktemp -p /tmp pg_full_setup_report.XXXXXX)"
+    STEP=0
+    TOTAL=9
+    progress() {{
+      STEP=$((STEP+1))
+      echo "[$STEP/$TOTAL] $1"
+    }}
+    report() {{
+      printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_FILE"
+    }}
+    show_report() {{
+      echo
+      echo "Summary"
+      echo "-------"
+      printf '%-22s %-6s %s\\n' "Action" "Status" "Details"
+      printf '%-22s %-6s %s\\n' "------" "------" "-------"
+      cat "$REPORT_FILE" | while IFS=$'\\t' read -r a s d; do printf '%-22s %-6s %s\\n' "$a" "$s" "$d"; done
+    }}
+    trap 'show_report' EXIT
+
+    USE_SUDO={1 if use_sudo else 0}
+    if [ "$USE_SUDO" -eq 1 ]; then
+      if ! command -v sudo >/dev/null 2>&1; then
+        echo "sudo not found on remote host"
+        exit 4
+      fi
+      SUDO="sudo"
+    else
+      SUDO=""
+    fi
+
+    PKG_MGR={shlex.quote(mgr)}
+    PG_MAJOR={int(pg_major)}
+    pkg_installed() {{
+      if [ "$PKG_MGR" = "apt" ]; then
+        dpkg-query -W -f='${{Status}}' "postgresql-$PG_MAJOR" 2>/dev/null | grep -q 'install ok installed'
+        return $?
+      fi
+      rpm -q postgresql-server >/dev/null 2>&1 || rpm -q postgresql >/dev/null 2>&1
+    }}
+
+    progress "Ensure PGDG repo"
+    if [ "$PKG_MGR" = "apt" ]; then
+      if [ -f /etc/apt/sources.list.d/pgdg.list ] && grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.list; then
+        report "PGDG repo" "SKIP" "already configured"
+      else
+        $SUDO apt-get update
+        $SUDO apt-get install -y ca-certificates curl gnupg lsb-release
+        $SUDO install -d -m 0755 /usr/share/keyrings
+        if [ ! -f /usr/share/keyrings/postgresql.gpg ]; then
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | $SUDO gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+        fi
+        CODENAME="$(lsb_release -cs 2>/dev/null || true)"
+        if [ -z "$CODENAME" ] && [ -f /etc/os-release ]; then
+          . /etc/os-release
+          CODENAME="$VERSION_CODENAME"
+        fi
+        echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" | $SUDO tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+        report "PGDG repo" "DONE" "configured for ${CODENAME}-pgdg"
+      fi
+    else
+      report "PGDG repo" "SKIP" "not applicable"
+    fi
+
+    progress "Install PostgreSQL packages"
+    if pkg_installed; then
+      report "Install packages" "SKIP" "postgresql-$PG_MAJOR already installed"
+    else
+      if [ "$PKG_MGR" = "apt" ]; then
+        $SUDO apt-get update
+        $SUDO apt-get install -y "postgresql-$PG_MAJOR" "postgresql-contrib-$PG_MAJOR"
+      else
+        $SUDO "$PKG_MGR" install -y postgresql-server postgresql-contrib
+        $SUDO postgresql-setup --initdb || true
+      fi
+      report "Install packages" "DONE" "installed postgresql-$PG_MAJOR"
+    fi
+
+    progress "Ensure PostgreSQL service"
+    if command -v systemctl >/dev/null 2>&1; then
+      STATUS="$($SUDO systemctl is-active postgresql 2>/dev/null || echo unknown)"
+      if [ "$STATUS" = "active" ]; then
+        report "Service" "SKIP" "systemctl is-active=$STATUS"
+      else
+        $SUDO systemctl enable --now postgresql || true
+        report "Service" "DONE" "systemctl enable --now"
+      fi
+    elif command -v service >/dev/null 2>&1; then
+      if $SUDO service postgresql status >/dev/null 2>&1; then
+        report "Service" "SKIP" "service status ok"
+      else
+        $SUDO service postgresql start || true
+        report "Service" "DONE" "service start"
+      fi
+    else
+      report "Service" "SKIP" "unknown init system"
+    fi
+
+    as_postgres() {{
+      if command -v sudo >/dev/null 2>&1; then
+        sudo -u postgres "$@"
+        return
+      fi
+      if command -v runuser >/dev/null 2>&1; then
+        runuser -u postgres -- "$@"
+        return
+      fi
+      if command -v su >/dev/null 2>&1; then
+        local cmd=""
+        for arg in "$@"; do
+          cmd="$cmd $(printf "%q" "$arg")"
+        done
+        su - postgres -c "$cmd"
+        return
+      fi
+      echo "No supported method to run commands as postgres (sudo/runuser/su missing)"
+      exit 5
+    }}
+
+    psqlq() {{
+      as_postgres psql -At -d postgres -c "$1"
+    }}
+
+    progress "Role: {app_user}"
+    ROLE_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    if [ "$ROLE_EXISTS" = "1" ]; then
+      report "Role" "SKIP" "role '{app_user}' already exists"
+    else
+      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)}
+      report "Role" "DONE" "created/updated"
+    fi
+
+    progress "Database: {db_name}"
+    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    if [ "$DB_EXISTS" != "1" ]; then
+      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(create_db_sql)}
+      report "Database" "DONE" "created"
+    else
+      report "Database" "SKIP" "db '{db_name}' already exists"
+    fi
+
+    progress "Grants"
+    as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(grant_sql)}
+    report "Grants" "DONE" "applied"
+
+    CONFIG_FILE="$(psqlq "SHOW config_file;")"
+    HBA_FILE="$(psqlq "SHOW hba_file;")"
+    DATA_DIR="$(psqlq "SHOW data_directory;")"
+    if [ -z "$CONFIG_FILE" ] || [ -z "$HBA_FILE" ]; then
+      echo "Could not discover PostgreSQL config paths"
+      exit 6
+    fi
+
+    LISTEN_ADDRESSES={shlex.quote(listen_addresses)}
+    CIDR={shlex.quote(cidr)}
+    AUTH={shlex.quote(auth)}
+    SSH_PORT={int(ssh_port)}
+    PG_PORT={int(pg_port)}
+    {textwrap.dedent(REMOTE_CONFIG_FAILSAFE_SNIPPET).strip()}
+
+    progress "Remote access config"
+    RULE="host all all $CIDR $AUTH"
+    CURRENT_LISTEN="$(psqlq "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r\\n')"
+    NEED_LISTEN=0
+    NEED_HBA=0
+    if [ "$CURRENT_LISTEN" != "$LISTEN_ADDRESSES" ]; then NEED_LISTEN=1; fi
+    if $SUDO grep -Fxq "$RULE" "$HBA_FILE"; then NEED_HBA=0; else NEED_HBA=1; fi
+
+    NEED_RESTART=0
+    if [ "$NEED_LISTEN" -eq 0 ]; then
+      report "listen_addresses" "SKIP" "already '$CURRENT_LISTEN'"
+    fi
+    if [ "$NEED_HBA" -eq 0 ]; then
+      report "pg_hba rule" "SKIP" "already present: $RULE"
+    fi
+
+    if [ "$NEED_LISTEN" -eq 1 ] || [ "$NEED_HBA" -eq 1 ]; then
+      backup_remote_config
+      trap 'rollback_remote_config' ERR
+      if [ "$NEED_LISTEN" -eq 1 ]; then
+        if $SUDO test -f "$CONFIG_FILE"; then
+          $SUDO sed -ri "s/^\\s*#?\\s*listen_addresses\\s*=.*/listen_addresses = '$LISTEN_ADDRESSES'/" "$CONFIG_FILE" || true
+          if ! $SUDO grep -Eq "^\\s*#?\\s*listen_addresses\\s*=" "$CONFIG_FILE"; then
+            echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null
+          fi
+        else
+          echo "postgresql.conf not found: $CONFIG_FILE"
+          exit 7
+        fi
+        report "listen_addresses" "DONE" "set to '$LISTEN_ADDRESSES'"
+        NEED_RESTART=1
+      fi
+
+      if [ "$NEED_HBA" -eq 1 ]; then
+        echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null
+        report "pg_hba rule" "DONE" "added: $RULE"
+        NEED_RESTART=1
+      fi
+    fi
+
+    progress "Firewall ports"
+    FW_DONE=0
+    if command -v ufw >/dev/null 2>&1; then
+      UFW_OUT="$($SUDO ufw status 2>/dev/null || true)"
+      if echo "$UFW_OUT" | grep -q "Status: active" && echo "$UFW_OUT" | grep -q "${{PG_PORT}}/tcp" && echo "$UFW_OUT" | grep -q "${{SSH_PORT}}/tcp"; then
+        report "Firewall" "SKIP" "ufw active; allows ${{SSH_PORT}}/tcp and ${{PG_PORT}}/tcp"
+        FW_DONE=1
+      fi
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+      if $SUDO firewall-cmd --state >/dev/null 2>&1; then
+        PORTS="$($SUDO firewall-cmd --list-ports 2>/dev/null || true)"
+        if echo "$PORTS" | grep -qw "${{PG_PORT}}/tcp" && echo "$PORTS" | grep -qw "${{SSH_PORT}}/tcp"; then
+          report "Firewall" "SKIP" "firewalld running; allowed ports: $PORTS"
+          FW_DONE=1
+        fi
+      fi
+    fi
+
+    if [ "$FW_DONE" -eq 0 ]; then
+      {textwrap.dedent(REMOTE_FIREWALL_SETUP_SNIPPET).strip()}
+      ensure_firewall_ports
+      report "Firewall" "DONE" "rules applied"
+    fi
+
+    progress "Restart/health"
+    if [ "$NEED_RESTART" -eq 1 ]; then
+      if command -v systemctl >/dev/null 2>&1; then
+        $SUDO systemctl restart postgresql || true
+      elif command -v service >/dev/null 2>&1; then
+        $SUDO service postgresql restart || true
+      elif command -v pg_ctl >/dev/null 2>&1; then
+        as_postgres pg_ctl restart -D "$DATA_DIR" -m fast || true
+      fi
+      report "Restart" "DONE" "postgresql restarted"
+      trap - ERR
+    else
+      report "Restart" "SKIP" "no config changes"
+    fi
+
+    as_postgres psql -At -d postgres -c "SELECT 1;" | grep -qx "1"
+    report "Health" "OK" "SELECT 1"
+
+    echo "OK"
+    """
+
+    p = ssh_run(
+        host=host,
+        port=ssh_port,
+        user=ssh_user,
+        identity_file=identity_file,
+        remote_command=f"bash -lc {shlex.quote(textwrap.dedent(remote_script).strip())}",
+        capture=False,
+    )
+    if p.returncode != 0:
+        print_block("Failed", f"Remote full setup failed with exit code {p.returncode}.")
+        return
+
+    audit_ok, audit_rows = remote_postgres_audit_ssh(
+        host=host,
+        port=ssh_port,
+        user=ssh_user,
+        identity_file=identity_file,
+        expected_db=db_name,
+        expected_role=app_user,
+    )
+    print_block("Audit", format_report_lines(audit_rows))
+    if not audit_ok:
+        print_block(
+            "Failed verification",
+            """
+            The remote setup commands completed, but one or more validation checks did not pass.
+            Review the audit output above before using this server.
+            """,
+        )
+        return
+
+    print_block(
+        "Done",
+        f"""
+        Remote PostgreSQL setup completed on {host}.
+        The script installed PostgreSQL, configured the database/user, enabled remote access,
+        checked the firewall service state, and attempted to open {format_tcp_ports(firewall_ports)}.
+        If PostgreSQL had failed its restart/health check, the script would have restored the previous config files.
+        Next: use "Verify" with host {host} and port {pg_port} to test connectivity.
         """,
     )
 
@@ -560,53 +1160,65 @@ def configure_db_user_local() -> None:
         "-v",
         "ON_ERROR_STOP=1",
     ]
+    summary: list[tuple[str, str]] = []
+    total = 3
+    step = 0
 
-    p = subprocess.run(
-        base_cmd + ["-c", textwrap.dedent(role_sql)],
-        text=True,
-        env={**os.environ, **env},
-    )
-    if p.returncode != 0:
-        print_block(
-            "Failed",
-            """
-            Could not apply SQL via psql.
-            Common causes:
-            - Wrong password
-            - pg_hba.conf does not allow password auth from this host
-            - PostgreSQL service not running
-            """,
+    step += 1
+    print_progress(step, total, f"Role: {app_user}")
+    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
+    role_exists = run_cmd(base_cmd + ["-At", "-c", role_exists_sql], env=env, capture=True, check=False)
+    role_present = role_exists.returncode == 0 and (role_exists.stdout or "").strip() == "1"
+    update_role = True
+    if role_present:
+        update_role = yes_no(f'Role "{app_user}" already exists. Update password anyway?', default=False)
+    if update_role:
+        p = subprocess.run(
+            base_cmd + ["-c", textwrap.dedent(role_sql)],
+            text=True,
+            env={**os.environ, **env},
         )
-        return
+        if p.returncode != 0:
+            print_block(
+                "Failed",
+                """
+                Could not apply SQL via psql.
+                Common causes:
+                - Wrong password
+                - pg_hba.conf does not allow password auth from this host
+                - PostgreSQL service not running
+                """,
+            )
+            return
+        summary.append(("Role", "done"))
+    else:
+        summary.append(("Role", "skipped (already exists)"))
 
-    exists = run_cmd(
-        base_cmd + ["-At", "-c", db_exists_sql],
-        env=env,
-        capture=True,
-        check=False,
-    )
+    step += 1
+    print_progress(step, total, f"Database: {db_name}")
+    exists = run_cmd(base_cmd + ["-At", "-c", db_exists_sql], env=env, capture=True, check=False)
     if exists.returncode != 0:
         print_block("Failed", "Could not check whether the database already exists.")
         return
-
-    if (exists.stdout or "").strip() != "1":
-        createdb = run_cmd(
-            base_cmd + ["-c", create_db_sql],
-            env=env,
-            check=False,
-        )
+    db_present = (exists.stdout or "").strip() == "1"
+    if not db_present:
+        createdb = run_cmd(base_cmd + ["-c", create_db_sql], env=env, check=False)
         if createdb.returncode != 0:
             print_block("Failed", "Could not create the database.")
             return
+        summary.append(("Database", "done"))
+    else:
+        summary.append(("Database", "skipped (already exists)"))
 
-    grant = run_cmd(
-        base_cmd + ["-c", grant_sql],
-        env=env,
-        check=False,
-    )
+    step += 1
+    print_progress(step, total, f"Grant privileges: {db_name} -> {app_user}")
+    grant = run_cmd(base_cmd + ["-c", grant_sql], env=env, check=False)
     if grant.returncode != 0:
         print_block("Failed", "Could not grant privileges on the database.")
         return
+    summary.append(("Grants", "done"))
+
+    print_block("Summary", format_report_lines(summary))
 
     print_block(
         "Done",
@@ -808,20 +1420,251 @@ def apply_firewall_rules(ports: Sequence[int]) -> None:
         return
 
 
-def restart_postgres(psql_path: str, data_directory: str | None) -> None:
+def is_firewall_port_allowed(port: int) -> bool | None:
+    if is_windows():
+        rule_name = f"PostgreSQL {port}"
+        p = run_cmd(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+            capture=True,
+            check=False,
+        )
+        out = (p.stdout or "") + "\n" + (p.stderr or "")
+        if "No rules match" in out:
+            return False
+        return p.returncode == 0
+
+    needs_sudo = os.geteuid() != 0
+    sudo = ["sudo"] if needs_sudo and which("sudo") else []
+
+    if which("ufw"):
+        p = run_cmd(sudo + ["ufw", "status"], capture=True, check=False)
+        if p.returncode != 0:
+            return None
+        out = (p.stdout or "") + "\n" + (p.stderr or "")
+        return f"{port}/tcp" in out
+
+    if which("firewall-cmd"):
+        p = run_cmd(sudo + ["firewall-cmd", "--list-ports"], capture=True, check=False)
+        if p.returncode != 0:
+            return None
+        out = (p.stdout or "") + "\n" + (p.stderr or "")
+        return f"{port}/tcp" in out
+
+    return None
+
+
+def format_report_lines(rows: Sequence[tuple[str, str]]) -> str:
+    if not rows:
+        return ""
+    width = max(len(label) for label, _ in rows)
+    return "\n".join(f"{label:<{width}} : {value}" for label, value in rows)
+
+
+def local_postgres_audit(
+    psql: str,
+    *,
+    host: str,
+    port: int,
+    user: str,
+    db: str,
+    password: str | None,
+) -> tuple[bool, list[tuple[str, str]]]:
+    version = run_cmd([psql, "--version"], capture=True, check=False)
+    health = psql_query(psql, host=host, port=port, user=user, db=db, password=password, sql="SELECT 1;")
+    current_user = psql_query(
+        psql, host=host, port=port, user=user, db=db, password=password, sql="SELECT current_user;"
+    )
+    current_db = psql_query(
+        psql, host=host, port=port, user=user, db=db, password=password, sql="SELECT current_database();"
+    )
+    db_exists = psql_query(
+        psql,
+        host=host,
+        port=port,
+        user=user,
+        db=db,
+        password=password,
+        sql=f"SELECT 1 FROM pg_database WHERE datname = '{normalize_sql_literal(db)}';",
+    )
+    role_exists = psql_query(
+        psql,
+        host=host,
+        port=port,
+        user=user,
+        db=db,
+        password=password,
+        sql=f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(user)}';",
+    )
+    config_file = psql_query(psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW config_file;")
+    hba_file = psql_query(psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW hba_file;")
+    data_dir = psql_query(
+        psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW data_directory;"
+    )
+    listen_addresses = psql_query(
+        psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW listen_addresses;"
+    )
+    server_port = psql_query(psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW port;")
+    server_version = psql_query(
+        psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW server_version;"
+    )
+
+    rows = [
+        ("psql binary", (version.stdout or "").strip() if version.returncode == 0 else "not available"),
+        ("connection", "ok" if health == "1" else "failed"),
+        ("server version", server_version or "unknown"),
+        ("current user", current_user or "unknown"),
+        ("current database", current_db or "unknown"),
+        ("role exists", "yes" if role_exists == "1" else "no"),
+        ("database exists", "yes" if db_exists == "1" else "no"),
+        ("listen_addresses", listen_addresses or "unknown"),
+        ("server port", server_port or "unknown"),
+        ("config_file", config_file or "unavailable"),
+        ("hba_file", hba_file or "unavailable"),
+        ("data_directory", data_dir or "unavailable"),
+    ]
+    ok = health == "1" and role_exists == "1" and db_exists == "1"
+    return ok, rows
+
+
+def remote_postgres_audit_ssh(
+    *,
+    host: str,
+    port: int,
+    user: str,
+    identity_file: str | None,
+    expected_db: str,
+    expected_role: str,
+) -> tuple[bool, list[tuple[str, str]]]:
+    mgr = detect_remote_linux_pkg_manager(host=host, port=port, user=user, identity_file=identity_file)
+    if not mgr:
+        return False, [("ssh/package manager", "failed to detect remote host details")]
+
+    if mgr == "apt":
+        pkg_check = "dpkg-query -W -f='${Status}' postgresql 2>/dev/null | grep -q 'install ok installed'"
+    else:
+        pkg_check = "rpm -q postgresql-server >/dev/null 2>&1 || rpm -q postgresql >/dev/null 2>&1"
+
+    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(expected_role)}';"
+    db_exists_sql = f"SELECT 1 FROM pg_database WHERE datname = '{normalize_sql_literal(expected_db)}';"
+    remote_script = f"""
+    emit() {{
+      printf '__AUDIT__%s=%s\\n' "$1" "$2"
+    }}
+
+    as_postgres() {{
+      if command -v sudo >/dev/null 2>&1; then
+        sudo -u postgres "$@"
+        return
+      fi
+      if command -v runuser >/dev/null 2>&1; then
+        runuser -u postgres -- "$@"
+        return
+      fi
+      if command -v su >/dev/null 2>&1; then
+        local cmd=""
+        for arg in "$@"; do
+          cmd="$cmd $(printf "%q" "$arg")"
+        done
+        su - postgres -c "$cmd"
+        return
+      fi
+      return 1
+    }}
+
+    emit host {shlex.quote(host)}
+    emit package_manager {shlex.quote(mgr)}
+    if {pkg_check}; then emit package_installed yes; else emit package_installed no; fi
+    if id postgres >/dev/null 2>&1; then emit postgres_os_user yes; else emit postgres_os_user no; fi
+    if command -v psql >/dev/null 2>&1; then emit psql yes; else emit psql no; fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+      emit service_enabled "$(systemctl is-enabled postgresql 2>/dev/null || echo unknown)"
+      emit service_active "$(systemctl is-active postgresql 2>/dev/null || echo unknown)"
+    else
+      emit service_enabled unknown
+      if command -v service >/dev/null 2>&1 && service postgresql status >/dev/null 2>&1; then
+        emit service_active yes
+      else
+        emit service_active unknown
+      fi
+    fi
+
+    emit health "$(as_postgres psql -At -d postgres -c "SELECT 1;" 2>/dev/null | tr -d '\\r\\n')"
+    emit role_exists "$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    emit db_exists "$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    emit config_file "$(as_postgres psql -At -d postgres -c "SHOW config_file;" 2>/dev/null | tr -d '\\r')"
+    emit hba_file "$(as_postgres psql -At -d postgres -c "SHOW hba_file;" 2>/dev/null | tr -d '\\r')"
+    emit data_directory "$(as_postgres psql -At -d postgres -c "SHOW data_directory;" 2>/dev/null | tr -d '\\r')"
+    emit listen_addresses "$(as_postgres psql -At -d postgres -c "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r')"
+    emit port "$(as_postgres psql -At -d postgres -c "SHOW port;" 2>/dev/null | tr -d '\\r')"
+    emit server_version "$(as_postgres psql -At -d postgres -c "SHOW server_version;" 2>/dev/null | tr -d '\\r')"
+    """
+
+    p = ssh_run(
+        host=host,
+        port=port,
+        user=user,
+        identity_file=identity_file,
+        remote_command=f"bash -lc {shlex.quote(textwrap.dedent(remote_script).strip())}",
+        capture=True,
+    )
+    if p.returncode != 0:
+        out = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+        return False, [("remote audit", out or "failed")]
+
+    values: dict[str, str] = {}
+    for line in ((p.stdout or "") + "\n" + (p.stderr or "")).splitlines():
+        if line.startswith("__AUDIT__") and "=" in line:
+            key, value = line[len("__AUDIT__") :].split("=", 1)
+            values[key.strip()] = value.strip()
+
+    rows = [
+        ("host", values.get("host", host)),
+        ("package manager", values.get("package_manager", mgr)),
+        ("package installed", values.get("package_installed", "unknown")),
+        ("postgres OS user", values.get("postgres_os_user", "unknown")),
+        ("psql", values.get("psql", "unknown")),
+        ("service enabled", values.get("service_enabled", "unknown")),
+        ("service active", values.get("service_active", "unknown")),
+        ("health", "ok" if values.get("health") == "1" else (values.get("health") or "failed")),
+        ("role exists", "yes" if values.get("role_exists") == "1" else "no"),
+        ("database exists", "yes" if values.get("db_exists") == "1" else "no"),
+        ("server version", values.get("server_version", "unknown")),
+        ("listen_addresses", values.get("listen_addresses", "unknown")),
+        ("server port", values.get("port", "unknown")),
+        ("config_file", values.get("config_file", "unavailable")),
+        ("hba_file", values.get("hba_file", "unavailable")),
+        ("data_directory", values.get("data_directory", "unavailable")),
+    ]
+    ok = (
+        values.get("package_installed") == "yes"
+        and values.get("postgres_os_user") == "yes"
+        and values.get("psql") == "yes"
+        and values.get("health") == "1"
+        and values.get("role_exists") == "1"
+        and values.get("db_exists") == "1"
+    )
+    return ok, rows
+
+
+def restart_postgres(psql_path: str, data_directory: str | None) -> bool:
     pg_ctl = find_pg_ctl_path(psql_path)
     if pg_ctl and data_directory:
         p = run_cmd([pg_ctl, "restart", "-D", data_directory, "-m", "fast"], check=False)
         if p.returncode == 0:
-            return
+            return True
 
     if not is_windows():
         needs_sudo = os.geteuid() != 0
         sudo = ["sudo"] if needs_sudo and which("sudo") else []
         if which("systemctl"):
-            run_cmd(sudo + ["systemctl", "restart", "postgresql"], check=False)
+            p = run_cmd(sudo + ["systemctl", "restart", "postgresql"], check=False)
+            return p.returncode == 0
         elif which("service"):
-            run_cmd(sudo + ["service", "postgresql", "restart"], check=False)
+            p = run_cmd(sudo + ["service", "postgresql", "restart"], check=False)
+            return p.returncode == 0
+
+    return False
 
 
 def enable_remote_access_local() -> None:
@@ -913,10 +1756,45 @@ def enable_remote_access_local() -> None:
     )
     if not yes_no("Apply these changes now?", default=True):
         return
+    summary: list[tuple[str, str]] = []
+    total = 4
+    step = 0
 
+    current_listen = psql_query(
+        psql,
+        host=host,
+        port=port,
+        user=superuser,
+        db="postgres",
+        password=superpass if use_password else None,
+        sql="SHOW listen_addresses;",
+    )
+    rule_line = f"host all all {cidr} {auth}"
+    rule_present = file_has_exact_line(hba_file, rule_line)
+    firewall_allowed = is_firewall_port_allowed(port)
+
+    if current_listen == listen_addresses and rule_present and firewall_allowed is True:
+        summary.append(("listen_addresses", "skipped (already set)"))
+        summary.append(("pg_hba.conf rule", "skipped (already present)"))
+        summary.append((f"Firewall TCP/{port}", "skipped (already allowed)"))
+        summary.append(("Restart/health", "skipped (no changes)"))
+        print_block("Summary", format_report_lines(summary))
+        print_block("Done", "No changes required.")
+        return
+
+    config_backup = ""
+    hba_backup = ""
+    changed = False
+
+    step += 1
+    print_progress(step, total, "postgresql.conf: listen_addresses")
     try:
-        set_listen_addresses(config_file, listen_addresses)
-        ensure_pg_hba_rule(hba_file, cidr, auth)
+        if current_listen != listen_addresses:
+            config_backup = backup_file(config_file)
+            changed = set_listen_addresses(config_file, listen_addresses) or changed
+            summary.append(("listen_addresses", "done"))
+        else:
+            summary.append(("listen_addresses", "skipped (already set)"))
     except PermissionError:
         print_block(
             "Permission denied",
@@ -927,15 +1805,75 @@ def enable_remote_access_local() -> None:
         )
         return
 
-    apply_firewall_rules([port])
-    restart_postgres(psql, data_dir)
+    step += 1
+    print_progress(step, total, "pg_hba.conf: rule")
+    try:
+        if not rule_present:
+            if not hba_backup:
+                hba_backup = backup_file(hba_file)
+            changed = ensure_pg_hba_rule(hba_file, cidr, auth) or changed
+            summary.append(("pg_hba.conf rule", "done"))
+        else:
+            summary.append(("pg_hba.conf rule", "skipped (already present)"))
+    except PermissionError:
+        if config_backup:
+            restore_file(config_backup, config_file)
+        print_block(
+            "Permission denied",
+            """
+            Could not modify PostgreSQL configuration files.
+            Run this script with elevated permissions on the server and retry.
+            """,
+        )
+        return
 
+    step += 1
+    print_progress(step, total, f"Firewall TCP/{port}")
+    if firewall_allowed is True:
+        summary.append((f"Firewall TCP/{port}", "skipped (already allowed)"))
+    else:
+        apply_firewall_rules([port])
+        summary.append((f"Firewall TCP/{port}", "done" if firewall_allowed is False else "attempted"))
+
+    step += 1
+    print_progress(step, total, "Restart/health")
+    restart_ok = True
+    if changed:
+        restart_ok = restart_postgres(psql, data_dir)
+    health_ok = bool(
+        psql_query(
+            psql,
+            host=host,
+            port=port,
+            user=superuser,
+            db="postgres",
+            password=superpass if use_password else None,
+            sql="SELECT 1;",
+        )
+    )
+    if changed and (not restart_ok or not health_ok):
+        if config_backup:
+            restore_file(config_backup, config_file)
+        if hba_backup:
+            restore_file(hba_backup, hba_file)
+        restart_postgres(psql, data_dir)
+        print_block("Summary", format_report_lines(summary))
+        print_block(
+            "Failed safely",
+            """
+            PostgreSQL did not come back healthy after applying remote-access changes.
+            The script restored the previous configuration files and restarted PostgreSQL.
+            """,
+        )
+        return
+    summary.append(("Restart/health", "done" if changed else "skipped (no changes)"))
+
+    print_block("Summary", format_report_lines(summary))
     print_block(
         "Done",
         """
-        Remote access configuration applied (best-effort).
+        Remote access configuration is ready.
         Next:
-        - Ensure the target user has a strong password
         - Verify network routing/security groups
         - Use "Verify" to test connectivity
         """,
@@ -982,10 +1920,11 @@ def enable_remote_access_ssh() -> None:
         f"""
         Target (SSH): {ssh_user}@{host}:{ssh_port}
 
+        backup:          create rollback copies of postgresql.conf and pg_hba.conf
         postgresql.conf: set listen_addresses = '{listen_addresses}'
         pg_hba.conf:     add host all all {cidr} {auth}
-        firewall:        open {format_tcp_ports(firewall_ports)} (best-effort)
-        restart:         restart PostgreSQL (best-effort)
+        firewall:        ensure service enabled/running, then open {format_tcp_ports(firewall_ports)} (best-effort)
+        restart:         restart PostgreSQL and validate health, else restore backups
         """,
     )
     if not yes_no("Apply these changes on the remote host now?", default=True):
@@ -993,6 +1932,26 @@ def enable_remote_access_ssh() -> None:
 
     remote_script = f"""
     set -e
+
+    REPORT_FILE="$(mktemp -p /tmp pg_remote_access_report.XXXXXX)"
+    STEP=0
+    TOTAL=4
+    progress() {{
+      STEP=$((STEP+1))
+      echo "[$STEP/$TOTAL] $1"
+    }}
+    report() {{
+      printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_FILE"
+    }}
+    show_report() {{
+      echo
+      echo "Summary"
+      echo "-------"
+      printf '%-22s %-6s %s\\n' "Action" "Status" "Details"
+      printf '%-22s %-6s %s\\n' "------" "------" "-------"
+      cat "$REPORT_FILE" | while IFS=$'\\t' read -r a s d; do printf '%-22s %-6s %s\\n' "$a" "$s" "$d"; done
+    }}
+    trap 'show_report' EXIT
 
     USE_SUDO={1 if use_sudo else 0}
 
@@ -1045,38 +2004,88 @@ def enable_remote_access_ssh() -> None:
     AUTH={shlex.quote(auth)}
     SSH_PORT={int(ssh_port)}
     PG_PORT={int(pg_port)}
+    RULE="host all all $CIDR $AUTH"
+    CURRENT_LISTEN="$(psqlq "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r\\n')"
 
-    if $SUDO test -f "$CONFIG_FILE"; then
-      $SUDO sed -ri "s/^\\s*#?\\s*listen_addresses\\s*=.*/listen_addresses = '$LISTEN_ADDRESSES'/" "$CONFIG_FILE" || true
-      if ! $SUDO grep -Eq "^\\s*#?\\s*listen_addresses\\s*=" "$CONFIG_FILE"; then
-        echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null
+    NEED_LISTEN=0
+    NEED_HBA=0
+    if [ "$CURRENT_LISTEN" != "$LISTEN_ADDRESSES" ]; then NEED_LISTEN=1; fi
+    if $SUDO grep -Fxq "$RULE" "$HBA_FILE"; then NEED_HBA=0; else NEED_HBA=1; fi
+    NEED_RESTART=0
+
+    progress "Remote access config"
+    {textwrap.dedent(REMOTE_CONFIG_FAILSAFE_SNIPPET).strip()}
+    if [ "$NEED_LISTEN" -eq 1 ] || [ "$NEED_HBA" -eq 1 ]; then
+      backup_remote_config
+      trap 'rollback_remote_config' ERR
+      if [ "$NEED_LISTEN" -eq 1 ]; then
+        if $SUDO test -f "$CONFIG_FILE"; then
+          $SUDO sed -ri "s/^\\s*#?\\s*listen_addresses\\s*=.*/listen_addresses = '$LISTEN_ADDRESSES'/" "$CONFIG_FILE" || true
+          if ! $SUDO grep -Eq "^\\s*#?\\s*listen_addresses\\s*=" "$CONFIG_FILE"; then
+            echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null
+          fi
+        else
+          echo "postgresql.conf not found: $CONFIG_FILE"
+          exit 7
+        fi
+        report "listen_addresses" "DONE" "set to '$LISTEN_ADDRESSES'"
+        NEED_RESTART=1
+      else
+        report "listen_addresses" "SKIP" "already '$CURRENT_LISTEN'"
+      fi
+
+      if [ "$NEED_HBA" -eq 1 ]; then
+        echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null
+        report "pg_hba rule" "DONE" "added: $RULE"
+        NEED_RESTART=1
+      else
+        report "pg_hba rule" "SKIP" "already present: $RULE"
       fi
     else
-      echo "postgresql.conf not found: $CONFIG_FILE"
-      exit 7
+      report "listen_addresses" "SKIP" "already '$CURRENT_LISTEN'"
+      report "pg_hba rule" "SKIP" "already present: $RULE"
     fi
 
-    RULE="host all all $CIDR $AUTH"
-    if ! $SUDO grep -Fxq "$RULE" "$HBA_FILE"; then
-      echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null
-    fi
-
+    progress "Firewall ports"
+    FW_DONE=0
     if command -v ufw >/dev/null 2>&1; then
-      $SUDO ufw allow "${{SSH_PORT}}/tcp" || true
-      $SUDO ufw allow "${{PG_PORT}}/tcp" || true
+      UFW_OUT="$($SUDO ufw status 2>/dev/null || true)"
+      if echo "$UFW_OUT" | grep -q "Status: active" && echo "$UFW_OUT" | grep -q "${{PG_PORT}}/tcp" && echo "$UFW_OUT" | grep -q "${{SSH_PORT}}/tcp"; then
+        report "Firewall" "SKIP" "ufw active; allows ${{SSH_PORT}}/tcp and ${{PG_PORT}}/tcp"
+        FW_DONE=1
+      fi
     elif command -v firewall-cmd >/dev/null 2>&1; then
-      $SUDO firewall-cmd --add-port "${{SSH_PORT}}/tcp" --permanent || true
-      $SUDO firewall-cmd --add-port "${{PG_PORT}}/tcp" --permanent || true
-      $SUDO firewall-cmd --reload || true
+      if $SUDO firewall-cmd --state >/dev/null 2>&1; then
+        PORTS="$($SUDO firewall-cmd --list-ports 2>/dev/null || true)"
+        if echo "$PORTS" | grep -qw "${{PG_PORT}}/tcp" && echo "$PORTS" | grep -qw "${{SSH_PORT}}/tcp"; then
+          report "Firewall" "SKIP" "firewalld running; allowed ports: $PORTS"
+          FW_DONE=1
+        fi
+      fi
+    fi
+    if [ "$FW_DONE" -eq 0 ]; then
+      {textwrap.dedent(REMOTE_FIREWALL_SETUP_SNIPPET).strip()}
+      ensure_firewall_ports
+      report "Firewall" "DONE" "rules applied"
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-      $SUDO systemctl restart postgresql || true
-    elif command -v service >/dev/null 2>&1; then
-      $SUDO service postgresql restart || true
-    elif command -v pg_ctl >/dev/null 2>&1; then
-      as_postgres pg_ctl restart -D "$DATA_DIR" -m fast || true
+    progress "Restart/health"
+    if [ "$NEED_RESTART" -eq 1 ]; then
+      if command -v systemctl >/dev/null 2>&1; then
+        $SUDO systemctl restart postgresql || true
+      elif command -v service >/dev/null 2>&1; then
+        $SUDO service postgresql restart || true
+      elif command -v pg_ctl >/dev/null 2>&1; then
+        as_postgres pg_ctl restart -D "$DATA_DIR" -m fast || true
+      fi
+      report "Restart" "DONE" "postgresql restarted"
+      trap - ERR
+    else
+      report "Restart" "SKIP" "no config changes"
     fi
+
+    as_postgres psql -At -d postgres -c "SELECT 1;" | grep -qx "1"
+    report "Health" "OK" "SELECT 1"
 
     echo "OK"
     """
@@ -1093,11 +2102,31 @@ def enable_remote_access_ssh() -> None:
         print_block("Failed", f"Remote remote-access configuration failed with exit code {p.returncode}.")
         return
 
+    audit_ok, audit_rows = remote_postgres_audit_ssh(
+        host=host,
+        port=ssh_port,
+        user=ssh_user,
+        identity_file=identity_file,
+        expected_db="postgres",
+        expected_role="postgres",
+    )
+    print_block("Audit", format_report_lines(audit_rows))
+    if not audit_ok:
+        print_block(
+            "Failed verification",
+            """
+            Remote access changes were applied, but the server audit found one or more problems.
+            Review the audit output above before using the server remotely.
+            """,
+        )
+        return
+
     print_block(
         "Done",
         """
-        Remote access configuration applied on the remote host (best-effort).
-        The script attempted to open both SSH and PostgreSQL in the server firewall.
+        Remote access configuration applied on the remote host.
+        The script checked the firewall service and attempted to open both SSH and PostgreSQL.
+        If PostgreSQL had failed its restart/health check, the script would have restored the previous config files.
         Next: use "Verify" and set Host to the server DNS/IP to test connectivity.
         """,
     )
@@ -1141,11 +2170,32 @@ def configure_db_user_ssh() -> None:
         app_pass = getpass.getpass("App user password: ")
 
     role_sql = " ".join(textwrap.dedent(build_role_sql(app_user, app_pass)).splitlines())
+    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
     db_exists_sql = build_db_exists_sql(db_name)
     create_db_sql = build_create_db_sql(db_name, app_user)
     grant_sql = build_grant_sql(db_name, app_user)
     remote_script = f"""
     set -e
+
+    REPORT_FILE="$(mktemp -p /tmp pg_config_report.XXXXXX)"
+    STEP=0
+    TOTAL=3
+    progress() {{
+      STEP=$((STEP+1))
+      echo "[$STEP/$TOTAL] $1"
+    }}
+    report() {{
+      printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_FILE"
+    }}
+    show_report() {{
+      echo
+      echo "Summary"
+      echo "-------"
+      printf '%-18s %-6s %s\\n' "Action" "Status" "Details"
+      printf '%-18s %-6s %s\\n' "------" "------" "-------"
+      cat "$REPORT_FILE" | while IFS=$'\\t' read -r a s d; do printf '%-18s %-6s %s\\n' "$a" "$s" "$d"; done
+    }}
+    trap 'show_report' EXIT
 
     as_postgres() {{
       if command -v sudo >/dev/null 2>&1; then
@@ -1168,14 +2218,27 @@ def configure_db_user_ssh() -> None:
       exit 5
     }}
 
-    as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)}
-
-    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)})"
-    if [ "$DB_EXISTS" != "1" ]; then
-      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(create_db_sql)}
+    progress "Role: {app_user}"
+    ROLE_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    if [ "$ROLE_EXISTS" = "1" ]; then
+      report "Role" "SKIP" "role '{app_user}' already exists"
+    else
+      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)}
+      report "Role" "DONE" "created/updated"
     fi
 
+    progress "Database: {db_name}"
+    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    if [ "$DB_EXISTS" != "1" ]; then
+      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(create_db_sql)}
+      report "Database" "DONE" "created"
+    else
+      report "Database" "SKIP" "db '{db_name}' already exists"
+    fi
+
+    progress "Grants"
     as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(grant_sql)}
+    report "Grants" "DONE" "applied"
     """
 
     print_block(
@@ -1210,6 +2273,25 @@ def configure_db_user_ssh() -> None:
         )
         return
 
+    audit_ok, audit_rows = remote_postgres_audit_ssh(
+        host=host,
+        port=ssh_port,
+        user=ssh_user,
+        identity_file=identity_file,
+        expected_db=db_name,
+        expected_role=app_user,
+    )
+    print_block("Audit", format_report_lines(audit_rows))
+    if not audit_ok:
+        print_block(
+            "Failed verification",
+            """
+            The database/user commands completed, but the remote audit could not confirm the expected state.
+            Review the audit output above.
+            """,
+        )
+        return
+
     print_block(
         "Done",
         """
@@ -1234,6 +2316,42 @@ def configure_db_user() -> None:
 
 
 def verify_installation() -> None:
+    idx = prompt_choice(
+        "Verify target",
+        [
+            "Direct PostgreSQL connection",
+            "Remote Linux over SSH (server audit)",
+        ],
+    )
+    if idx == 1:
+        if not which("ssh"):
+            print_block(
+                "ssh not found",
+                """
+                OpenSSH client is required for the remote server audit.
+                Install the OpenSSH client and retry.
+                """,
+            )
+            return
+
+        host, ssh_port, ssh_user, identity_file, _use_sudo = prompt_ssh_connection()
+        db = prompt_identifier("Expected database", default="postgres")
+        user = prompt_identifier("Expected role", default="postgres")
+        audit_ok, audit_rows = remote_postgres_audit_ssh(
+            host=host,
+            port=ssh_port,
+            user=ssh_user,
+            identity_file=identity_file,
+            expected_db=db,
+            expected_role=user,
+        )
+        print_block("Audit", format_report_lines(audit_rows))
+        if audit_ok:
+            print_block("Success", "Remote server audit passed.")
+        else:
+            print_block("Failed", "Remote server audit found one or more problems.")
+        return
+
     psql = find_psql_path()
     if not psql:
         print_block(
@@ -1242,48 +2360,25 @@ def verify_installation() -> None:
         )
         return
 
-    v = run_cmd([psql, "--version"], capture=True, check=False)
-    print()
-    if v.returncode == 0:
-        print(v.stdout.strip())
-    else:
-        print("Could not run psql --version.")
-
-    if not yes_no("Test a connection with credentials?", default=True):
-        return
-
     host = prompt_host("localhost")
     port = prompt_port(5432)
     db = prompt_identifier("Database", default="postgres")
     user = prompt_identifier("User", default="postgres")
     use_password = yes_no("Use password?", default=True)
     pw = getpass.getpass("Password: ") if use_password else ""
-
-    env: dict[str, str] = {}
-    if use_password and pw:
-        env["PGPASSWORD"] = pw
-
-    p = run_cmd(
-        [
-            psql,
-            "-h",
-            host,
-            "-p",
-            str(port),
-            "-U",
-            user,
-            "-d",
-            db,
-            "-c",
-            "SELECT version();",
-        ],
-        env=env,
-        check=False,
+    audit_ok, audit_rows = local_postgres_audit(
+        psql,
+        host=host,
+        port=port,
+        user=user,
+        db=db,
+        password=pw if use_password else None,
     )
-    if p.returncode == 0:
-        print_block("Success", "Connection OK.")
+    print_block("Audit", format_report_lines(audit_rows))
+    if audit_ok:
+        print_block("Success", "Connection and PostgreSQL checks passed.")
     else:
-        print_block("Failed", "Connection test failed.")
+        print_block("Failed", "One or more PostgreSQL checks failed.")
 
 
 def show_system_info() -> None:
@@ -1306,7 +2401,7 @@ def main_menu() -> None:
             [
                 "System info",
                 "Install PostgreSQL",
-                "Install PostgreSQL on remote host (SSH/Linux)",
+                "Remote PostgreSQL full setup (SSH/Linux)",
                 "Configure (create DB/user)",
                 "Enable remote access (server)",
                 "Verify",
@@ -1318,7 +2413,7 @@ def main_menu() -> None:
         elif idx == 1:
             install_postgres()
         elif idx == 2:
-            remote_install_postgres_ssh()
+            remote_full_setup_ssh()
         elif idx == 3:
             configure_db_user()
         elif idx == 4:
@@ -1342,8 +2437,8 @@ def minimal_flow() -> None:
     show_system_info()
     if yes_no("Install PostgreSQL now?", default=True):
         install_postgres()
-    if yes_no("Install PostgreSQL on a remote Linux host via SSH now?", default=False):
-        remote_install_postgres_ssh()
+    if yes_no("Run full PostgreSQL setup on a remote Linux host via SSH now?", default=False):
+        remote_full_setup_ssh()
     if yes_no("Configure DB/user now?", default=True):
         configure_db_user()
     if yes_no("Enable remote access now?", default=False):
@@ -1353,12 +2448,16 @@ def minimal_flow() -> None:
 
 
 def main(argv: Sequence[str]) -> int:
-    args = parse_args(argv)
-    if args.no_menu:
-        minimal_flow()
+    try:
+        args = parse_args(argv)
+        if args.no_menu:
+            minimal_flow()
+            return 0
+        main_menu()
         return 0
-    main_menu()
-    return 0
+    except KeyboardInterrupt:
+        print_block("Cancelled", "Operation cancelled by user.")
+        return 130
 
 
 if __name__ == "__main__":
