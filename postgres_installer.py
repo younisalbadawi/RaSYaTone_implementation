@@ -7,6 +7,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 from typing import Iterable, Mapping, Sequence
 
@@ -108,17 +109,37 @@ def run_cmd(
 
 
 def normalize_sql_literal(value: str) -> str:
-    return value.replace("'", "''")
+    if "'" not in value:
+        return value
+    out: list[str] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "'":
+            out.append("''")
+            i += 1
+            while i < n and value[i] == "'":
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def normalize_sql_identifier(ident: str) -> str:
+    return ident.replace('"', '""')
 
 
 def build_role_sql(app_user: str, app_pass: str) -> str:
+    u = normalize_sql_identifier(app_user)
     return f"""
     DO $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}') THEN
-            CREATE ROLE "{app_user}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}';
+            CREATE ROLE "{u}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}';
         ELSE
-            ALTER ROLE "{app_user}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}';
+            ALTER ROLE "{u}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}';
         END IF;
     END
     $$;
@@ -126,15 +147,27 @@ def build_role_sql(app_user: str, app_pass: str) -> str:
 
 
 def build_db_exists_sql(db_name: str) -> str:
-    return f"SELECT 1 FROM pg_database WHERE datname = '{normalize_sql_literal(db_name)}';"
+    return f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{normalize_sql_literal(db_name)}';"
 
 
 def build_create_db_sql(db_name: str, app_user: str) -> str:
-    return f'CREATE DATABASE "{db_name}" OWNER "{app_user}";'
+    d = normalize_sql_identifier(db_name)
+    u = normalize_sql_identifier(app_user)
+    return f'CREATE DATABASE "{d}" OWNER "{u}";'
 
 
-def build_grant_sql(db_name: str, app_user: str) -> str:
-    return f'GRANT ALL PRIVILEGES ON DATABASE "{db_name}" TO "{app_user}";'
+def build_grant_sql(db_name: str, app_user: str, schema_name: str = "public") -> str:
+    d = normalize_sql_identifier(db_name)
+    u = normalize_sql_identifier(app_user)
+    s = normalize_sql_identifier(schema_name)
+    return (
+        f'GRANT CONNECT, TEMPORARY ON DATABASE "{d}" TO "{u}";'
+        f'GRANT ALL ON SCHEMA "{s}" TO "{u}";'
+        f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "{s}" TO "{u}";'
+        f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "{s}" TO "{u}";'
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{s}" GRANT ALL ON TABLES TO "{u}";'
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{s}" GRANT ALL ON SEQUENCES TO "{u}";'
+    )
 
 
 def prompt_identifier(label: str, default: str | None = None) -> str:
@@ -505,6 +538,44 @@ def ssh_base_args(host: str, port: int, user: str, identity_file: str | None) ->
     return args
 
 
+def _is_host_key_error(stderr_text: str) -> bool:
+    t = stderr_text or ""
+    needles = (
+        "REMOTE HOST IDENTIFICATION HAS CHANGED",
+        "Host key verification failed",
+        "key does not match for",
+        "Offending key",
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED",
+    )
+    return any(n in t for n in needles)
+
+
+def _remove_host_key(host: str, port: int) -> None:
+    """Run ssh-keygen -R for host and [host]:port variants. Never aborts."""
+    targets: list[str] = []
+    if host:
+        targets.append(host)
+    if port and port != 22:
+        targets.append(f"[{host}]:{port}")
+    else:
+        targets.append(f"[{host}]:22")
+    for target in targets:
+        try:
+            r = run_cmd(
+                ["ssh-keygen", "-R", target],
+                capture=True,
+                check=False,
+            )
+            if r.returncode == 0:
+                print(f"[hostkey] Removed stale entry: {target}")
+            else:
+                msg = (r.stderr or r.stdout or "").strip()
+                if msg and "not found" not in msg.lower():
+                    print(f"[hostkey] ssh-keygen -R {target}: {msg}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[hostkey] WARN: could not run ssh-keygen -R {target}: {exc}")
+
+
 def ssh_run(
     *,
     host: str,
@@ -514,7 +585,39 @@ def ssh_run(
     remote_command: str,
     capture: bool,
 ) -> subprocess.CompletedProcess[str]:
-    return run_cmd(ssh_base_args(host, port, user, identity_file) + [remote_command], capture=capture)
+    base = ssh_base_args(host, port, user, identity_file)
+    cmd = base + [remote_command]
+    merged_env = os.environ.copy()
+    stdout_pipe = subprocess.PIPE if capture else subprocess.PIPE
+    stderr_pipe = subprocess.PIPE if capture else subprocess.PIPE
+
+    def _run_once() -> subprocess.CompletedProcess[str]:
+        p = subprocess.run(
+            list(cmd),
+            text=True,
+            env=merged_env,
+            stdout=stdout_pipe,
+            stderr=stderr_pipe,
+            check=False,
+        )
+        if not capture:
+            if p.stdout:
+                sys.stdout.write(p.stdout)
+                sys.stdout.flush()
+            if p.stderr:
+                sys.stderr.write(p.stderr)
+                sys.stderr.flush()
+        return p
+
+    result = _run_once()
+    if (result.returncode != 0 or capture) and _is_host_key_error(result.stderr or ""):
+        print()
+        print("[hostkey] Detected stale SSH host key for remote host.")
+        print(f"[hostkey] Running: ssh-keygen -R {host} -R [{host}]:{port}")
+        _remove_host_key(host, port)
+        print("[hostkey] Retrying SSH connection with fresh host keys...")
+        result = _run_once()
+    return result
 
 
 def prompt_ssh_connection() -> tuple[str, int, str, str | None, bool]:
@@ -598,14 +701,14 @@ def remote_install_postgres_ssh() -> None:
     remote_script_lines: list[str] = []
     if mgr == "apt":
         remote_script_lines += [
-            f'{sudo}bash -lc \'if [ -f /etc/apt/sources.list.d/pgdg.list ] && grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.list; then exit 0; fi; apt-get update; apt-get install -y ca-certificates curl gnupg lsb-release; install -d -m 0755 /usr/share/keyrings; if [ ! -f /usr/share/keyrings/postgresql.gpg ]; then curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /usr/share/keyrings/postgresql.gpg >/dev/null; fi; CODENAME="$(lsb_release -cs 2>/dev/null || true)"; if [ -z "$CODENAME" ] && [ -f /etc/os-release ]; then . /etc/os-release; CODENAME="$VERSION_CODENAME"; fi; echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list >/dev/null\'',
-            f"{sudo}apt-get update",
-            f"{sudo}apt-get install -y postgresql-{pg_major} postgresql-contrib-{pg_major}",
+            f'{sudo}bash -lc \'set -e; if [ -f /etc/apt/sources.list.d/pgdg.list ] && grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.list; then exit 0; fi; apt-get update || {{ echo "apt-get update failed (prereqs)"; exit 1; }}; apt-get install -y ca-certificates curl gnupg lsb-release || {{ echo "apt-get install prereqs failed"; exit 2; }}; install -d -m 0755 /usr/share/keyrings || true; if [ ! -f /usr/share/keyrings/postgresql.gpg ]; then curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /usr/share/keyrings/postgresql.gpg >/dev/null || {{ echo "Failed to download/install PGDG signing key"; exit 3; }}; fi; CODENAME="$(lsb_release -cs 2>/dev/null || true)"; if [ -z "$CODENAME" ] && [ -f /etc/os-release ]; then . /etc/os-release; CODENAME="$VERSION_CODENAME"; fi; echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${{CODENAME}}-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list >/dev/null\'',
+            f"{sudo}apt-get update || {{ echo 'apt-get update failed'; exit 4; }}",
+            f"{sudo}apt-get install -y postgresql-{pg_major} postgresql-contrib-{pg_major} || {{ echo 'apt-get install postgresql-{pg_major} failed'; exit 5; }}",
             f"{sudo}systemctl enable --now postgresql || {sudo}service postgresql start || true",
         ]
     else:
         remote_script_lines += [
-            f"{sudo}{mgr} install -y postgresql-server postgresql-contrib",
+            f"{sudo}{mgr} install -y postgresql-server postgresql-contrib || {{ echo '{mgr} install postgresql-server failed'; exit 5; }}",
             f"{sudo}postgresql-setup --initdb || true",
             f"{sudo}systemctl enable --now postgresql || {sudo}service postgresql start || true",
         ]
@@ -654,38 +757,81 @@ def remote_install_postgres_ssh() -> None:
 
 
 REMOTE_FIREWALL_SETUP_SNIPPET = """
+    ufw_port_allowed() {
+      # $1 = numeric port; returns 0 if port/tcp is allowed (by port or service name)
+      local p="$1"
+      local out="$2"
+      echo "$out" | grep -qE "(^|[[:space:]])${p}/tcp([[:space:]]|$)" && return 0
+      local svc
+      while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        echo "$out" | grep -qiE "(^|[[:space:]])${svc}([[:space:]]|$)" && return 0
+      done < <(getent services "${p}/tcp" 2>/dev/null | awk '{print $1}')
+      return 1
+    }
+    firewalld_port_allowed() {
+      # $1 = numeric port; checks ports, services, and running+permanent rich rules
+      local p="$1"
+      local s
+      $SUDO firewall-cmd --list-ports 2>/dev/null | grep -qw "${p}/tcp" && return 0
+      $SUDO firewall-cmd --permanent --list-ports 2>/dev/null | grep -qw "${p}/tcp" && return 0
+      while IFS= read -r s; do
+        [ -z "$s" ] && continue
+        local pn
+        pn="$(getent services "$s/tcp" 2>/dev/null | awk '{print $2}' | cut -d/ -f1)"
+        [ "$pn" = "$p" ] && return 0
+      done < <($SUDO firewall-cmd --list-services 2>/dev/null; $SUDO firewall-cmd --permanent --list-services 2>/dev/null)
+      # Firewalld v0.9+ has --query-port (most robust):
+      if $SUDO firewall-cmd --query-port "${p}/tcp" --permanent >/dev/null 2>&1; then return 0; fi
+      if $SUDO firewall-cmd --query-port "${p}/tcp" >/dev/null 2>&1; then return 0; fi
+      return 1
+    }
     ensure_firewall_ports() {
+      FW_CHANGED=0
+      local was_enabled=0 was_active=0 ufw_out="" pn s
       if command -v ufw >/dev/null 2>&1; then
         if command -v systemctl >/dev/null 2>&1; then
-          if ! $SUDO systemctl is-enabled ufw >/dev/null 2>&1; then
-            $SUDO systemctl enable ufw || true
-          fi
-          if ! $SUDO systemctl is-active ufw >/dev/null 2>&1; then
-            $SUDO systemctl start ufw || true
-          fi
+          $SUDO systemctl is-enabled ufw >/dev/null 2>&1 && was_enabled=1 || true
+          $SUDO systemctl is-active ufw >/dev/null 2>&1 && was_active=1 || true
+          if [ "$was_enabled" -eq 0 ]; then $SUDO systemctl enable ufw >/dev/null 2>&1 || true; FW_CHANGED=1; fi
+          if [ "$was_active" -eq 0 ]; then $SUDO systemctl start ufw >/dev/null 2>&1 || true; FW_CHANGED=1; fi
         elif command -v service >/dev/null 2>&1; then
-          $SUDO service ufw start || true
+          $SUDO service ufw start >/dev/null 2>&1 || true
+          FW_CHANGED=1
         fi
-        $SUDO ufw allow "${SSH_PORT}/tcp" || true
-        $SUDO ufw allow "${PG_PORT}/tcp" || true
-        return
+        ufw_out="$($SUDO ufw status 2>/dev/null || true)"
+        if ! ufw_port_allowed "${SSH_PORT}" "$ufw_out"; then
+          $SUDO ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true; FW_CHANGED=1
+        fi
+        if ! ufw_port_allowed "${PG_PORT}" "$ufw_out"; then
+          $SUDO ufw allow "${PG_PORT}/tcp" >/dev/null 2>&1 || true; FW_CHANGED=1
+        fi
+        return 0
       fi
 
       if command -v firewall-cmd >/dev/null 2>&1; then
+        was_enabled=0; was_active=0
         if command -v systemctl >/dev/null 2>&1; then
-          if ! $SUDO systemctl is-enabled firewalld >/dev/null 2>&1; then
-            $SUDO systemctl enable firewalld || true
-          fi
-          if ! $SUDO systemctl is-active firewalld >/dev/null 2>&1; then
-            $SUDO systemctl start firewalld || true
-          fi
+          $SUDO systemctl is-enabled firewalld >/dev/null 2>&1 && was_enabled=1 || true
+          $SUDO systemctl is-active firewalld >/dev/null 2>&1 && was_active=1 || true
+          if [ "$was_enabled" -eq 0 ]; then $SUDO systemctl enable firewalld >/dev/null 2>&1 || true; FW_CHANGED=1; fi
+          if [ "$was_active" -eq 0 ]; then $SUDO systemctl start firewalld >/dev/null 2>&1 || true; FW_CHANGED=1; fi
         elif command -v service >/dev/null 2>&1; then
-          $SUDO service firewalld start || true
+          $SUDO service firewalld start >/dev/null 2>&1 || true
+          FW_CHANGED=1
         fi
-        $SUDO firewall-cmd --add-port "${SSH_PORT}/tcp" --permanent || true
-        $SUDO firewall-cmd --add-port "${PG_PORT}/tcp" --permanent || true
-        $SUDO firewall-cmd --reload || true
+        if ! firewalld_port_allowed "${SSH_PORT}"; then
+          $SUDO firewall-cmd --add-port "${SSH_PORT}/tcp" --permanent >/dev/null 2>&1 || true; FW_CHANGED=1
+        fi
+        if ! firewalld_port_allowed "${PG_PORT}"; then
+          $SUDO firewall-cmd --add-port "${PG_PORT}/tcp" --permanent >/dev/null 2>&1 || true; FW_CHANGED=1
+        fi
+        if [ "$FW_CHANGED" -eq 1 ]; then
+          $SUDO firewall-cmd --reload >/dev/null 2>&1 || true
+        fi
+        return 0
       fi
+      return 0
     }
 """
 
@@ -715,8 +861,8 @@ REMOTE_CONFIG_FAILSAFE_SNIPPET = """
     backup_remote_config() {
       CONFIG_BACKUP="${CONFIG_FILE}.trae.bak"
       HBA_BACKUP="${HBA_FILE}.trae.bak"
-      $SUDO cp "$CONFIG_FILE" "$CONFIG_BACKUP"
-      $SUDO cp "$HBA_FILE" "$HBA_BACKUP"
+      $SUDO cp "$CONFIG_FILE" "$CONFIG_BACKUP" || { echo "Backup failed for $CONFIG_FILE" >&2; exit 6; }
+      $SUDO cp "$HBA_FILE" "$HBA_BACKUP" || { echo "Backup failed for $HBA_FILE" >&2; exit 6; }
     }
 """
 
@@ -803,15 +949,12 @@ def remote_full_setup_ssh() -> None:
         return
 
     role_sql = " ".join(textwrap.dedent(build_role_sql(app_user, app_pass)).splitlines())
-    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
+    role_exists_sql = f"SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
     db_exists_sql = build_db_exists_sql(db_name)
     create_db_sql = build_create_db_sql(db_name, app_user)
     grant_sql = build_grant_sql(db_name, app_user)
 
     remote_script = f"""
-    set -e
-
-    REPORT_FILE="$(mktemp -p /tmp pg_full_setup_report.XXXXXX)"
     STEP=0
     TOTAL=9
     progress() {{
@@ -819,7 +962,7 @@ def remote_full_setup_ssh() -> None:
       echo "[$STEP/$TOTAL] $1"
     }}
     report() {{
-      printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_FILE"
+      printf '%s\\t%s\\t%s\\n' "$1" "$2" "$3" >> "$REPORT_FILE" 2>/dev/null || true
     }}
     show_report() {{
       echo
@@ -827,14 +970,28 @@ def remote_full_setup_ssh() -> None:
       echo "-------"
       printf '%-22s %-6s %s\\n' "Action" "Status" "Details"
       printf '%-22s %-6s %s\\n' "------" "------" "-------"
-      cat "$REPORT_FILE" | while IFS=$'\\t' read -r a s d; do printf '%-22s %-6s %s\\n' "$a" "$s" "$d"; done
+      if [ -n "$REPORT_FILE" ] && [ -f "$REPORT_FILE" ]; then
+        cat "$REPORT_FILE" 2>/dev/null | while IFS=$'\\t' read -r a s d; do printf '%-22s %-6s %s\\n' "$a" "$s" "$d"; done
+      fi
     }}
+    REPORT_FILE="$(mktemp -p /tmp pg_full_setup_report.XXXXXX 2>/dev/null || echo /tmp/pg_full_setup_report.$$)"
+    : > "$REPORT_FILE" 2>/dev/null || true
     trap 'show_report' EXIT
+    set -e
 
     USE_SUDO={1 if use_sudo else 0}
     if [ "$USE_SUDO" -eq 1 ]; then
       if ! command -v sudo >/dev/null 2>&1; then
-        echo "sudo not found on remote host"
+        report "PGDG repo"       "FAIL" "sudo not found on remote host (needed for privileged writes)"
+        report "Install packages" "FAIL" "sudo not found on remote host (needed for package install)"
+        report "Service"         "FAIL" "sudo not found on remote host (needed for service enable)"
+        report "Role"            "FAIL" "sudo not found on remote host (needed for role creation)"
+        report "Database"        "FAIL" "sudo not found on remote host (needed for database creation)"
+        report "Grants"          "FAIL" "sudo not found on remote host (needed for grant application)"
+        report "listen_addresses" "FAIL" "sudo not found on remote host (needed for postgresql.conf edits)"
+        report "pg_hba rule"     "FAIL" "sudo not found on remote host (needed for pg_hba.conf edits)"
+        report "Firewall"        "FAIL" "sudo not found on remote host (needed for firewall rules)"
+        echo "sudo not found on remote host" >&2
         exit 4
       fi
       SUDO="sudo"
@@ -846,30 +1003,39 @@ def remote_full_setup_ssh() -> None:
     PG_MAJOR={int(pg_major)}
     pkg_installed() {{
       if [ "$PKG_MGR" = "apt" ]; then
-        dpkg-query -W -f='${{Status}}' "postgresql-$PG_MAJOR" 2>/dev/null | grep -q 'install ok installed'
-        return $?
+        if dpkg-query -W -f='${{Status}}' "postgresql-$PG_MAJOR" 2>/dev/null | grep -q 'install ok installed'; then
+          return 0
+        else
+          return 1
+        fi
       fi
-      rpm -q postgresql-server >/dev/null 2>&1 || rpm -q postgresql >/dev/null 2>&1
+      if rpm -q postgresql-server >/dev/null 2>&1; then return 0; fi
+      if rpm -q postgresql >/dev/null 2>&1; then return 0; fi
+      return 1
     }}
 
     progress "Ensure PGDG repo"
     if [ "$PKG_MGR" = "apt" ]; then
-      if [ -f /etc/apt/sources.list.d/pgdg.list ] && grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.list; then
+      PGDG_FOUND=0
+      if [ -f /etc/apt/sources.list.d/pgdg.list ] && $SUDO grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.list; then PGDG_FOUND=1; fi
+      if [ "$PGDG_FOUND" -eq 0 ] && [ -f /etc/apt/sources.list.d/pgdg.sources ] && $SUDO grep -q "apt.postgresql.org" /etc/apt/sources.list.d/pgdg.sources; then PGDG_FOUND=1; fi
+      if [ "$PGDG_FOUND" -eq 0 ] && $SUDO grep -rq "apt.postgresql.org" /etc/apt/sources.list.d/ /etc/apt/sources.list 2>/dev/null; then PGDG_FOUND=1; fi
+      if [ "$PGDG_FOUND" -eq 1 ]; then
         report "PGDG repo" "SKIP" "already configured"
       else
-        $SUDO apt-get update
-        $SUDO apt-get install -y ca-certificates curl gnupg lsb-release
-        $SUDO install -d -m 0755 /usr/share/keyrings
+        $SUDO apt-get update || {{ report "PGDG repo" "FAIL" "apt-get update failed"; echo "apt-get update failed" >&2; exit 9; }}
+        $SUDO apt-get install -y ca-certificates curl gnupg lsb-release || {{ report "PGDG repo" "FAIL" "apt-get install prereqs failed"; echo "apt-get install ca-certificates/curl/gnupg/lsb-release failed" >&2; exit 9; }}
+        $SUDO install -d -m 0755 /usr/share/keyrings || true
         if [ ! -f /usr/share/keyrings/postgresql.gpg ]; then
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | $SUDO gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | $SUDO gpg --dearmor -o /usr/share/keyrings/postgresql.gpg || {{ report "PGDG repo" "FAIL" "gpg key download failed"; echo "Failed to download/install PGDG signing key" >&2; exit 9; }}
         fi
         CODENAME="$(lsb_release -cs 2>/dev/null || true)"
         if [ -z "$CODENAME" ] && [ -f /etc/os-release ]; then
           . /etc/os-release
           CODENAME="$VERSION_CODENAME"
         fi
-        echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" | $SUDO tee /etc/apt/sources.list.d/pgdg.list >/dev/null
-        report "PGDG repo" "DONE" "configured for ${CODENAME}-pgdg"
+        echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${{CODENAME}}-pgdg main" | $SUDO tee /etc/apt/sources.list.d/pgdg.list >/dev/null || {{ report "PGDG repo" "FAIL" "could not write /etc/apt/sources.list.d/pgdg.list"; echo "Failed to write PGDG sources list" >&2; exit 9; }}
+        report "PGDG repo" "DONE" "configured for ${{CODENAME}}-pgdg"
       fi
     else
       report "PGDG repo" "SKIP" "not applicable"
@@ -880,10 +1046,10 @@ def remote_full_setup_ssh() -> None:
       report "Install packages" "SKIP" "postgresql-$PG_MAJOR already installed"
     else
       if [ "$PKG_MGR" = "apt" ]; then
-        $SUDO apt-get update
-        $SUDO apt-get install -y "postgresql-$PG_MAJOR" "postgresql-contrib-$PG_MAJOR"
+        $SUDO apt-get update || {{ report "Install packages" "FAIL" "apt-get update failed"; echo "apt-get update failed" >&2; exit 9; }}
+        $SUDO apt-get install -y "postgresql-$PG_MAJOR" "postgresql-contrib-$PG_MAJOR" || {{ report "Install packages" "FAIL" "apt-get install postgresql-$PG_MAJOR failed"; echo "apt-get install postgresql-$PG_MAJOR failed" >&2; exit 9; }}
       else
-        $SUDO "$PKG_MGR" install -y postgresql-server postgresql-contrib
+        $SUDO "$PKG_MGR" install -y postgresql-server postgresql-contrib || {{ report "Install packages" "FAIL" "$PKG_MGR install postgresql-server failed"; echo "$PKG_MGR install failed" >&2; exit 9; }}
         $SUDO postgresql-setup --initdb || true
       fi
       report "Install packages" "DONE" "installed postgresql-$PG_MAJOR"
@@ -926,41 +1092,53 @@ def remote_full_setup_ssh() -> None:
         su - postgres -c "$cmd"
         return
       fi
-      echo "No supported method to run commands as postgres (sudo/runuser/su missing)"
+      report "Role" "FAIL" "no method to run commands as postgres (sudo/runuser/su missing)"
+      echo "No supported method to run commands as postgres (sudo/runuser/su missing)" >&2
       exit 5
     }}
 
     psqlq() {{
-      as_postgres psql -At -d postgres -c "$1"
+      as_postgres psql -At -d postgres -c "$1" 2>/dev/null || true
     }}
 
     progress "Role: {app_user}"
-    ROLE_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    ROLE_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n' || true)"
+    as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)} || {{ report "Role" "FAIL" "psql error applying role SQL"; echo "Failed to apply role SQL for {app_user}" >&2; exit 10; }}
     if [ "$ROLE_EXISTS" = "1" ]; then
-      report "Role" "SKIP" "role '{app_user}' already exists"
+      report "Role" "SKIP" "role '{app_user}' exists; password idempotently re-applied"
     else
-      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)}
       report "Role" "DONE" "created/updated"
     fi
 
     progress "Database: {db_name}"
-    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n' || true)"
     if [ "$DB_EXISTS" != "1" ]; then
-      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(create_db_sql)}
+      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(create_db_sql)} || {{ report "Database" "FAIL" "psql error creating database"; echo "Failed to create database {db_name}" >&2; exit 10; }}
       report "Database" "DONE" "created"
     else
       report "Database" "SKIP" "db '{db_name}' already exists"
     fi
 
+    APP_USER_VAR={shlex.quote(app_user)}
+    DB_NAME_VAR={shlex.quote(db_name)}
+
     progress "Grants"
-    as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(grant_sql)}
-    report "Grants" "DONE" "applied"
+    GRANT_CHECK_SQL="SELECT CASE WHEN pg_catalog.has_database_privilege(:'app_user_v', :'db_name_v', 'CONNECT') AND pg_catalog.has_schema_privilege(:'app_user_v', 'public', 'USAGE') AND pg_catalog.has_schema_privilege(:'app_user_v', 'public', 'CREATE') THEN 1 ELSE 0 END;"
+    GRANTS_OK="$(as_postgres psql -At -d "$DB_NAME_VAR" -v app_user_v="$APP_USER_VAR" -v db_name_v="$DB_NAME_VAR" -c "$GRANT_CHECK_SQL" 2>/dev/null | tr -d '\\r\\n' || true)"
+    if [ "$GRANTS_OK" = "1" ]; then
+      report "Grants" "SKIP" "privileges already in effect"
+    else
+      (as_postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME_VAR" -c {shlex.quote(grant_sql)} || as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(grant_sql)}) || {{ report "Grants" "FAIL" "psql error applying grant SQL (target and fallback postgres both failed)"; echo "Failed to apply grant SQL for user={app_user} db={db_name}" >&2; exit 10; }}
+      report "Grants" "DONE" "applied"
+    fi
 
     CONFIG_FILE="$(psqlq "SHOW config_file;")"
     HBA_FILE="$(psqlq "SHOW hba_file;")"
     DATA_DIR="$(psqlq "SHOW data_directory;")"
     if [ -z "$CONFIG_FILE" ] || [ -z "$HBA_FILE" ]; then
-      echo "Could not discover PostgreSQL config paths"
+      report "listen_addresses" "FAIL" "could not discover postgresql.conf/hba_file via SHOW; postgres may not be running"
+      report "pg_hba rule" "SKIP" "skipped (config discovery failed)"
+      echo "Could not discover PostgreSQL config paths (config_file='$CONFIG_FILE', hba_file='$HBA_FILE')" >&2
       exit 6
     fi
 
@@ -973,11 +1151,11 @@ def remote_full_setup_ssh() -> None:
 
     progress "Remote access config"
     RULE="host all all $CIDR $AUTH"
-    CURRENT_LISTEN="$(psqlq "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r\\n')"
+    CURRENT_LISTEN="$(psqlq "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r\\n' || true)"
     NEED_LISTEN=0
     NEED_HBA=0
     if [ "$CURRENT_LISTEN" != "$LISTEN_ADDRESSES" ]; then NEED_LISTEN=1; fi
-    if $SUDO grep -Fxq "$RULE" "$HBA_FILE"; then NEED_HBA=0; else NEED_HBA=1; fi
+    if $SUDO grep -vE '^[[:space:]]*#' "$HBA_FILE" 2>/dev/null | tr -d '\\r' | grep -Fq -- "$RULE"; then NEED_HBA=0; else NEED_HBA=1; fi
 
     NEED_RESTART=0
     if [ "$NEED_LISTEN" -eq 0 ]; then
@@ -988,16 +1166,20 @@ def remote_full_setup_ssh() -> None:
     fi
 
     if [ "$NEED_LISTEN" -eq 1 ] || [ "$NEED_HBA" -eq 1 ]; then
-      backup_remote_config
+      backup_remote_config || {{ report "listen_addresses" "FAIL" "backup failed"; report "pg_hba rule" "SKIP" "backup failed (aborted)"; echo "backup_remote_config failed" >&2; exit 11; }}
       trap 'rollback_remote_config' ERR
       if [ "$NEED_LISTEN" -eq 1 ]; then
         if $SUDO test -f "$CONFIG_FILE"; then
           $SUDO sed -ri "s/^\\s*#?\\s*listen_addresses\\s*=.*/listen_addresses = '$LISTEN_ADDRESSES'/" "$CONFIG_FILE" || true
           if ! $SUDO grep -Eq "^\\s*#?\\s*listen_addresses\\s*=" "$CONFIG_FILE"; then
-            echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null
+            echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null || {{ report "listen_addresses" "FAIL" "could not append to $CONFIG_FILE"; echo "Failed to append listen_addresses to $CONFIG_FILE" >&2; exit 7; }}
           fi
         else
-          echo "postgresql.conf not found: $CONFIG_FILE"
+          report "listen_addresses" "FAIL" "postgresql.conf missing: $CONFIG_FILE"
+          if [ "$NEED_HBA" -eq 1 ]; then
+            report "pg_hba rule" "SKIP" "aborted (postgresql.conf missing)"
+          fi
+          echo "postgresql.conf not found: $CONFIG_FILE" >&2
           exit 7
         fi
         report "listen_addresses" "DONE" "set to '$LISTEN_ADDRESSES'"
@@ -1005,34 +1187,37 @@ def remote_full_setup_ssh() -> None:
       fi
 
       if [ "$NEED_HBA" -eq 1 ]; then
-        echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null
+        echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null || {{ report "pg_hba rule" "FAIL" "could not append to $HBA_FILE"; echo "Failed to append pg_hba rule to $HBA_FILE" >&2; exit 7; }}
         report "pg_hba rule" "DONE" "added: $RULE"
         NEED_RESTART=1
       fi
     fi
 
     progress "Firewall ports"
+    {textwrap.dedent(REMOTE_FIREWALL_SETUP_SNIPPET).strip()}
     FW_DONE=0
     if command -v ufw >/dev/null 2>&1; then
       UFW_OUT="$($SUDO ufw status 2>/dev/null || true)"
-      if echo "$UFW_OUT" | grep -q "Status: active" && echo "$UFW_OUT" | grep -q "${{PG_PORT}}/tcp" && echo "$UFW_OUT" | grep -q "${{SSH_PORT}}/tcp"; then
-        report "Firewall" "SKIP" "ufw active; allows ${{SSH_PORT}}/tcp and ${{PG_PORT}}/tcp"
+      if echo "$UFW_OUT" | grep -q "Status: active" && ufw_port_allowed "${{SSH_PORT}}" "$UFW_OUT" && ufw_port_allowed "${{PG_PORT}}" "$UFW_OUT"; then
+        report "Firewall" "SKIP" "ufw active; allows ${{SSH_PORT}}/tcp (ssh) and ${{PG_PORT}}/tcp (pg)"
         FW_DONE=1
       fi
     elif command -v firewall-cmd >/dev/null 2>&1; then
       if $SUDO firewall-cmd --state >/dev/null 2>&1; then
-        PORTS="$($SUDO firewall-cmd --list-ports 2>/dev/null || true)"
-        if echo "$PORTS" | grep -qw "${{PG_PORT}}/tcp" && echo "$PORTS" | grep -qw "${{SSH_PORT}}/tcp"; then
-          report "Firewall" "SKIP" "firewalld running; allowed ports: $PORTS"
+        if firewalld_port_allowed "${{SSH_PORT}}" && firewalld_port_allowed "${{PG_PORT}}"; then
+          report "Firewall" "SKIP" "firewalld running; both ssh and pg ports allowed"
           FW_DONE=1
         fi
       fi
     fi
 
     if [ "$FW_DONE" -eq 0 ]; then
-      {textwrap.dedent(REMOTE_FIREWALL_SETUP_SNIPPET).strip()}
-      ensure_firewall_ports
-      report "Firewall" "DONE" "rules applied"
+      ensure_firewall_ports || true
+      if [ "$FW_CHANGED" -eq 0 ]; then
+        report "Firewall" "SKIP" "verified after ensure; no new rules required"
+      else
+        report "Firewall" "DONE" "rules applied"
+      fi
     fi
 
     progress "Restart/health"
@@ -1050,8 +1235,14 @@ def remote_full_setup_ssh() -> None:
       report "Restart" "SKIP" "no config changes"
     fi
 
-    as_postgres psql -At -d postgres -c "SELECT 1;" | grep -qx "1"
-    report "Health" "OK" "SELECT 1"
+    HEALTH_OUT="$(as_postgres psql -At -d postgres -c "SELECT 1;" 2>/dev/null | tr -d '\\r\\n' || true)"
+    if [ "$HEALTH_OUT" = "1" ]; then
+      report "Health" "OK" "SELECT 1"
+    else
+      report "Health" "FAIL" "output='$HEALTH_OUT'"
+      echo "Health check failed: expected '1' from postgres, got: '$HEALTH_OUT'" >&2
+      exit 8
+    fi
 
     echo "OK"
     """
@@ -1166,7 +1357,7 @@ def configure_db_user_local() -> None:
 
     step += 1
     print_progress(step, total, f"Role: {app_user}")
-    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
+    role_exists_sql = f"SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
     role_exists = run_cmd(base_cmd + ["-At", "-c", role_exists_sql], env=env, capture=True, check=False)
     role_present = role_exists.returncode == 0 and (role_exists.stdout or "").strip() == "1"
     update_role = True
@@ -1325,6 +1516,16 @@ def write_text_file_atomic(path: str, content: str) -> None:
             pass
 
 
+def _extract_conf_value(line: str, key: str) -> str | None:
+    m = re.match(rf"^\s*#?\s*{re.escape(key)}\s*=\s*(.+?)\s*$", line.rstrip("\r\n"))
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        return raw[1:-1]
+    return raw
+
+
 def set_listen_addresses(conf_path: str, listen_addresses_value: str) -> bool:
     src = read_text_file(conf_path)
     lines = src.splitlines(True)
@@ -1340,29 +1541,50 @@ def set_listen_addresses(conf_path: str, listen_addresses_value: str) -> bool:
                 changed = True
                 continue
         if re.match(r"^\s*listen_addresses\s*=", line):
-            out.append(f"listen_addresses = '{listen_addresses_value}'\n")
-            changed = True
-            continue
+            current = _extract_conf_value(line, "listen_addresses")
+            if current != listen_addresses_value:
+                out.append(f"listen_addresses = '{listen_addresses_value}'\n")
+                changed = True
+                continue
         out.append(line)
 
     if not changed:
-        if out and not out[-1].endswith("\n"):
-            out[-1] += "\n"
-        out.append(f"listen_addresses = '{listen_addresses_value}'\n")
-        changed = True
+        found_active = any(
+            re.match(r"^\s*listen_addresses\s*=", ln)
+            for ln in lines
+        )
+        if not found_active:
+            if out and not out[-1].endswith("\n"):
+                out[-1] += "\n"
+            out.append(f"listen_addresses = '{listen_addresses_value}'\n")
+            changed = True
 
     if changed:
         write_text_file_atomic(conf_path, "".join(out))
     return changed
 
 
+def _pg_hba_rule_exists(hba_path: str, cidr: str, auth_method: str) -> bool:
+    needle = f"host all all {cidr} {auth_method}"
+    try:
+        with open(hba_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stripped = line.lstrip()
+                if stripped.startswith("#"):
+                    continue
+                if needle in stripped:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 def ensure_pg_hba_rule(hba_path: str, cidr: str, auth_method: str) -> bool:
+    if _pg_hba_rule_exists(hba_path, cidr, auth_method):
+        return False
+
     src = read_text_file(hba_path)
     rule = f"host all all {cidr} {auth_method}\n"
-    normalized = "\n".join(l.rstrip("\r") for l in src.splitlines())
-
-    if rule.strip() in normalized:
-        return False
 
     out = src
     if out and not out.endswith("\n"):
@@ -1484,7 +1706,7 @@ def local_postgres_audit(
         user=user,
         db=db,
         password=password,
-        sql=f"SELECT 1 FROM pg_database WHERE datname = '{normalize_sql_literal(db)}';",
+        sql=f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{normalize_sql_literal(db)}';",
     )
     role_exists = psql_query(
         psql,
@@ -1493,7 +1715,7 @@ def local_postgres_audit(
         user=user,
         db=db,
         password=password,
-        sql=f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(user)}';",
+        sql=f"SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(user)}';",
     )
     config_file = psql_query(psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW config_file;")
     hba_file = psql_query(psql, host=host, port=port, user=user, db=db, password=password, sql="SHOW hba_file;")
@@ -1535,17 +1757,18 @@ def remote_postgres_audit_ssh(
     expected_db: str,
     expected_role: str,
 ) -> tuple[bool, list[tuple[str, str]]]:
-    mgr = detect_remote_linux_pkg_manager(host=host, port=port, user=user, identity_file=identity_file)
+    mgr, diag = detect_remote_linux_pkg_manager(host=host, port=port, user=user, identity_file=identity_file)
     if not mgr:
-        return False, [("ssh/package manager", "failed to detect remote host details")]
+        diag_block = diag if diag else "failed to detect remote host details"
+        return False, [("ssh/package manager", diag_block)]
 
     if mgr == "apt":
         pkg_check = "dpkg-query -W -f='${Status}' postgresql 2>/dev/null | grep -q 'install ok installed'"
     else:
         pkg_check = "rpm -q postgresql-server >/dev/null 2>&1 || rpm -q postgresql >/dev/null 2>&1"
 
-    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(expected_role)}';"
-    db_exists_sql = f"SELECT 1 FROM pg_database WHERE datname = '{normalize_sql_literal(expected_db)}';"
+    role_exists_sql = f"SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(expected_role)}';"
+    db_exists_sql = f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{normalize_sql_literal(expected_db)}';"
     remote_script = f"""
     emit() {{
       printf '__AUDIT__%s=%s\\n' "$1" "$2"
@@ -1769,8 +1992,7 @@ def enable_remote_access_local() -> None:
         password=superpass if use_password else None,
         sql="SHOW listen_addresses;",
     )
-    rule_line = f"host all all {cidr} {auth}"
-    rule_present = file_has_exact_line(hba_file, rule_line)
+    rule_present = _pg_hba_rule_exists(hba_file, cidr, auth)
     firewall_allowed = is_firewall_port_allowed(port)
 
     if current_listen == listen_addresses and rule_present and firewall_allowed is True:
@@ -1791,8 +2013,9 @@ def enable_remote_access_local() -> None:
     try:
         if current_listen != listen_addresses:
             config_backup = backup_file(config_file)
-            changed = set_listen_addresses(config_file, listen_addresses) or changed
-            summary.append(("listen_addresses", "done"))
+            set_result = set_listen_addresses(config_file, listen_addresses)
+            changed = set_result or changed
+            summary.append(("listen_addresses", "done" if set_result else "skipped (already set)"))
         else:
             summary.append(("listen_addresses", "skipped (already set)"))
     except PermissionError:
@@ -1809,10 +2032,13 @@ def enable_remote_access_local() -> None:
     print_progress(step, total, "pg_hba.conf: rule")
     try:
         if not rule_present:
-            if not hba_backup:
-                hba_backup = backup_file(hba_file)
-            changed = ensure_pg_hba_rule(hba_file, cidr, auth) or changed
-            summary.append(("pg_hba.conf rule", "done"))
+            hba_backup = backup_file(hba_file)
+            rule_result = ensure_pg_hba_rule(hba_file, cidr, auth)
+            changed = rule_result or changed
+            if rule_result:
+                summary.append(("pg_hba.conf rule", "done"))
+            else:
+                summary.append(("pg_hba.conf rule", "skipped (already present)"))
         else:
             summary.append(("pg_hba.conf rule", "skipped (already present)"))
     except PermissionError:
@@ -1931,9 +2157,6 @@ def enable_remote_access_ssh() -> None:
         return
 
     remote_script = f"""
-    set -e
-
-    REPORT_FILE="$(mktemp -p /tmp pg_remote_access_report.XXXXXX)"
     STEP=0
     TOTAL=4
     progress() {{
@@ -1941,7 +2164,7 @@ def enable_remote_access_ssh() -> None:
       echo "[$STEP/$TOTAL] $1"
     }}
     report() {{
-      printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_FILE"
+      printf '%s\\t%s\\t%s\\n' "$1" "$2" "$3" >> "$REPORT_FILE" 2>/dev/null || true
     }}
     show_report() {{
       echo
@@ -1949,15 +2172,24 @@ def enable_remote_access_ssh() -> None:
       echo "-------"
       printf '%-22s %-6s %s\\n' "Action" "Status" "Details"
       printf '%-22s %-6s %s\\n' "------" "------" "-------"
-      cat "$REPORT_FILE" | while IFS=$'\\t' read -r a s d; do printf '%-22s %-6s %s\\n' "$a" "$s" "$d"; done
+      if [ -n "$REPORT_FILE" ] && [ -f "$REPORT_FILE" ]; then
+        cat "$REPORT_FILE" 2>/dev/null | while IFS=$'\\t' read -r a s d; do printf '%-22s %-6s %s\\n' "$a" "$s" "$d"; done
+      fi
     }}
+    REPORT_FILE="$(mktemp -p /tmp pg_remote_access_report.XXXXXX 2>/dev/null || echo /tmp/pg_remote_access_report.$$)"
+    : > "$REPORT_FILE" 2>/dev/null || true
     trap 'show_report' EXIT
+    set -e
 
     USE_SUDO={1 if use_sudo else 0}
 
     if [ "$USE_SUDO" -eq 1 ]; then
       if ! command -v sudo >/dev/null 2>&1; then
-        echo "sudo not found on remote host"
+        report "listen_addresses" "FAIL" "sudo not found on remote host (needed for postgresql.conf edits)"
+        report "pg_hba rule"     "FAIL" "sudo not found on remote host (needed for pg_hba.conf edits)"
+        report "Firewall"        "FAIL" "sudo not found on remote host (needed for firewall rules)"
+        report "Restart/health"  "FAIL" "sudo not found on remote host (needed for postgresql restart)"
+        echo "sudo not found on remote host" >&2
         exit 4
       fi
       SUDO="sudo"
@@ -1982,12 +2214,13 @@ def enable_remote_access_ssh() -> None:
         su - postgres -c "$cmd"
         return
       fi
-      echo "No supported method to run commands as postgres (sudo/runuser/su missing)"
+      report "listen_addresses" "FAIL" "no method to run commands as postgres (sudo/runuser/su missing)"
+      echo "No supported method to run commands as postgres (sudo/runuser/su missing)" >&2
       exit 5
     }}
 
     psqlq() {{
-      as_postgres psql -At -d postgres -c "$1"
+      as_postgres psql -At -d postgres -c "$1" 2>/dev/null || true
     }}
 
     CONFIG_FILE="$(psqlq "SHOW config_file;")"
@@ -1995,7 +2228,9 @@ def enable_remote_access_ssh() -> None:
     DATA_DIR="$(psqlq "SHOW data_directory;")"
 
     if [ -z "$CONFIG_FILE" ] || [ -z "$HBA_FILE" ]; then
-      echo "Could not discover PostgreSQL config paths"
+      report "listen_addresses" "FAIL" "could not discover postgresql.conf/hba_file via SHOW; postgres may not be running"
+      report "pg_hba rule" "SKIP" "skipped (config discovery failed)"
+      echo "Could not discover PostgreSQL config paths (config_file='$CONFIG_FILE', hba_file='$HBA_FILE')" >&2
       exit 6
     fi
 
@@ -2005,12 +2240,12 @@ def enable_remote_access_ssh() -> None:
     SSH_PORT={int(ssh_port)}
     PG_PORT={int(pg_port)}
     RULE="host all all $CIDR $AUTH"
-    CURRENT_LISTEN="$(psqlq "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r\\n')"
+    CURRENT_LISTEN="$(psqlq "SHOW listen_addresses;" 2>/dev/null | tr -d '\\r\\n' || true)"
 
     NEED_LISTEN=0
     NEED_HBA=0
     if [ "$CURRENT_LISTEN" != "$LISTEN_ADDRESSES" ]; then NEED_LISTEN=1; fi
-    if $SUDO grep -Fxq "$RULE" "$HBA_FILE"; then NEED_HBA=0; else NEED_HBA=1; fi
+    if $SUDO grep -vE '^[[:space:]]*#' "$HBA_FILE" 2>/dev/null | tr -d '\\r' | grep -Fq -- "$RULE"; then NEED_HBA=0; else NEED_HBA=1; fi
     NEED_RESTART=0
 
     progress "Remote access config"
@@ -2022,10 +2257,11 @@ def enable_remote_access_ssh() -> None:
         if $SUDO test -f "$CONFIG_FILE"; then
           $SUDO sed -ri "s/^\\s*#?\\s*listen_addresses\\s*=.*/listen_addresses = '$LISTEN_ADDRESSES'/" "$CONFIG_FILE" || true
           if ! $SUDO grep -Eq "^\\s*#?\\s*listen_addresses\\s*=" "$CONFIG_FILE"; then
-            echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null
+            echo "listen_addresses = '$LISTEN_ADDRESSES'" | $SUDO tee -a "$CONFIG_FILE" >/dev/null || {{ report "listen_addresses" "FAIL" "could not append to $CONFIG_FILE"; echo "Failed to append listen_addresses to $CONFIG_FILE" >&2; exit 7; }}
           fi
         else
-          echo "postgresql.conf not found: $CONFIG_FILE"
+          report "listen_addresses" "FAIL" "postgresql.conf missing: $CONFIG_FILE"
+          echo "postgresql.conf not found: $CONFIG_FILE" >&2
           exit 7
         fi
         report "listen_addresses" "DONE" "set to '$LISTEN_ADDRESSES'"
@@ -2035,7 +2271,7 @@ def enable_remote_access_ssh() -> None:
       fi
 
       if [ "$NEED_HBA" -eq 1 ]; then
-        echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null
+        echo "$RULE" | $SUDO tee -a "$HBA_FILE" >/dev/null || {{ report "pg_hba rule" "FAIL" "could not append to $HBA_FILE"; echo "Failed to append pg_hba rule to $HBA_FILE" >&2; exit 7; }}
         report "pg_hba rule" "DONE" "added: $RULE"
         NEED_RESTART=1
       else
@@ -2047,26 +2283,29 @@ def enable_remote_access_ssh() -> None:
     fi
 
     progress "Firewall ports"
+    {textwrap.dedent(REMOTE_FIREWALL_SETUP_SNIPPET).strip()}
     FW_DONE=0
     if command -v ufw >/dev/null 2>&1; then
       UFW_OUT="$($SUDO ufw status 2>/dev/null || true)"
-      if echo "$UFW_OUT" | grep -q "Status: active" && echo "$UFW_OUT" | grep -q "${{PG_PORT}}/tcp" && echo "$UFW_OUT" | grep -q "${{SSH_PORT}}/tcp"; then
-        report "Firewall" "SKIP" "ufw active; allows ${{SSH_PORT}}/tcp and ${{PG_PORT}}/tcp"
+      if echo "$UFW_OUT" | grep -q "Status: active" && ufw_port_allowed "${{SSH_PORT}}" "$UFW_OUT" && ufw_port_allowed "${{PG_PORT}}" "$UFW_OUT"; then
+        report "Firewall" "SKIP" "ufw active; allows ${{SSH_PORT}}/tcp (ssh) and ${{PG_PORT}}/tcp (pg)"
         FW_DONE=1
       fi
     elif command -v firewall-cmd >/dev/null 2>&1; then
       if $SUDO firewall-cmd --state >/dev/null 2>&1; then
-        PORTS="$($SUDO firewall-cmd --list-ports 2>/dev/null || true)"
-        if echo "$PORTS" | grep -qw "${{PG_PORT}}/tcp" && echo "$PORTS" | grep -qw "${{SSH_PORT}}/tcp"; then
-          report "Firewall" "SKIP" "firewalld running; allowed ports: $PORTS"
+        if firewalld_port_allowed "${{SSH_PORT}}" && firewalld_port_allowed "${{PG_PORT}}"; then
+          report "Firewall" "SKIP" "firewalld running; both ssh and pg ports allowed"
           FW_DONE=1
         fi
       fi
     fi
     if [ "$FW_DONE" -eq 0 ]; then
-      {textwrap.dedent(REMOTE_FIREWALL_SETUP_SNIPPET).strip()}
-      ensure_firewall_ports
-      report "Firewall" "DONE" "rules applied"
+      ensure_firewall_ports || true
+      if [ "$FW_CHANGED" -eq 0 ]; then
+        report "Firewall" "SKIP" "verified after ensure; no new rules required"
+      else
+        report "Firewall" "DONE" "rules applied"
+      fi
     fi
 
     progress "Restart/health"
@@ -2084,8 +2323,14 @@ def enable_remote_access_ssh() -> None:
       report "Restart" "SKIP" "no config changes"
     fi
 
-    as_postgres psql -At -d postgres -c "SELECT 1;" | grep -qx "1"
-    report "Health" "OK" "SELECT 1"
+    HEALTH_OUT="$(as_postgres psql -At -d postgres -c "SELECT 1;" 2>/dev/null | tr -d '\\r\\n' || true)"
+    if [ "$HEALTH_OUT" = "1" ]; then
+      report "Health" "OK" "SELECT 1"
+    else
+      report "Health" "FAIL" "output='$HEALTH_OUT'"
+      echo "Health check failed: expected '1' from postgres, got: '$HEALTH_OUT'" >&2
+      exit 8
+    fi
 
     echo "OK"
     """
@@ -2170,14 +2415,11 @@ def configure_db_user_ssh() -> None:
         app_pass = getpass.getpass("App user password: ")
 
     role_sql = " ".join(textwrap.dedent(build_role_sql(app_user, app_pass)).splitlines())
-    role_exists_sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
+    role_exists_sql = f"SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}';"
     db_exists_sql = build_db_exists_sql(db_name)
     create_db_sql = build_create_db_sql(db_name, app_user)
     grant_sql = build_grant_sql(db_name, app_user)
     remote_script = f"""
-    set -e
-
-    REPORT_FILE="$(mktemp -p /tmp pg_config_report.XXXXXX)"
     STEP=0
     TOTAL=3
     progress() {{
@@ -2185,7 +2427,7 @@ def configure_db_user_ssh() -> None:
       echo "[$STEP/$TOTAL] $1"
     }}
     report() {{
-      printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_FILE"
+      printf '%s\\t%s\\t%s\\n' "$1" "$2" "$3" >> "$REPORT_FILE" 2>/dev/null || true
     }}
     show_report() {{
       echo
@@ -2193,9 +2435,14 @@ def configure_db_user_ssh() -> None:
       echo "-------"
       printf '%-18s %-6s %s\\n' "Action" "Status" "Details"
       printf '%-18s %-6s %s\\n' "------" "------" "-------"
-      cat "$REPORT_FILE" | while IFS=$'\\t' read -r a s d; do printf '%-18s %-6s %s\\n' "$a" "$s" "$d"; done
+      if [ -n "$REPORT_FILE" ] && [ -f "$REPORT_FILE" ]; then
+        cat "$REPORT_FILE" 2>/dev/null | while IFS=$'\\t' read -r a s d; do printf '%-18s %-6s %s\\n' "$a" "$s" "$d"; done
+      fi
     }}
+    REPORT_FILE="$(mktemp -p /tmp pg_config_report.XXXXXX 2>/dev/null || echo /tmp/pg_config_report.$$)"
+    : > "$REPORT_FILE" 2>/dev/null || true
     trap 'show_report' EXIT
+    set -e
 
     as_postgres() {{
       if command -v sudo >/dev/null 2>&1; then
@@ -2214,21 +2461,21 @@ def configure_db_user_ssh() -> None:
         su - postgres -c "$cmd"
         return
       fi
-      echo "No supported method to run commands as postgres (sudo/runuser/su missing)"
+      report "Role" "FAIL" "no method to run commands as postgres (sudo/runuser/su missing)"
+      echo "No supported method to run commands as postgres (sudo/runuser/su missing)" >&2
       exit 5
     }}
-
     progress "Role: {app_user}"
-    ROLE_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    ROLE_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(role_exists_sql)} 2>/dev/null | tr -d '\\r\\n' || true)"
+    as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)}
     if [ "$ROLE_EXISTS" = "1" ]; then
-      report "Role" "SKIP" "role '{app_user}' already exists"
+      report "Role" "SKIP" "role '{app_user}' exists; password idempotently re-applied"
     else
-      as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(role_sql)}
       report "Role" "DONE" "created/updated"
     fi
 
     progress "Database: {db_name}"
-    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n')"
+    DB_EXISTS="$(as_postgres psql -At -d postgres -c {shlex.quote(db_exists_sql)} 2>/dev/null | tr -d '\\r\\n' || true)"
     if [ "$DB_EXISTS" != "1" ]; then
       as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(create_db_sql)}
       report "Database" "DONE" "created"
@@ -2236,9 +2483,18 @@ def configure_db_user_ssh() -> None:
       report "Database" "SKIP" "db '{db_name}' already exists"
     fi
 
+    APP_USER_VAR2={shlex.quote(app_user)}
+    DB_NAME_VAR2={shlex.quote(db_name)}
+
     progress "Grants"
-    as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(grant_sql)}
-    report "Grants" "DONE" "applied"
+    GRANT_CHECK_SQL2="SELECT CASE WHEN pg_catalog.has_database_privilege(:'app_user_v2', :'db_name_v2', 'CONNECT') AND pg_catalog.has_schema_privilege(:'app_user_v2', 'public', 'USAGE') AND pg_catalog.has_schema_privilege(:'app_user_v2', 'public', 'CREATE') THEN 1 ELSE 0 END;"
+    GRANTS_OK2="$(as_postgres psql -At -d "$DB_NAME_VAR2" -v app_user_v2="$APP_USER_VAR2" -v db_name_v2="$DB_NAME_VAR2" -c "$GRANT_CHECK_SQL2" 2>/dev/null | tr -d '\\r\\n' || true)"
+    if [ "$GRANTS_OK2" = "1" ]; then
+      report "Grants" "SKIP" "privileges already in effect"
+    else
+      (as_postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME_VAR2" -c {shlex.quote(grant_sql)} || as_postgres psql -v ON_ERROR_STOP=1 -d postgres -c {shlex.quote(grant_sql)}) || {{ report "Grants" "FAIL" "psql error applying grant SQL (target and fallback postgres both failed)"; echo "Failed to apply grant SQL for user={app_user} db={db_name}" >&2; exit 10; }}
+      report "Grants" "DONE" "applied"
+    fi
     """
 
     print_block(
