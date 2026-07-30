@@ -161,11 +161,13 @@ _CHARS_UTF8 = {
     "tl": "╔", "tr": "╗", "bl": "╚", "br": "╝", "h": "═", "v": "║",
     "ml": "╠", "mr": "╣", "mdh": "╦", "muh": "╩", "mx": "╬",
     "em": "—", "ge": "≥", "le": "≤", "arr": "→", "larr": "←",
+    "x": "✗", "ok": "✓",
 }
 _CHARS_ASCII = {
     "tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
     "ml": "+", "mr": "+", "mdh": "+", "muh": "+", "mx": "+",
     "em": "--", "ge": ">=", "le": "<=", "arr": "->", "larr": "<-",
+    "x": "x", "ok": "ok",
 }
 
 
@@ -252,6 +254,14 @@ def _wrap_text_width(text: str, width: int = _STDOUT_WIDTH,
         text = ""
     if not isinstance(text, str):
         text = str(text)
+    # Strip carriage returns that cause 74-char-padded lines to end with \r and
+    # reset cursor to col 0 between prints (overwrite corruption). Python's
+    # argparse HelpFormatter on Windows writes usage via text mode so strings
+    # are CRLF-delimited; split("\n") below then keeps the "\r" tail on every
+    # paragraph — which we must drop BEFORE width-padding or every padded
+    # line's tail \r undoes the whole line's render on next line's overwrite.
+    # Similarly, bare \r (old-Mac line breaks) become paragraph boundaries.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     # Always normalize first: —→--, ≥→>= etc. so widths reflect final output char counts
     # (normalization never adds width beyond ASCII equivalents; —=1→--=2, so must be pre-counted)
     text = _norm_text(text, no_unicode=True)
@@ -491,8 +501,16 @@ _COLORS = {
     "GREEN": "\033[32m",
     "YELLOW": "\033[33m",
     "BLUE": "\033[34m",
+    "MAGENTA": "\033[35m",
+    "CYAN": "\033[36m",
     "BOLD": "\033[1m",
     "RESET": "\033[0m",
+    "BOLD_RED": "\033[1;31m",
+    "BOLD_GREEN": "\033[1;32m",
+    "BOLD_YELLOW": "\033[1;33m",
+    "BOLD_BLUE": "\033[1;34m",
+    "BOLD_MAGENTA": "\033[1;35m",
+    "BOLD_CYAN": "\033[1;36m",
 }
 
 
@@ -529,11 +547,108 @@ def setup_logging(log_dir: Path, quiet: bool = False, verbose: bool = False,
     console.addFilter(_DropErrorsOnConsoleFilter())
     logger.addHandler(console)
 
+    # ------------------------------------------------------------------
+    # Cross-process locking FileHandler.
+    # Multiple concurrent rasyatone_deploy.py invocations append to the SAME
+    # deploy.log. Without per-record byte-range locks:
+    #   (a) writes shorter than 4KB-64KB can still interleave mid-line,
+    #   (b) even O_APPEND on Windows/POSIX can return writes in "wrong"
+    #       timestamp order when two processes emit their record within ~1ms
+    #       (as seen in deploy.log lines 108-137 where PID=30636 @ 11:13:23
+    #        PRECEDES PID=6216 @ 11:04:41 in the file).
+    # Fix: use msvcrt.locking LK_NBLCK (NON-BLOCKING attempt, 3 tries with
+    # 25ms backoff) on Windows; fcntl.flock LOCK_EX | LOCK_NB on POSIX.
+    # CRITICAL: we NEVER wait more than ~100ms total for a log lock — logging
+    # must never delay the deploy pipeline (deploy.log 158-185 showed ~9s gaps
+    # caused by a prior LK_LOCK attempt waiting on another PID's handle). If
+    # we cannot acquire in 3 tries, emit the record UNLOCKED (O_APPEND on
+    # NTFS/UFS is always atomic per POSIX for writes smaller than PIPE_BUF).
+    # ------------------------------------------------------------------
+    class _LockedFileHandler(_logging.FileHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                stream = self.stream
+            except Exception:
+                self.handleError(record)
+                return
+            acquired = False
+            try:
+                acquired = self._lock_ex_nb(stream, tries=3, sleep_ms=25)
+                try:
+                    if self.mode == "a":
+                        try: stream.seek(0, 2)
+                        except Exception: pass
+                    stream.write(msg)
+                    stream.write(self.terminator)
+                    self.flush()
+                finally:
+                    if acquired:
+                        self._unlock(stream)
+            except Exception:
+                self.handleError(record)
+
+        @staticmethod
+        def _lock_ex_nb(stream, tries: int = 3, sleep_ms: int = 25) -> bool:
+            """Return True if a non-blocking exclusive lock was acquired.
+
+            Never blocks longer than `tries * sleep_ms` milliseconds (plus the
+            negligible syscall overhead). Caller is responsible for _unlock()
+            only when this returned True.
+            """
+            fp = getattr(stream, "fileno", None)
+            if fp is None: return False
+            try: fd = fp()
+            except Exception: return False
+            on_windows = _geteuid_or_none() is None
+            import time as _tm_lk
+            for attempt in range(max(1, tries)):
+                try:
+                    if on_windows:
+                        import msvcrt  # type: ignore
+                        import os as _os_lk
+                        n_bytes = 1024 * 1024  # 1 MB past current EOF
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, n_bytes)
+                        return True
+                    else:
+                        try:
+                            import fcntl  # type: ignore
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            return True
+                        except ImportError:
+                            return False
+                except Exception:
+                    if attempt + 1 < tries:
+                        _tm_lk.sleep(sleep_ms / 1000.0)
+            return False
+
+        @staticmethod
+        def _unlock(stream):
+            fp = getattr(stream, "fileno", None)
+            if fp is None: return
+            try: fd = fp()
+            except Exception: return
+            on_windows = _geteuid_or_none() is None
+            try:
+                if on_windows:
+                    import msvcrt  # type: ignore
+                    n_bytes = 1024 * 1024
+                    try: msvcrt.locking(fd, msvcrt.LK_UNLCK, n_bytes)
+                    except Exception: pass
+                else:
+                    try:
+                        import fcntl  # type: ignore
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except ImportError:
+                        pass
+            except Exception:
+                pass
+
     # File handler /var/log/rasyatone/deploy.log (0640, rasyatone_user:adm if possible)
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         deploy_log = log_dir / "deploy.log"
-        file_h = _logging.FileHandler(deploy_log, mode="a", encoding="utf-8")
+        file_h = _LockedFileHandler(deploy_log, mode="a", encoding="utf-8")
         file_h.setLevel(_logging.DEBUG)
         file_h.setFormatter(_logging.Formatter(
             "%(asctime)s | ST=%(stage)s | PID=%(process)d | %(levelname)-7s | %(message)s",
@@ -2650,19 +2765,102 @@ def _is_host_key_error(stderr: str) -> bool:
     if not stderr:
         return False
     needles = ("REMOTE HOST IDENTIFICATION HAS CHANGED", "Host key verification failed",
-               "key does not match for", "Offending key", "WARNING: POSSIBLE DNS SPOOFING")
+               "key does not match for", "Offending key", "WARNING: POSSIBLE DNS SPOOFING",
+               "server's host key is not cached",  # PuTTY/plink first-connect
+               "host key does not match",  # PuTTY/plink changed-key
+               "cached server host key differs",  # PuTTY variants
+               "Cannot confirm a host key in batch mode")  # PuTTY/plink -batch abort
     return any(h in stderr for h in needles)
 
 
+def _putty_registry_hostkey_key_names(host: str, port: Optional[int] = None) -> list[str]:
+    """PuTTY stores host keys as HKCU\\Software\\SimonTatham\\PuTTY\\SshHostKeys\\
+    with value names == "<ssh-algo>@<port>:<host>" for custom ports, or
+    "<ssh-algo>@<host>" for port 22. Return the (algo-oblivious) tail parts
+    "<port>:<host>" / "<host>" that we need to strip-value-delete from the
+    SshHostKeys subkey to clear stale PuTTY cache for a target host.
+    """
+    suffixes: list[str] = []
+    p = port if port else 22
+    if p == 22:
+        suffixes.append(f"@{host}")
+    suffixes.append(f"@{p}:{host}")
+    # PuTTY sometimes stores IPv4 with 0-padded dotted quad; include a fallback
+    # matching-bysuffix loop in _clear_putty_host_keys rather than enumerate here.
+    return suffixes
+
+
+def _clear_putty_host_keys(host: str, port: Optional[int] = None, log=None) -> int:
+    """Clear stale PuTTY/plink host-key entries from HKCU registry. Returns 0 on success,
+    non-zero on access error (registry not available or empty)."""
+    on_windows = _geteuid_or_none() is None
+    if not on_windows:
+        return 0
+    try:
+        import winreg  # type: ignore
+    except Exception:
+        return 0
+    deleted = 0
+    errors = 0
+    SQ = f"Software\\SimonTatham\\PuTTY\\SshHostKeys"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SQ, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as h:
+            i = 0
+            names: list[str] = []
+            while True:
+                try:
+                    names.append(winreg.EnumValue(h, i)[0])
+                except OSError:
+                    break
+                i += 1
+            p = port if port else 22
+            # match tail forms: "<algo>@host" (22) / "<algo>@port:host" (custom) /
+            # also catch IPv4 dotted-quad canonicalized-by-plink forms
+            host_lower = host.lower()
+            host_suffixes = [
+                f"@{host}",
+                f"@{p}:{host}",
+            ]
+            host_suffixes_lower = [s.lower() for s in host_suffixes]
+            for vn in names:
+                try:
+                    vnl = vn.lower()
+                    for suf in host_suffixes_lower:
+                        if vnl.endswith(suf):
+                            winreg.DeleteValue(h, vn)
+                            deleted += 1
+                            break
+                except Exception as exc:
+                    if log is not None:
+                        log.warning("[hostkey/putty] cannot delete regval %s: %s", vn, exc)
+                    errors += 1
+            if log is not None and deleted:
+                log.info("[hostkey/putty] cleared %d stale PuTTY SshHostKeys entry/entries for %s",
+                         deleted, host)
+            return 0 if errors == 0 else 1
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        if log is not None:
+            log.warning("[hostkey/putty] cannot open PuTTY SshHostKeys regkey: %s", exc)
+        return 2
+
+
 def _remove_host_key(host: str, port: Optional[int] = None, log=None) -> int:
-    """Run ssh-keygen -R twice (bare and host:port bracketed). Returns 0 if last run_ok was 0."""
+    """Run ssh-keygen -R twice (bare and host:port bracketed) plus clear PuTTY
+    SshHostKeys registry (Windows/plink path). Returns 0 if any cleanup succeeded."""
     def _run(cmd):
         return run_ok(cmd, log=log, check=False, timeout=60).returncode
     r1 = _run(["ssh-keygen", "-R", host])
     r2 = 0
     if port and port != 22:
         r2 = _run(["ssh-keygen", "-R", f"[{host}]:{port}"])
-    return 0 if r1 == 0 or r2 == 0 else r1 | r2
+    rp = _clear_putty_host_keys(host, port=port, log=log)
+    openssh_ok = (r1 == 0 or r2 == 0)
+    if openssh_ok or rp == 0:
+        return 0
+    return (r1 | r2) if rp == 0 else (r1 | r2 | rp)
 
 
 def _ssh_base_args(host: str, user: str, port: Optional[int], identity: Optional[Path],
@@ -2689,29 +2887,486 @@ def _ssh_base_args(host: str, user: str, port: Optional[int], identity: Optional
     return args
 
 
+def _ssh_locate_plink() -> Optional[str]:
+    """Return path to PuTTY plink.exe binary if available (Windows password-auth capable), else None."""
+    return shutil.which("plink")
+
+
+_PLINK_HOSTKEY_FLAGS: Optional[list[str]] = None  # memoized: -auto_store_ssh_keys or fallback
+
+
+def _plink_hostkey_flags(plink_exe: Optional[str] = None) -> list[str]:
+    """Probe plink.exe capability at most once and return the best supported
+    host-key-auto-accept argv slice.
+
+    PuTTY 0.79 (2024) added `-auto_store_ssh_keys` which silently accepts and
+    caches an unknown host key on first connect (analogous to OpenSSH's
+    StrictHostKeyChecking=accept-new). This is strongly preferred over `-batch`
+    which **aborts with a fatal** FATAL ERROR: Cannot confirm a host key in
+    batch mode on every first connect (see deploy.log hostkey errors).
+
+    PuTTY 0.77–0.78 do NOT have -auto_store_ssh_keys, but they DO support
+    `-hostkey keyid` (documented in 0.78 --help as "manually specify a host
+    key (may be repeated)"). Callers can parse the SHA-256:… fingerprint from
+    the first `-batch` failure stderr and retry with an explicit
+    ["-hostkey", "sha256@<64-hex>"] appended.
+
+    If the installed plink predates 0.77 and doesn't recognize either, we
+    fall back to `-batch` and rely on the caller's `_remove_host_key()` + retry
+    loop for remediation (still better than a console pop-up in CREATE_NO_WINDOW).
+    """
+    global _PLINK_HOSTKEY_FLAGS
+    if _PLINK_HOSTKEY_FLAGS is not None:
+        return list(_PLINK_HOSTKEY_FLAGS)
+    probe: list[str] = ["-auto_store_ssh_keys"]
+    exe = plink_exe or _ssh_locate_plink()
+    if exe is not None and _geteuid_or_none() is None:
+        try:
+            import subprocess as _sp_plink
+            # plink --help exits non-zero but stderr prints all flags. Run with
+            # no user/host to avoid a connect attempt; the help/usage output is
+            # written to stderr regardless. PuTTY >= 0.77 uses --help with
+            # DOUBLE DASH (GNU-style) — single -help errors with
+            # "plink: unknown option \"-help\"" (31 chars only, no flag info).
+            _pp = _sp_plink.Popen(
+                [exe, "--help"], stdout=_sp_plink.PIPE, stderr=_sp_plink.PIPE,
+                creationflags=0x08000000,
+            )
+            try:
+                _o, _e = _pp.communicate(timeout=8)
+            except _sp_plink.TimeoutExpired:
+                _pp.kill() ; _o, _e = _pp.communicate()
+            text = (_e or b"").decode("utf-8", errors="replace") + \
+                   (_o or b"").decode("utf-8", errors="replace")
+            # Match hyphens, underscores or mixed (PuTTY help says
+            # "-auto_store_ssh_keys" in some builds, "-auto-store-ssh-keys"
+            # in others; --help text itself already uses "-auto_store_…" as
+            # of 0.79 so we normalize all hyphen-underscore variants).
+            _t_norm = text.lower().replace("_", "-")
+            has_as = ("auto-store-ssh-keys" in _t_norm)
+            if not has_as:
+                probe = ["-batch"]
+        except Exception:
+            probe = ["-batch"]
+    else:
+        probe = ["-batch"]
+    _PLINK_HOSTKEY_FLAGS = probe
+    return list(_PLINK_HOSTKEY_FLAGS)
+
+
+_PLINK_PARSED_FP_CACHE: dict[str, str] = {}  # key: host[:port] → last accepted PuTTY-native "<TYPE>:<native>"
+_PLINK_FP_CACHE_FILE_NAME = ".rasyatone_deploy_hostkey_fingerprints.json"
+
+
+def _plink_fingerprint_cache_path(override_parent: Optional[Path] = None) -> Optional[Path]:
+    """Return the persistent on-disk path for `_PLINK_PARSED_FP_CACHE`.
+
+    Priority:
+      1. `override_parent` (if provided & caller already has a resolved log_dir).
+      2. Windows: `%LOCALAPPDATA%\\rasyatone\\` (or fallback: `%USERPROFILE%\\.rasyatone\\`).
+      3. POSIX: `$XDG_STATE_HOME/rasyatone/` (or fallback: `~/.local/state/rasyatone/`),
+         then `~/.rasyatone/`.
+    NEVER place the cache inside a remote-only path (e.g. /var/log/rasyatone can be on
+    remote box when in local-mode — this cache is for the CLIENT running rasyatone_deploy.py
+    on the operator's Windows machine).
+    """
+    parents: list[Path] = []
+    if override_parent is not None:
+        parents.append(Path(override_parent))
+    home = Path.home()
+    euid = _geteuid_or_none()
+    if euid is None:
+        # Windows — prefer %LOCALAPPDATA% (per-user, machine-local, no roam)
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            parents.append(Path(local_appdata) / "rasyatone")
+        parents.append(home / ".rasyatone")
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME")
+        if xdg_state:
+            parents.append(Path(xdg_state) / "rasyatone")
+        parents.append(home / ".local" / "state" / "rasyatone")
+        parents.append(home / ".rasyatone")
+    for p in parents:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            continue
+        try:
+            probe = p / f".write_probe_{os.getpid()}"
+            probe.write_bytes(b"")
+            probe.unlink()
+            return p / _PLINK_FP_CACHE_FILE_NAME
+        except (OSError, PermissionError):
+            continue
+    return None
+
+
+def _load_plink_hostkey_cache(override_parent: Optional[Path] = None,
+                              log: Optional[logging.Logger] = None) -> int:
+    """Load on-disk fingerprint cache into `_PLINK_PARSED_FP_CACHE`.
+
+    Returns number of entries loaded (0 = nothing loaded, empty file / missing).
+    NEVER raises; all errors are caught and logged as warnings if logger provided.
+    File format JSON: `{ "<port>:<host>" : "SHA256:<base64>"  |  "MD5:aa:bb:cc:..." }`
+    """
+    global _PLINK_PARSED_FP_CACHE
+    path = _plink_fingerprint_cache_path(override_parent=override_parent)
+    if path is None or not path.exists():
+        return 0
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, PermissionError, UnicodeDecodeError) as exc:
+        if log is not None:
+            log.warning("[hostkey] cannot read persistent fingerprint cache %s: %s", path, exc)
+        return 0
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as exc:
+        if log is not None:
+            log.warning("[hostkey] corrupt persistent fingerprint cache %s (%s); ignoring.", path, exc)
+        return 0
+    if not isinstance(data, dict):
+        if log is not None:
+            log.warning("[hostkey] persistent fingerprint cache %s is not a JSON object; ignoring.", path)
+        return 0
+    loaded = 0
+    for k, v in data.items():
+        if (not isinstance(k, str)) or (not isinstance(v, str)):
+            continue
+        if not v.startswith("SHA256:") and not v.startswith("MD5:"):
+            continue
+        _PLINK_PARSED_FP_CACHE[k] = v
+        loaded += 1
+    return loaded
+
+
+def _save_plink_hostkey_cache(override_parent: Optional[Path] = None,
+                              log: Optional[logging.Logger] = None) -> bool:
+    """Flush `_PLINK_PARSED_FP_CACHE` to disk so next Python process inherits cache.
+
+    Returns True on successful write; False on any failure; NEVER raises.
+    """
+    path = _plink_fingerprint_cache_path(override_parent=override_parent)
+    if path is None:
+        if log is not None:
+            log.warning("[hostkey] no writable location for persistent fingerprint cache; skipping save.")
+        return False
+    try:
+        # atomic: write to tmp + os.replace on same volume so concurrent readers
+        # never see half-written JSON (NTFS rename is atomic for files on same drive)
+        tmp = path.with_suffix(path.suffix + ".tmp." + str(os.getpid()))
+        tmp.write_text(json.dumps(dict(_PLINK_PARSED_FP_CACHE), ensure_ascii=False, indent=2, sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)  # contain user-visible SSH host fingerprints
+        except OSError:
+            pass
+    except (OSError, PermissionError) as exc:
+        if log is not None:
+            log.warning("[hostkey] cannot write persistent fingerprint cache %s: %s", path, exc)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _plink_parse_hostkey_fingerprint(stderr_text: str) -> Optional[str]:
+    """Return the PuTTY-NATIVE key-id format from `stderr_text` if it contains a
+    "The server's ssh-<algo> key fingerprint is:" stanza; else None.
+
+    PuTTY's `-hostkey` flag parser (validated on PuTTY 0.78 install) accepts ONLY:
+      • "SHA256:<original-base64-token>"      (case-sensitive "SHA256:" prefix,
+                                                NO case normalization, NO decode,
+                                                NO re-encoding — use the token as
+                                                written in the error.)
+      • "MD5:aa:bb:cc:dd:…" (lowercase hex, colon-separated, 16 pairs)
+
+    CRITICAL: ANY other format (sha256:, SHA256:<hex>, sha256@<hex>, bare base64,
+    bare hex) is REJECTED by plink with:
+        "plink: 'X' is not a valid format for a manual host key specification"
+    — see deploy.log #188-189 for that error live. We therefore return the EXACT
+    PuTTY-printed form with zero transformation: regex captures from "SHA256:<tok>"
+    where <tok> is 43-44 base64 chars possibly ending in "=", and we RE-emit as
+    `"SHA256:" + tok` unchanged.
+    """
+    if not stderr_text:
+        return None
+    import re as _re_fp
+    for m in _re_fp.finditer(r"SHA256\s*:\s*([A-Za-z0-9+/=]{40,50})", stderr_text):
+        # PuTTY prints: "ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E"
+        # Accepted by -hostkey after probe: "SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E"
+        # (uppercase SHA256 colon + original token exactly as printed)
+        return "SHA256:" + m.group(1)
+    for m in _re_fp.finditer(r"(MD5\s*:\s*(?:[0-9a-fA-F]{2}:){15}[0-9a-fA-F]{2})", stderr_text):
+        return m.group(1).replace(" ", "")
+    return None
+
+
 def _ssh_locate_sshpass() -> Optional[str]:
     """Return path to sshpass binary if available, else None."""
     return shutil.which("sshpass")
 
 
+def _threaded_heartbeat(stop_event, log=None, interval: float = 2.0,
+                        label: str = "") -> None:
+    """Background target: print a single `.` every `interval`s until stop_event is set.
+
+    Used to keep the terminal looking alive during long SSH transfers/runs where
+    stdout/stderr may be silent for minutes. Outputs to stderr (progress channel).
+    """
+    import threading as _thr
+    _safe_stderr_print(f"\n   {label} ", no_unicode=True, error=False, end="")
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    while not stop_event.is_set():
+        if stop_event.wait(interval):
+            break
+        try:
+            sys.stderr.write(".")
+            sys.stderr.flush()
+        except Exception:
+            break
+    _safe_stderr_print(" done", no_unicode=True, error=False)
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _ssh_heartbeat(label: str, enable: bool = True):
+    """Context manager: starts a heartbeat dot-printer thread, cleans up on exit."""
+    import threading as _thr
+    t = None
+    stop_evt = _thr.Event()
+    if enable and sys.stderr is not None and getattr(sys.stderr, "isatty", lambda: False)():
+        t = _thr.Thread(target=_threaded_heartbeat,
+                        args=(stop_evt,),
+                        kwargs={"label": label, "interval": 2.0},
+                        daemon=True)
+        t.start()
+    try:
+        yield
+    finally:
+        stop_evt.set()
+        if t is not None:
+            t.join(timeout=5.0)
+
+
 def _ssh_run_with_pty(ssh_args: list[str], ssh_password: Optional[str],
                       stdin_payload: Optional[str | bytes],
-                      timeout: int, log=None) -> subprocess.CompletedProcess:
+                      timeout: int, log=None, label: str = "ssh",
+                      plink_hostkey: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run an SSH subprocess using Python stdlib pty (POSIX) / pipe-feeding fallback (Windows).
 
     - On POSIX (Linux/macOS with Python built with pty support): fork a real PTY so
       OpenSSH reads the password from its controlling terminal, not stdin (the stdin
       channel must remain free for `stdin_payload` to reach remote bash).
-    - On Windows (no native pty in stdlib): use PIPE + feed password then payload on
-      stdin, combined with the documented OpenSSH "stdin-reads-password" behavior that
-      triggers when (a) no console is attached and (b) the SSH_ASKPASS trick below is used.
-      If the password is still not consumed, raise a clear actionable error.
+    - On Windows (no native pty in stdlib): use PuTTY plink.exe if available (it has
+      native -pw password support); else fail-fast with a clean actionable error
+      explaining how Win32-OpenSSH.exe never reads passwords from pipes and how to fix.
     """
     on_windows = _geteuid_or_none() is None
     ssh_pass_bytes: bytes = b""
     if ssh_password:
         ssh_pass_bytes = (ssh_password + "\n").encode("utf-8")
 
+    # ------------------------------------------------------------------
+    # Windows + password auth: PREFER plink.exe (PuTTY) over ssh.exe since the
+    # Microsoft Win32-OpenSSH port always reads passwords from a Console, never
+    # from redirected stdin. CREATE_NO_WINDOW + stdin-pipe on ssh.exe causes a
+    # silent indefinite hang (ssh.exe blocks in AttachConsole forever). plink
+    # supports `-pw <password> -batch` which fully avoids console dependencies.
+    # ------------------------------------------------------------------
+    if on_windows and ssh_password:
+        plink = _ssh_locate_plink()
+        if plink is not None:
+            # Translate ssh args to plink args:
+            #   ssh [-o BatchMode=no -p 22 -i key] user@host -T -- bash -lc script
+            #   plink [-ssh -P 22 -i key.ppk] user@host -pw <pw> -batch -T bash -lc script
+            # Extract components from ssh_args we built in ssh_run()
+            pw_env_argv = ssh_args  # original ssh argv; we'll rebuild as plink argv below
+            user_host: Optional[str] = None
+            port_opt: Optional[str] = None
+            identity_opt: list[str] = []
+            # scan ssh_args for known positional/optionals
+            i = 0
+            while i < len(pw_env_argv):
+                a = pw_env_argv[i]
+                if a == "-p":
+                    port_opt = pw_env_argv[i + 1] if i + 1 < len(pw_env_argv) else None
+                    i += 2
+                    continue
+                if a == "-i":
+                    if i + 1 < len(pw_env_argv):
+                        identity_opt = ["-i", pw_env_argv[i + 1]]
+                    i += 2
+                    continue
+                if a == "-T" or a.startswith("-o") or a == "--":
+                    i += 1
+                    continue
+                if "@" in a and (user_host is None):
+                    user_host = a
+                i += 1
+            # Extract remote cmd: any args after the final "-- bash -lc script" block
+            remote_cmd: list[str] = []
+            # Simpler: ssh_args = [ssh, ...opts..., user@host, -T, --, "bash", "-lc", script]
+            if "--" in pw_env_argv:
+                cmd_start = pw_env_argv.index("--") + 1
+                remote_cmd = pw_env_argv[cmd_start:]
+            if user_host is None:
+                # Fallback: try to rebuild manually from what ssh_run passed
+                pass
+            # Pre-populate hostkey: if a PREVIOUS call to the same host already had
+            # to pass `-hostkey <sha256:…>` in order to connect (PuTTY 0.78 empty cache
+            # on first connect), re-use that fingerprint now so the FIRST plink
+            # attempt succeeds immediately. PuTTY's `-hostkey` CLI flag is intentionally
+            # NON-persistent (a security feature; it never writes HKCU\…\SshHostKeys
+            # when using -hostkey). So: we persist the cached fingerprint in our own
+            # Python memory to avoid 2nd/3rd/4th SSH calls re-entering the whole
+            # "detect stale → parse fp → retry" overhead cycle. See deploy.log lines
+            # 202-210 where after Upload OK, the NEXT SSH call to the SAME exact
+            # host:port re-executed Warning→ssh-keygen -R→parse→retry for no benefit.
+            _port_str = str(port_opt) if port_opt is not None else "22"
+            _host_part = user_host.split("@", 1)[1] if (user_host and "@" in user_host) else None
+            cache_key = f"{_port_str}:{_host_part}" if _host_part else None
+            _came_from_cache = False
+            if plink_hostkey is None and cache_key and (cache_key in _PLINK_PARSED_FP_CACHE):
+                plink_hostkey = _PLINK_PARSED_FP_CACHE[cache_key]
+                _came_from_cache = True
+                if log is not None:
+                    if ":" in plink_hostkey:
+                        _pp_t, _pp_b = plink_hostkey.split(":", 1)
+                        if _pp_t.upper() == "MD5":
+                            _pps = _pp_b.split(":")
+                            _pp_short = f"{_pp_t}:" + ":".join(_pps[:4]) + ":…"
+                        else:
+                            _pp_short = f"{_pp_t}:{_pp_b[:12]}…"
+                    else:
+                        _pp_short = plink_hostkey[:16] + "…"
+                    log.info("[hostkey/plink] reusing prior -hostkey %s (cache hit for %s).",
+                             _pp_short, cache_key)
+            plink_argv: list[str] = [plink, "-ssh"]
+            if port_opt is not None:
+                plink_argv += ["-P", str(port_opt)]
+            plink_argv += identity_opt
+            plink_argv += ["-pw", ssh_password]
+            plink_argv += _plink_hostkey_flags(plink)  # -auto_store_ssh_keys (PuTTY>=0.79) or -batch fallback
+            if plink_hostkey:
+                # Retry on PuTTY 0.77–0.78: first -batch run failed with "The host key is
+                # not cached … FATAL ERROR: Cannot confirm a host key in batch mode" and
+                # the caller successfully parsed the fingerprint from stderr. Pass back
+                # the EXACT PuTTY-native string returned by _plink_parse_hostkey_fingerprint:
+                # either "SHA256:<original-base64>" (43-44 chars after colon, case sensitive)
+                # or "MD5:aa:bb:…". We validated these on a real PuTTY 0.78: any other
+                # format raises "is not a valid format for a manual host key specification"
+                # (see deploy.log #188-189 for the live sha256@<hex> rejection).
+                plink_argv += ["-hostkey", plink_hostkey]
+                if log is not None:
+                    # Pretty-print the key id for logs: strip long base64 after 12 chars
+                    # (SHA256:<12 chars>…) or MD5:<first-4-pairs>:…:…
+                    if ":" in plink_hostkey:
+                        _h_type, _h_body = plink_hostkey.split(":", 1)
+                        if _h_type.upper() == "MD5":
+                            _parts = _h_body.split(":")
+                            _short_body = ":".join(_parts[:4]) + ":…"
+                        else:
+                            _short_body = _h_body[:12] + "…"
+                        _short = f"{_h_type}:{_short_body}"
+                    else:
+                        _short = plink_hostkey[:16] + "…"
+                    # Two distinct log lines because semantics differ:
+                    #   * "using explicit -hostkey…" = FIRST attempt is using a -hostkey
+                    #     flag that was either passed in by caller OR populated from our
+                    #     process-global _PLINK_PARSED_FP_CACHE dict (cache hit above).
+                    #     No prior failure occurred → NOT a retry.
+                    #   * "retrying with explicit -hostkey…" = caller is recovering from
+                    #     an already-seen -batch abort. A previous plink invocation failed
+                    #     with "Cannot confirm a host key in batch mode" → true retry.
+                    # To distinguish, we tag onto the `plink_hostkey` local: if it came
+                    # from cache lookup above, we ALREADY logged a distinct cache-hit
+                    # line and this block fires BUT we must NOT print "retrying". So:
+                    # if caller explicitly passed plink_hostkey into function args, that
+                    # ALWAYS means retry path; if we populated it locally from
+                    # _PLINK_PARSED_FP_CACHE dict, that means first attempt + cache hit.
+                    # We set a local bool _came_from_cache right before populating
+                    # plink_hostkey from dict so we can tell the two cases apart here.
+                    if _came_from_cache:
+                        log.info("[hostkey/plink] using explicit -hostkey %s on first attempt (from local cache).", _short)
+                    else:
+                        log.info("[hostkey/plink] retrying with explicit -hostkey %s", _short)
+            plink_argv += ["-T"]
+            if user_host:
+                plink_argv.append(user_host)
+            plink_argv += remote_cmd
+            creationflags = 0
+            if on_windows:
+                creationflags = 0x08000000  # CREATE_NO_WINDOW
+            stdin_bytes: Optional[bytes]
+            if stdin_payload is None:
+                stdin_bytes = None
+            elif isinstance(stdin_payload, str):
+                stdin_bytes = stdin_payload.encode("utf-8")
+            else:
+                stdin_bytes = stdin_payload
+            try:
+                proc = subprocess.Popen(
+                    plink_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=creationflags,
+                )
+            except ValueError:
+                proc = subprocess.Popen(
+                    plink_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            try:
+                with _ssh_heartbeat(label, enable=True):
+                    out_b, err_b = proc.communicate(input=stdin_bytes, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out_b, err_b = proc.communicate()
+                raise subprocess.TimeoutExpired(plink_argv, timeout) from None
+            out_s = out_b.decode("utf-8", errors="replace") if out_b is not None else ""
+            err_s = err_b.decode("utf-8", errors="replace") if err_b is not None else ""
+            # plink uses different host-key error text: "The server's host key is not
+            # cached in the registry" — surface by returning it in stderr so caller's
+            # _is_host_key_error can act on it.
+            return subprocess.CompletedProcess(args=plink_argv, returncode=proc.returncode,
+                                               stdout=out_s, stderr=err_s)
+        # ------------------------------------------------------------------
+        # No plink.exe on Windows AND password required => FAIL FAST with clear
+        # actionable guidance instead of silently hanging inside ssh.exe forever.
+        # ------------------------------------------------------------------
+        no_such_binary_msg = (
+            "   On Windows, Microsoft's ssh.exe reads login passwords from a CONSOLE "
+            "handle (never stdin/pipe). A password was set in the wizard, and neither "
+            "sshpass nor PuTTY plink.exe was found on PATH. Options to fix (pick one):"
+            "\n     (a) winget install PuTTY.PuTTY   (installs plink.exe, recommended)"
+            "\n     (b) choco install putty          (if you use Chocolatey)"
+            "\n     (c) Use SSH keys:  type $env:USERPROFILE\\.ssh\\id_*.pub | "
+            "ssh root@207.180.207.208 mkdir -p ~/.ssh ^&^& cat ^>^> ~/.ssh/authorized_keys"
+            "  then re-run wizard and press ENTER for both passwords (leave blank)."
+            "\n     (d) Run the script from WSL:Ubuntu + `apt install sshpass`."
+        )
+        if log is not None:
+            log.error(no_such_binary_msg)
+        raise DeployError(0, 41, no_such_binary_msg)
+
+    # ------------------------------------------------------------------
+    # POSIX: real pty via os.forkpty (pty module wraps it cleanly)
+    # ------------------------------------------------------------------
     if not on_windows and hasattr(__import__("os"), "forkpty"):
         # POSIX: real pty via os.forkpty (pty module wraps it cleanly)
         import pty as _pty
@@ -2737,96 +3392,85 @@ def _ssh_run_with_pty(ssh_args: list[str], ssh_password: Optional[str],
         stdin_remaining = ssh_pass_bytes + payload_bytes if ssh_password else payload_bytes
         start_t = time.time()
         try:
-            while True:
-                if time.time() - start_t > timeout:
-                    os.kill(pid, 9)
-                    raise subprocess.TimeoutExpired(ssh_args, timeout)
-                r_ready, w_ready, _ = _select.select(
-                    [fd],
-                    [fd] if stdin_remaining else [],
-                    [],
-                    0.25,
-                )
-                if fd in r_ready:
-                    try:
-                        chunk = os.read(fd, 65536)
-                    except OSError:
-                        chunk = b""
-                    if not chunk:
-                        break
-                    output_buf.extend(chunk)
-                    # Heuristic: detect SSH password prompt so we send the PW *before*
-                    # sending the user payload (keeps payload in good shape for remote bash).
-                    # Known prompts: "password:", "Password:", "Enter passphrase for key",
-                    # "Passcode or option", "Verification code", plus localized variants
-                    # usually contain the substring "password" or "Password" or "passphrase".
-                    low_tail = bytes(output_buf[-256:]).lower()
-                    if (not password_sent and ssh_password
-                            and (b"password:" in low_tail
-                                 or b"passphrase " in low_tail
-                                 or b"passphrase:" in low_tail
-                                 or b"verification code" in low_tail)):
+            with _ssh_heartbeat(label, enable=True):
+                while True:
+                    if time.time() - start_t > timeout:
+                        os.kill(pid, 9)
+                        raise subprocess.TimeoutExpired(ssh_args, timeout)
+                    r_ready, w_ready, _ = _select.select(
+                        [fd],
+                        [fd] if stdin_remaining else [],
+                        [],
+                        0.25,
+                    )
+                    if fd in r_ready:
                         try:
-                            n = os.write(fd, ssh_pass_bytes)
+                            chunk = os.read(fd, 65536)
                         except OSError:
-                            n = 0
-                        if n == len(ssh_pass_bytes):
-                            password_sent = True
-                            stdin_remaining = payload_bytes  # only payload left to send
-                    # If 1.5s elapsed and we still haven't triggered the prompt heuristics,
-                    # fall through: send PW (if any) + payload now to un-stall.
-                    if (not password_sent or not payload_sent) and (time.time() - start_t > 1.2):
-                        if stdin_remaining:
+                            chunk = b""
+                        if not chunk:
+                            break
+                        output_buf.extend(chunk)
+                        # Heuristic: detect SSH password prompt so we send the PW *before*
+                        # sending the user payload (keeps payload in good shape for remote bash).
+                        low_tail = bytes(output_buf[-256:]).lower()
+                        if (not password_sent and ssh_password
+                                and (b"password:" in low_tail
+                                     or b"passphrase " in low_tail
+                                     or b"passphrase:" in low_tail
+                                     or b"verification code" in low_tail)):
                             try:
-                                n = os.write(fd, stdin_remaining)
+                                n = os.write(fd, ssh_pass_bytes)
                             except OSError:
                                 n = 0
-                            if n > 0:
-                                stdin_remaining = stdin_remaining[n:]
-                                if ssh_password and not password_sent and not stdin_remaining.startswith(ssh_pass_bytes[: min(4, len(ssh_pass_bytes))]):
-                                    password_sent = True
-                                if not stdin_remaining:
-                                    payload_sent = True
-                                    password_sent = True
-                if fd in w_ready and stdin_remaining:
-                    try:
-                        n = os.write(fd, stdin_remaining)
-                    except OSError:
-                        n = 0
-                    if n > 0:
-                        stdin_remaining = stdin_remaining[n:]
-                        if not stdin_remaining:
-                            payload_sent = True
-                            if not ssh_password:
+                            if n == len(ssh_pass_bytes):
                                 password_sent = True
-                # Reap child if it exited
-                done_pid, status = os.waitpid(pid, os.WNOHANG)
-                if done_pid == pid:
-                    # Drain any final bytes from the PTY after EOF
-                    try:
-                        while True:
-                            chunk = os.read(fd, 65536)
-                            if not chunk:
-                                break
-                            output_buf.extend(chunk)
-                    except OSError:
-                        pass
-                    rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else (
-                        -os.WTERMSIG(status) if os.WIFSIGNALED(status) else 1)
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                    out_s = bytes(output_buf).decode("utf-8", errors="replace")
-                    # PTY merges stdout/stderr; split heuristically is hard. Put everything in
-                    # stdout (ssh writes progress/password prompts to stderr on the PTY but
-                    # that text ends up intermixed in the master fd output stream).
-                    return subprocess.CompletedProcess(
-                        args=ssh_args, returncode=rc, stdout=out_s, stderr="")
-                # Short sleep to avoid busy loop on some BSD variants
-                time.sleep(0.005)
+                                stdin_remaining = payload_bytes
+                        if (not password_sent or not payload_sent) and (time.time() - start_t > 1.2):
+                            if stdin_remaining:
+                                try:
+                                    n = os.write(fd, stdin_remaining)
+                                except OSError:
+                                    n = 0
+                                if n > 0:
+                                    stdin_remaining = stdin_remaining[n:]
+                                    if ssh_password and not password_sent and not stdin_remaining.startswith(ssh_pass_bytes[: min(4, len(ssh_pass_bytes))]):
+                                        password_sent = True
+                                    if not stdin_remaining:
+                                        payload_sent = True
+                                        password_sent = True
+                    if fd in w_ready and stdin_remaining:
+                        try:
+                            n = os.write(fd, stdin_remaining)
+                        except OSError:
+                            n = 0
+                        if n > 0:
+                            stdin_remaining = stdin_remaining[n:]
+                            if not stdin_remaining:
+                                payload_sent = True
+                                if not ssh_password:
+                                    password_sent = True
+                    done_pid, status = os.waitpid(pid, os.WNOHANG)
+                    if done_pid == pid:
+                        try:
+                            while True:
+                                chunk = os.read(fd, 65536)
+                                if not chunk:
+                                    break
+                                output_buf.extend(chunk)
+                        except OSError:
+                            pass
+                        rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else (
+                            -os.WTERMSIG(status) if os.WIFSIGNALED(status) else 1)
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        out_s = bytes(output_buf).decode("utf-8", errors="replace")
+                        return subprocess.CompletedProcess(
+                            args=ssh_args, returncode=rc, stdout=out_s, stderr="")
+                    time.sleep(0.005)
         finally:
-            # Safety: ensure child + fd cleaned up even on exception
             try:
                 done_pid, _ = os.waitpid(pid, os.WNOHANG)
                 if done_pid == 0:
@@ -2838,23 +3482,43 @@ def _ssh_run_with_pty(ssh_args: list[str], ssh_password: Optional[str],
                 os.close(fd)
             except OSError:
                 pass
+
     # ------------------------------------------------------------------
-    # Windows / no-forkpty fallback: PIPE-based feeding
-    # OpenSSH prefers the console for password prompts. Trick it into reading the password
-    # from its stdin pipe by (a) creating the subprocess with no window, (b) setting the
-    # SSH_ASKPASS environment variable to a dummy that echoes the password — unreliable —
-    # OR (simpler, most reliable on modern Win32-OpenSSH 8.1+):
-    #   - use `CREATE_NO_WINDOW` to detach from any console,
-    #   - prepend password + newline to the front of stdin, then payload,
-    #   - hope ssh uses stdin for password when /dev/tty is unavailable (documented
-    #     behavior on Win32-OpenSSH when no console is present).
-    # If this still fails, we surface a clear "install sshpass or use key-based auth" error.
+    # macOS/BSD without forkpty: use sshpass + plain Popen. On non-Windows
+    # systems this fallback rarely triggers (Python on macOS provides forkpty
+    # via pty module on framework builds, and Linux always has it).
+    # ------------------------------------------------------------------
+    sshpass = _ssh_locate_sshpass() if ssh_password else None
+    if sshpass is not None and ssh_password:
+        env = os.environ.copy()
+        env["SSHPASS"] = ssh_password
+        wrapped = [sshpass, "-e"] + ssh_args
+        stdin_bytes = None
+        if isinstance(stdin_payload, bytes):
+            stdin_bytes = stdin_payload
+        elif isinstance(stdin_payload, str):
+            stdin_bytes = stdin_payload.encode("utf-8")
+        proc = subprocess.Popen(wrapped, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env)
+        try:
+            with _ssh_heartbeat(label, enable=True):
+                out_b, err_b = proc.communicate(input=stdin_bytes, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out_b, err_b = proc.communicate()
+            raise subprocess.TimeoutExpired(wrapped, timeout) from None
+        out_s = out_b.decode("utf-8", errors="replace") if out_b is not None else ""
+        err_s = err_b.decode("utf-8", errors="replace") if err_b is not None else ""
+        return subprocess.CompletedProcess(args=wrapped, returncode=proc.returncode,
+                                           stdout=out_s, stderr=err_s)
+    # ------------------------------------------------------------------
+    # LAST RESORT (non-Windows, no pty, no sshpass): PIPE feeding. We know
+    # this almost-never works for password auth, but for key-auth scenarios
+    # (ssh_password is None) it will proceed fine. We'll surface the failure
+    # via the existing permission-denied hint below.
     # ------------------------------------------------------------------
     extra_env: dict[str, str] = {}
     if ssh_password and on_windows:
-        # Hint used by newer OpenSSH builds: force askpass if set, but since we can't
-        # easily provide askpass we just set DISPLAY to a non-empty value (this combined
-        # with no-console triggers stdin password read on some Win32-OpenSSH builds).
         extra_env.setdefault("DISPLAY", "localhost:0.0")
     env = os.environ.copy()
     env.update(extra_env)
@@ -2870,7 +3534,6 @@ def _ssh_run_with_pty(ssh_args: list[str], ssh_password: Optional[str],
     stdin_bytes = bytes(full_stdin) if full_stdin else None
     creationflags = 0
     if on_windows:
-        # CREATE_NO_WINDOW = 0x08000000
         creationflags = 0x08000000
     try:
         proc = subprocess.Popen(
@@ -2890,15 +3553,14 @@ def _ssh_run_with_pty(ssh_args: list[str], ssh_password: Optional[str],
             env=env,
         )
     try:
-        out_b, err_b = proc.communicate(input=stdin_bytes, timeout=timeout)
+        with _ssh_heartbeat(label, enable=True):
+            out_b, err_b = proc.communicate(input=stdin_bytes, timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         out_b, err_b = proc.communicate()
         raise subprocess.TimeoutExpired(ssh_args, timeout) from None
     out_s = out_b.decode("utf-8", errors="replace") if out_b is not None else ""
     err_s = err_b.decode("utf-8", errors="replace") if err_b is not None else ""
-    # If password auth was requested AND stderr contains "Permission denied" + "password"
-    # then the stdin-feeding trick didn't work on this platform; surface a clear fix.
     if ssh_password and proc.returncode != 0:
         low = (err_s or "").lower()
         if ("permission denied" in low and "password" in low) or \
@@ -2921,7 +3583,8 @@ def _ssh_run_with_pty(ssh_args: list[str], ssh_password: Optional[str],
 def ssh_run(*, host: str, user: str, port: Optional[int], identity: Optional[Path],
             script: str, timeout: int = 7200, log=None, scrub_env=None,
             stdin_payload: Optional[str | bytes] = None,
-            ssh_password: Optional[str] = None):
+            ssh_password: Optional[str] = None,
+            progress_label: Optional[str] = None):
     """Run script on remote via ssh -T. Retry once on host-key error (auto-cleanup).
 
     If `stdin_payload` is provided, pipes it into the remote `bash -lc script` over ssh's
@@ -2930,29 +3593,41 @@ def ssh_run(*, host: str, user: str, port: Optional[int], identity: Optional[Pat
 
     If `ssh_password` is provided:
       - On systems with `sshpass` installed: prefix the ssh command with `sshpass -p<PW>`.
-      - Otherwise: use PTY-based driver (POSIX) or stdin-feeding fallback (Windows) to
-        deliver the password to SSH's controlling terminal.
+      - On Windows with PuTTY plink.exe available: translate ssh_args → plink with -pw.
+      - Otherwise: use PTY-based driver (POSIX) or fail-fast actionable DeployError (Windows).
+
+    `progress_label`: if supplied, the label printed before a heartbeat-dot stream
+    (e.g. "transfer" or "running"). Useful for keeping the terminal "alive" visually.
     """
     password_auth = bool(ssh_password)
+    plink_extra_hostkey: list[str] = []  # closure-mutable: populated if PuTTY 0.77–0.78 retry
+
+    def _label_for(kind: str) -> str:
+        if progress_label:
+            return f"[{progress_label}/{kind}]"
+        return kind
 
     def _run_once() -> subprocess.CompletedProcess:
         base_args = _ssh_base_args(host, user, port, identity, password_auth=password_auth)
         ssh_args = base_args + ["-T", "--", "bash", "-lc", script]
-        # Fast path: no password needed (BatchMode=yes, key/agent auth) — use plain subprocess
+        # Fast path: no password needed (BatchMode=yes, key/agent auth) — use plain subprocess,
+        # wrapped with heartbeat so the user sees dots during multi-minute long operations.
         if not password_auth:
             if stdin_payload is None or isinstance(stdin_payload, str):
-                return subprocess.run(
-                    ssh_args,
-                    input=stdin_payload,
-                    text=True,
-                    capture_output=True,
-                    timeout=timeout,
-                    check=False,
-                )
+                with _ssh_heartbeat(_label_for("ssh"), enable=True):
+                    return subprocess.run(
+                        ssh_args,
+                        input=stdin_payload,
+                        text=True,
+                        capture_output=True,
+                        timeout=timeout,
+                        check=False,
+                    )
             proc = subprocess.Popen(ssh_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
             try:
-                out_b, err_b = proc.communicate(input=stdin_payload, timeout=timeout)
+                with _ssh_heartbeat(_label_for("ssh"), enable=True):
+                    out_b, err_b = proc.communicate(input=stdin_payload, timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 out_b, err_b = proc.communicate()
@@ -2970,19 +3645,21 @@ def ssh_run(*, host: str, user: str, port: Optional[int], identity: Optional[Pat
             env["SSHPASS"] = ssh_password
             wrapped = [sshpass, "-e"] + ssh_args
             if stdin_payload is None or isinstance(stdin_payload, str):
-                return subprocess.run(
-                    wrapped,
-                    input=stdin_payload,
-                    text=True,
-                    capture_output=True,
-                    timeout=timeout,
-                    check=False,
-                    env=env,
-                )
+                with _ssh_heartbeat(_label_for("sshpass"), enable=True):
+                    return subprocess.run(
+                        wrapped,
+                        input=stdin_payload,
+                        text=True,
+                        capture_output=True,
+                        timeout=timeout,
+                        check=False,
+                        env=env,
+                    )
             proc = subprocess.Popen(wrapped, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, env=env)
             try:
-                out_b, err_b = proc.communicate(input=stdin_payload, timeout=timeout)
+                with _ssh_heartbeat(_label_for("sshpass"), enable=True):
+                    out_b, err_b = proc.communicate(input=stdin_payload, timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 out_b, err_b = proc.communicate()
@@ -2993,16 +3670,55 @@ def ssh_run(*, host: str, user: str, port: Optional[int], identity: Optional[Pat
                                                stdout=out_s, stderr=err_s)
         # sshpass not available — fall back to in-process PTY driver.
         return _ssh_run_with_pty(ssh_args, ssh_password=ssh_password,
-                                 stdin_payload=stdin_payload, timeout=timeout, log=log)
+                                 stdin_payload=stdin_payload, timeout=timeout, log=log,
+                                 label=_label_for("pty-ssh"),
+                                 plink_hostkey=plink_extra_hostkey[0] if plink_extra_hostkey else None)
 
     first = _run_once()
     if first.returncode != 0 and _is_host_key_error(first.stderr or ""):
+        # PuTTY 0.77–0.78 specific retry: first -batch attempt returned a SHA256
+        # fingerprint stanza; parse it before clearing caches, then carry into retry.
+        parsed_fp = None
+        if _geteuid_or_none() is None:
+            parsed_fp = _plink_parse_hostkey_fingerprint(first.stderr or "")
         if log is not None:
             log.warning("[hostkey] Detected stale SSH host key for %s — running ssh-keygen -R then retrying",
                         host)
             log.info("[hostkey] Running: ssh-keygen -R %s%s",
                      host, f" -R [{host}]:{port}" if port and port != 22 else "")
         _remove_host_key(host, port=port, log=log)
+        if parsed_fp:
+            # Cache parsed fingerprint in two places: (1) closure list to pass to
+            # immediate retry below, (2) process-global _PLINK_PARSED_FP_CACHE dict
+            # keyed by "<port>:<host>" so SUBSEQUENT ssh_run() calls to the same
+            # host prepend -hostkey to the FIRST plink invocation already, skipping
+            # the entire "fail → clear caches → parse fp → retry" overhead loop.
+            # (3) Persist to on-disk JSON cache so NEXT PYTHON PROCESS startup also
+            # inherits this fingerprint (deploy.log lines 200-256 show every new
+            # PID 41640 / 2764 / 10548 / 41072 re-pays the 5-second warm-up because
+            # the dict dies with each process) — saves ~5 seconds per run.
+            plink_extra_hostkey.append(parsed_fp)
+            cache_key = f"{port or 22}:{host}"
+            _PLINK_PARSED_FP_CACHE[cache_key] = parsed_fp
+            try:
+                _save_plink_hostkey_cache(log=log)
+            except Exception:
+                pass
+            if log is not None:
+                # parsed_fp is either "SHA256:<base64>" or "MD5:aa:bb:cc:..." — pretty print
+                if ":" in parsed_fp:
+                    _h_type, _h_body = parsed_fp.split(":", 1)
+                    if _h_type.upper() == "MD5":
+                        _parts = _h_body.split(":")
+                        _short = f"{_h_type}:" + ":".join(_parts[:4]) + ":…"
+                    else:
+                        _short = f"{_h_type}:{_h_body[:12]}…"
+                else:
+                    _short = parsed_fp[:16] + "…"
+                log.info(
+                    "[hostkey/plink] fingerprint %s parsed from stderr; retry will append -hostkey flag.",
+                    _short,
+                )
         if log is not None:
             log.info("[hostkey] Retrying SSH connection with fresh host keys...")
         first = _run_once()
@@ -3039,9 +3755,19 @@ def remote_deploy_wrapper(args, log, scrub_env) -> int:
         raise DeployError(0, 400, f"Identity file not found: {identity_path}")
     ssh_password: Optional[str] = getattr(args, "_ssh_password", None)
     sudo_password: Optional[str] = getattr(args, "_ssh_sudo_password", None)
+    # Optimization: root user on the remote never needs sudo (already uid 0).
+    # Skip the entire sudo wrapper so we never prompt for a sudo password that
+    # would never be used. Also clears the sudo_password to skip stdin prefix.
+    is_root = (user == "root")
+    if is_root and sudo_password:
+        if log is not None:
+            log.info("  SSH user='root' → auto-skipping sudo wrapper (remote is root already).")
+        sudo_password = None
     if log is not None:
         log.info("REMOTE MODE → %s@%s%s", user, host, f":{port}" if port else "")
-        if sudo_password:
+        if is_root:
+            log.info("  auth: remote=root (no sudo required)")
+        elif sudo_password:
             log.info("  sudo mode: interactive (password provided via wizard)")
         else:
             log.info("  sudo mode: non-interactive (sudo -n; NOPASSWD sudo required)")
@@ -3081,7 +3807,8 @@ def remote_deploy_wrapper(args, log, scrub_env) -> int:
     )
     result = ssh_run(host=host, user=user, port=port, identity=identity_path,
                      script=transfer_script, timeout=300, log=log, scrub_env=scrub_env,
-                     stdin_payload=b64_bytes, ssh_password=ssh_password)
+                     stdin_payload=b64_bytes, ssh_password=ssh_password,
+                     progress_label="transfer")
     if result.returncode != 0:
         if log is not None:
             log.error("Remote script upload failed:\n%s",
@@ -3091,15 +3818,19 @@ def remote_deploy_wrapper(args, log, scrub_env) -> int:
         log.info("Upload OK (%d bytes script transferred)", len(script_bytes))
 
     # Stage 2: RUN remotely
-    # When a sudo password is available:
-    #   - prefix sudo_pw + newline to the stdin of the remote SSH channel
-    #   - change `sudo -n` to `sudo -S -k` so sudo reads password from its stdin
-    #     (-S = stdin, -k = ignore timestamp so the PW is always requested once)
-    #   - use a zero-length sudo prompt string (-p '') so no "Password:" text
-    #     needs to be stripped from stderr
-    if sudo_password:
+    # Root user bypass: just "python3 /tmp/script.py --local-mode ..." (no sudo wrapper at all)
+    if is_root:
+        sudo_prefix = []
+        run_stdin_payload: Optional[bytes] = None
+    elif sudo_password:
+        # When a sudo password is available:
+        #   - prefix sudo_pw + newline to the stdin of the remote SSH channel
+        #   - change `sudo -n` to `sudo -S -k` so sudo reads password from its stdin
+        #     (-S = stdin, -k = ignore timestamp so the PW is always requested once)
+        #   - use a zero-length sudo prompt string (-p '') so no "Password:" text
+        #     needs to be stripped from stderr
         sudo_prefix = ["sudo", "-S", "-k", "-p", ""]
-        run_stdin_payload: Optional[bytes] = (sudo_password + "\n").encode("utf-8")
+        run_stdin_payload = (sudo_password + "\n").encode("utf-8")
     else:
         sudo_prefix = ["sudo", "-n"]
         run_stdin_payload = None  # let ssh_run/remote bash stdin flow naturally
@@ -3108,7 +3839,8 @@ def remote_deploy_wrapper(args, log, scrub_env) -> int:
     run_cmd = f"{quoted}; rc=$?; rm -f {shlex.quote(tmp_script)}; exit $rc"
     result2 = ssh_run(host=host, user=user, port=port, identity=identity_path,
                       script=run_cmd, timeout=4 * 3600, log=log, scrub_env=scrub_env,
-                      stdin_payload=run_stdin_payload, ssh_password=ssh_password)
+                      stdin_payload=run_stdin_payload, ssh_password=ssh_password,
+                      progress_label="run")
     # Stream remote stdout/stderr back to local
     if result2.stdout:
         sys.stdout.write(result2.stdout)
@@ -3231,6 +3963,44 @@ def _prompt_input(prompt: str, default: str | None = None,
                     no_unicode=no_unicode, error=False)
                 continue
         return value
+
+
+def _getpass_safe(prompt: str, no_unicode: bool = False) -> str:
+    """Hidden password input that DEGRADES GRACEFULLY when stdin/stdout are not a TTY.
+
+    On Windows, getpass.getpass() opens the CONSOLE handle (ReadConsoleW) directly
+    — it NEVER reads from sys.stdin. When we pipe stdin from a file (e.g. wizard
+    feed script) that means getpass will BLOCK FOREVER waiting for the user to
+    type in an invisible console window, producing zero output and zero CPU — the
+    exact "Terminal#2-99 stuck no progress" symptom.
+
+    Fallback logic (in order):
+      (1) If stdin AND stdout are both TTY → use real getpass.getpass() (hidden).
+      (2) Else if stdin is a readable stream → call normal input(prompt) (not
+          hidden, but reads from piped stdin so wizard feed scripts work).
+      (3) Else → empty string.
+    """
+    try:
+        _stdin_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        _stdout_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    except Exception:
+        _stdin_tty, _stdout_tty = False, False
+    if _stdin_tty and _stdout_tty:
+        try:
+            return getpass.getpass(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        except Exception:
+            pass
+    # Non-TTY stdin: fall back to regular input() so piped wizard feeds work
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+    except KeyboardInterrupt:
+        return ""
+    except Exception:
+        return ""
 
 
 def _visible_len_local(s: str) -> int:
@@ -3485,25 +4255,16 @@ def _run_interactive_wizard(args) -> None:
                        "(blank = fail on key rejection).")
             _safe_stderr_print(f"{indent}{C}{pw_hint}{RST}", no_unicode=no_unicode, error=False)
         _ssh_prompt = f"{indent}SSH login password (hidden input, Enter to skip): "
-        try:
-            ssh_pw_1 = getpass.getpass(_ssh_prompt)
-        except (EOFError, KeyboardInterrupt):
-            ssh_pw_1 = ""
+        ssh_pw_1 = _getpass_safe(_ssh_prompt, no_unicode=no_unicode)
         if ssh_pw_1:
             _ssh_prompt2 = f"{indent}Confirm SSH password: "
-            try:
-                ssh_pw_2 = getpass.getpass(_ssh_prompt2)
-            except (EOFError, KeyboardInterrupt):
-                ssh_pw_2 = ""
+            ssh_pw_2 = _getpass_safe(_ssh_prompt2, no_unicode=no_unicode)
             if ssh_pw_1 != ssh_pw_2:
                 _safe_stderr_print(
                     f"{indent}{_c('BOLD_RED', not no_color)}{_gx('x', no_unicode)} "
                     f"Passwords did not match -- prompting again.{_c('RESET', not no_color)}",
                     no_unicode=no_unicode, error=False)
-                try:
-                    ssh_pw_1 = getpass.getpass(_ssh_prompt)
-                except (EOFError, KeyboardInterrupt):
-                    ssh_pw_1 = ""
+                ssh_pw_1 = _getpass_safe(_ssh_prompt, no_unicode=no_unicode)
             ssh_password = ssh_pw_1 if ssh_pw_1 else None
 
         # Remote sudo password (only needed if sudo -n fails due to requiretty/pw sudo)
@@ -3513,25 +4274,16 @@ def _run_interactive_wizard(args) -> None:
         )
         _safe_stderr_print(f"{indent}{C}{sudo_hint}{RST}", no_unicode=no_unicode, error=False)
         _sudo_prompt = f"{indent}Remote user sudo password (hidden, Enter if NOPASSWD sudo): "
-        try:
-            sudo_pw_1 = getpass.getpass(_sudo_prompt)
-        except (EOFError, KeyboardInterrupt):
-            sudo_pw_1 = ""
+        sudo_pw_1 = _getpass_safe(_sudo_prompt, no_unicode=no_unicode)
         if sudo_pw_1:
             _sudo_prompt2 = f"{indent}Confirm remote sudo password: "
-            try:
-                sudo_pw_2 = getpass.getpass(_sudo_prompt2)
-            except (EOFError, KeyboardInterrupt):
-                sudo_pw_2 = ""
+            sudo_pw_2 = _getpass_safe(_sudo_prompt2, no_unicode=no_unicode)
             if sudo_pw_1 != sudo_pw_2:
                 _safe_stderr_print(
                     f"{indent}{_c('BOLD_RED', not no_color)}{_gx('x', no_unicode)} "
                     f"Sudo passwords did not match -- prompting again.{_c('RESET', not no_color)}",
                     no_unicode=no_unicode, error=False)
-                try:
-                    sudo_pw_1 = getpass.getpass(_sudo_prompt)
-                except (EOFError, KeyboardInterrupt):
-                    sudo_pw_1 = ""
+                sudo_pw_1 = _getpass_safe(_sudo_prompt, no_unicode=no_unicode)
             ssh_sudo_password = sudo_pw_1 if sudo_pw_1 else None
 
         _print_wizard_close(no_unicode, no_color)
@@ -3974,12 +4726,112 @@ def _interactive_confirm(msg: str, *, non_interactive: bool, force: bool) -> boo
     return ans in ("", "y", "yes")
 
 
+def _early_exit_banner(*, title: str, detail: str, code: int, no_unicode: bool = False,
+                       no_color: bool = False, tag: Optional[str] = None) -> None:
+    """74-char wide, 3-space indented "early exit" banner for errors before preflight banner.
+
+    Always prints on stdout (error=False) per project rule: expected early exits
+    (argparse errors, wizard cancel, missing password tooling) go to stdout so
+    PowerShell does not inject RemoteException labels. Use stderr only for
+    truly unexpected bugs.
+    """
+    import re as _re_ansi_eeb
+    bar = 74
+    hr = _banner_hr(bar, no_unicode=no_unicode)
+    tl, tr, bl, br = _gx("tl", no_unicode), _gx("tr", no_unicode), \
+        _gx("bl", no_unicode), _gx("br", no_unicode)
+    ml, mr = _gx("ml", no_unicode), _gx("mr", no_unicode)
+    v = _gx("v", no_unicode)
+    B = _c("BOLD", not no_color) + _c("RED", not no_color)
+    Y = _c("BOLD_YELLOW", not no_color)
+    RST = _c("RESET", not no_color)
+    indent = "   "
+    _ansi_re_eeb = _re_ansi_eeb.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+    def _vis_len(s: str) -> int:
+        return len(_ansi_re_eeb.sub('', s))
+    # Title row: tag appended right-aligned if provided
+    tag_str = f"[{tag}]" if tag else ""
+    title_frag = title[: bar - 4 - len(tag_str)]
+    if tag_str:
+        title_row = f"{title_frag}{tag_str:>{bar - 4 - len(title_frag)}s}"
+    else:
+        title_row = title_frag
+    header_line = f"{indent}{B}{tl}{hr}{tr}{RST}\n" \
+                  f"{indent}{B}{v}{RST} {title_row:<{bar-2}s} {B}{v}{RST}\n" \
+                  f"{indent}{B}{ml}{hr}{mr}{RST}"
+    _safe_stderr_print(header_line, no_unicode=no_unicode, error=False)
+    # Detail block with 74-char wrap + 3-space indent + ANSI padding
+    wrapped = _wrap_text_width(detail, bar, indent=3, pad=True)
+    _safe_stderr_print(wrapped, no_unicode=no_unicode, error=False)
+    # Footer row: "exit code: N" left-aligned, yellow, inside vertical pipes
+    left_frag = f"{Y}exit code: {code}{RST}"
+    vis = _vis_len(left_frag)
+    pad_needed = max(0, (bar - 2) - vis)
+    footer_row = f"{indent}{B}{v}{RST} {left_frag}{' ' * pad_needed} {B}{v}{RST}"
+    _safe_stderr_print(footer_row, no_unicode=no_unicode, error=False)
+    # Final bottom corners (no middle separator between detail and footer —
+    # using explicit separator between header AND detail only)
+    _safe_stderr_print(f"{indent}{B}{bl}{hr}{br}{RST}", no_unicode=no_unicode, error=False)
+
+
 def main(argv: list[str]) -> int:
     # Cross-platform VT / Unicode fixes BEFORE argparse / any printing (Terminal#1-60)
     _wrap_fix_encoding_once()
     auto_no_color, auto_no_unicode = _auto_flags(argv)
     parser = _build_argparser()
-    args = parser.parse_args(argv)
+    # ------------------------------------------------------------------
+    # EARLY EXIT BUG FIX (Terminal#1-98): argparse.parse_args calls sys.exit(2)
+    # on unknown flags / missing values. Without this catch, __main__ reraises
+    # SystemExit silently; pipeline shows ~5 lines of argparse usage then
+    # dies with rc=2 — no banner, no TerminalID tag, impossible to debug.
+    # Workaround: catch SystemExit raised inside parse_args(); render our
+    # standard 74-char early-exit banner with tag="argparse" + full usage text.
+    # Also temporarily redirect argparse's stderr output to silence its own
+    # duplicate error line (otherwise both our banner + argparse error show).
+    # ------------------------------------------------------------------
+    import io as _io_a
+    _saved_stderr = getattr(sys, "stderr", None)
+    try:
+        sys.stderr = _io_a.StringIO()
+        try:
+            args = parser.parse_args(argv)
+        except SystemExit as se:
+            _captured_err = sys.stderr.getvalue() if hasattr(sys.stderr, "getvalue") else ""
+            rc_code = int(se.code) if isinstance(se.code, int) else 2
+            buf = _io_a.StringIO()
+            parser.print_help(buf)
+            usage_text = buf.getvalue()
+            # Normalize line endings: on Windows, Python's argparse HelpFormatter
+            # writes CRLF via text-mode StringIO; our 74-char banner renderer pads
+            # every line to fixed width, so trailing \r chars get re-emitted after
+            # padding and reset the cursor to col 0, corrupting lines 94-105 of the
+            # Terminal#1-98/argparse banner (the "Full usage below:" help block).
+            _captured_err = _captured_err.replace("\r\n", "\n").replace("\r", "\n")
+            usage_text = usage_text.replace("\r\n", "\n").replace("\r", "\n")
+            first_line_argv = " ".join(argv) if argv else "<no args>"
+            if rc_code == 0:
+                # --help / --version requested — not an error, just pass through
+                print(usage_text, end="")
+                return 0
+            detail = (
+                f"Argument parse failed for argv: {first_line_argv}\n"
+                f"argparse exit code={rc_code}. Argparse own output:\n"
+                f"{_captured_err.strip() if _captured_err.strip() else '(none)'}\n\n"
+                f"Full usage below:\n\n"
+                + usage_text
+            )
+            _early_exit_banner(
+                title="CLI Argument Parse Error",
+                detail=detail,
+                code=rc_code,
+                no_unicode=auto_no_unicode,
+                no_color=auto_no_color,
+                tag="Terminal#1-98/argparse",
+            )
+            return rc_code
+    finally:
+        if _saved_stderr is not None:
+            sys.stderr = _saved_stderr
     # Merge auto-detected flags (OR with user explicit flag)
     args.no_color = bool(args.no_color or auto_no_color)
     args.no_unicode = bool(getattr(args, "no_unicode", False) or auto_no_unicode)
@@ -3988,9 +4840,16 @@ def main(argv: list[str]) -> int:
 
     # ------------------------------------------------------------------
     # INTERACTIVE WIZARD TRIGGER (--interactive or auto on Windows TTY)
-    # Skip if: --non-interactive, --local-mode (internal SSH invocation),
-    # or stdin is not a TTY (piped). Run if: --interactive explicitly set,
-    # or (dev host + no --remote + TTY) so first-time users get guided.
+    # Skip if: --non-interactive, --local-mode (internal SSH invocation).
+    #
+    #   Explicit --interactive (user flag): ALWAYS runs the wizard, even when
+    #   stdin is NOT a TTY — user may be piping a canned response file (e.g.
+    #   in CI or scripting a demo). Honoring the explicit flag is the least-
+    #   surprising behavior.
+    #
+    #   Auto-trigger (no flags at all): runs ONLY when (Windows dev host +
+    #   no --remote + stdin TTY + not --non-interactive) so first-time users
+    #   get guided, but piping/CI continues to skip.
     # ------------------------------------------------------------------
     _is_tty = getattr(sys.stdin, "isatty", lambda: False)()
     _on_dev_host = _geteuid_or_none() is None  # no POSIX geteuid => Windows / macOS
@@ -4007,29 +4866,54 @@ def main(argv: list[str]) -> int:
         _run_wizard = True
     if _run_wizard and getattr(args, "local_mode", False):
         _run_wizard = False  # never wizard when script is the SSH payload
-    if _run_wizard and not _is_tty:
+    # TTY gate: apply ONLY to the auto-trigger path, never the explicit
+    # --interactive path. User explicitly asked for wizard — wizard runs.
+    if _run_wizard and not _wizard_explicit and not _is_tty:
         _run_wizard = False
         _safe_stderr_print(
-            "   [wizard] --interactive requested but stdin is not a TTY "
-            "(skipped). Use CLI flags instead.",
+            "   [wizard] auto-wizard skipped (stdin not a TTY). "
+            "Pass --interactive explicitly to force.",
             no_unicode=args.no_unicode, error=False)
     if _run_wizard:
         try:
             _run_interactive_wizard(args)
         except DeployError as de:
-            # Wizard cancellation (130/131) => clean banner on stdout, exit code
-            _safe_stderr_print(f"\n   {de.user_msg}",
-                               no_unicode=args.no_unicode, error=False)
+            # Wizard cancellation (130 = user said No at confirm, 131 = EOF on stdin,
+            # 41 = no plink/sshpass for Windows password auth, etc). Render as a
+            # standardized early-exit banner so all early exits look uniform.
+            tag_suffix = {130: "user-cancel", 131: "eof"}.get(de.code, f"rc{de.code}")
+            _early_exit_banner(
+                title=f"Interactive Wizard: exit",
+                detail=(de.user_msg or "wizard exited") + "\n" + (de._stderr or de._stdout or ""),
+                code=de.code,
+                no_unicode=args.no_unicode,
+                no_color=args.no_color,
+                tag=f"Terminal#1-98/wizard/{tag_suffix}",
+            )
             return de.code
         except KeyboardInterrupt:
-            _safe_stderr_print("\n   Interactive wizard cancelled by user.",
-                               no_unicode=args.no_unicode, error=False)
+            _early_exit_banner(
+                title="Interactive Wizard: Interrupted",
+                detail="User pressed Ctrl+C during the interactive wizard.",
+                code=130,
+                no_unicode=args.no_unicode,
+                no_color=args.no_color,
+                tag="Terminal#1-98/wizard/sigint",
+            )
             return 130
         except Exception as exc_wiz:
-            # Unexpected wizard bug -> standard unexpected banner (rc=99)
-            _safe_stderr_print(
-                f"   Unexpected error in interactive wizard: {exc_wiz!r}",
-                no_unicode=args.no_unicode, error=True)
+            # Unexpected wizard bug -> banner on stderr (unexpected exception path)
+            import traceback as _tb_wiz
+            tb_wiz = _tb_wiz.format_exc()
+            _early_exit_banner(
+                title="Interactive Wizard: UNEXPECTED BUG",
+                detail=(f"{type(exc_wiz).__name__}: {exc_wiz}\n\nStack trace:\n{tb_wiz}"),
+                code=99,
+                no_unicode=args.no_unicode,
+                no_color=args.no_color,
+                tag="Terminal#1-98/wizard/bug",
+            )
+            _safe_stderr_print(tb_wiz, no_unicode=args.no_unicode, error=True)
             return 99
 
     # Remote mode short-circuit
@@ -4040,11 +4924,29 @@ def main(argv: list[str]) -> int:
         try:
             return remote_deploy_wrapper(args, log=dummy_log, scrub_env=dummy_scrub_env)
         except DeployError as de:
-            _safe_stderr_print(f"\nRemote deploy wrapper error: {de.user_msg}",
-                               no_unicode=args.no_unicode, error=False)
+            # DeployError from wrapper = expected error (no plink 41, upload failed 40, etc)
+            # -> render standard banner on stdout (error=False) to avoid PowerShell artifacts.
+            tag_suffix = {40: "transfer-failed", 41: "no-password-tool", 130: "cancel", 131: "eof"} \
+                .get(de.code, f"rc{de.code}")
+            extra_detail = (de._stderr or de._stdout or "")
+            _early_exit_banner(
+                title=f"Remote Deploy: exit code {de.code}",
+                detail=(de.user_msg or "") + ("\n" + extra_detail if extra_detail else ""),
+                code=de.code,
+                no_unicode=args.no_unicode,
+                no_color=args.no_color,
+                tag=f"Terminal#1-98/remote/{tag_suffix}",
+            )
             return de.code
         except KeyboardInterrupt:
-            _safe_stderr_print("\nInterrupted.", no_unicode=args.no_unicode, error=False)
+            _early_exit_banner(
+                title="Remote Deploy: Interrupted",
+                detail="User pressed Ctrl+C during remote deploy.",
+                code=130,
+                no_unicode=args.no_unicode,
+                no_color=args.no_color,
+                tag="Terminal#1-98/remote/sigint",
+            )
             return 130
 
     # Local mode
@@ -4067,6 +4969,21 @@ def main(argv: list[str]) -> int:
         import logging as _lg
         _lg.basicConfig(level=_lg.INFO, stream=sys.stdout, force=True, format="%(message)s")
         log = _lg.getLogger("rasyatone.deploy.fallback")
+
+    # Load persistent hostkey fingerprint cache (disk → _PLINK_PARSED_FP_CACHE dict)
+    # so a fingerprint parsed by a PREVIOUS PYTHON PROCESS (hours or days ago) is
+    # available BEFORE the first ssh_run() call. Every PID at deploy.log #200-256
+    # (41640 / 2764 / 10548 / 41072 = user re-ran the script 4 times) re-paid the
+    # ~5-second "fail → ssh-keygen -R → parse → retry" warm-up because the dict
+    # died when each process exited. This on-disk cache eliminates that overhead
+    # for every subsequent re-run to the same host:port.
+    try:
+        _loaded = _load_plink_hostkey_cache(log=log)
+        if _loaded and log is not None:
+            log.info("[hostkey/plink] loaded %d persistent hostkey fingerprint%s from on-disk cache.",
+                     _loaded, "s" if _loaded != 1 else "")
+    except Exception:
+        pass
 
     # Parse env file (never os.environ)
     env_path = Path(args.env_file)
@@ -4501,16 +5418,62 @@ if __name__ == "__main__":
             pass
         code = 130
     except Exception as _exc:
+        code = 9999
         try:
             import traceback as _tb
-            _tb_msg = f"   UNHANDLED EXIT: {type(_exc).__name__}: {_exc}\n{_tb.format_exc()}"
-            _safe_stderr_print(_tb_msg, no_unicode=True, error=True)
+            _tb_lines = _tb.format_exc()
+            _argv = list(sys.argv[1:])
+            _auto_nc, _auto_nu = False, False
+            try:
+                import re as _re_banner
+                _auto_nu = ("--no-unicode" in _argv) or bool(
+                    _re_banner.search(r"--no-unicode(?:=|\b)", " ".join(_argv)))
+                _auto_nc = ("--no-color" in _argv) or bool(
+                    _re_banner.search(r"--no-color(?:=|\b)", " ".join(_argv)))
+            except Exception:
+                pass
+            _eeb_fn = globals().get("_early_exit_banner")
+            if _eeb_fn is not None:
+                try:
+                    _eeb_fn(
+                        title="UNHANDLED EXCEPTION (script bug)",
+                        detail=(f"{type(_exc).__name__}: {_exc}\n\nStack trace:\n{_tb_lines}"),
+                        code=9999,
+                        no_unicode=_auto_nu,
+                        no_color=_auto_nc,
+                        tag="Terminal#1-98/global/bug",
+                    )
+                except Exception:
+                    # Banner rendering itself also failed; fall all the way back
+                    _tb_msg = f"   UNHANDLED EXIT: {type(_exc).__name__}: {_exc}\n{_tb_lines}"
+                    try:
+                        _safe_stderr_print(_tb_msg, no_unicode=True, error=True)
+                    except Exception:
+                        try:
+                            sys.stderr.buffer.write(
+                                f"UNHANDLED EXIT {type(_exc).__name__}: {_exc}\n"
+                                .encode("ascii", errors="backslashreplace")
+                            )
+                        except Exception:
+                            pass
+            else:
+                _tb_msg = f"   UNHANDLED EXIT: {type(_exc).__name__}: {_exc}\n{_tb_lines}"
+                try:
+                    _safe_stderr_print(_tb_msg, no_unicode=True, error=True)
+                except Exception:
+                    try:
+                        sys.stderr.buffer.write(
+                            f"UNHANDLED EXIT {type(_exc).__name__}: {_exc}\n"
+                            .encode("ascii", errors="backslashreplace")
+                        )
+                    except Exception:
+                        pass
         except Exception:
             try:
-                import sys as _s
-                _s.stderr.buffer.write(
-                    f"UNHANDLED EXIT {type(_exc).__name__}: {_exc}\n".encode("ascii", errors="backslashreplace")
+                sys.stderr.buffer.write(
+                    f"UNHANDLED EXIT {type(_exc).__name__}: {_exc}\n"
+                    .encode("ascii", errors="backslashreplace")
                 )
-            except Exception: pass
-        code = 9999
+            except Exception:
+                pass
     raise SystemExit(code)

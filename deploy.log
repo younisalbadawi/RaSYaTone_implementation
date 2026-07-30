@@ -2,15 +2,270 @@
 2026-07-29T14:47:20+0400 | ST=0 | PID=14932 | INFO    | REMOTE MODE → deploy_user@10.0.0.1
 2026-07-29T14:48:18+0400 | ST=0 | PID=27636 | INFO    | REMOTE MODE → deploy_user@10.0.0.1
 2026-07-29T14:48:33+0400 | ST=0 | PID=27636 | ERROR   | Remote script upload failed:
-ssh: connect to host 10.0.0.1 port 22: Connection timed out
+ssh: connect to host 10.0.0.1 port 22: Connection timed out
+
 
 2026-07-30T08:55:52+0400 | ST=0 | PID=19424 | INFO    | REMOTE MODE → root@207.180.207.208
 2026-07-30T08:55:53+0400 | ST=0 | PID=19424 | ERROR   | Remote script upload failed:
-Warning: Permanently added '207.180.207.208' (ED25519) to the list of known hosts.
-root@207.180.207.208: Permission denied (publickey,password).
+Warning: Permanently added '207.180.207.208' (ED25519) to the list of known hosts.
+
+root@207.180.207.208: Permission denied (publickey,password).
+
 
 2026-07-30T09:02:25+0400 | ST=0 | PID=38268 | INFO    | REMOTE MODE → root@207.180.207.208
 2026-07-30T09:02:26+0400 | ST=0 | PID=38268 | ERROR   | Remote script upload failed:
-Warning: Permanently added '207.180.207.208' (ED25519) to the list of known hosts.
-root@207.180.207.208: Permission denied (publickey,password).
+Warning: Permanently added '207.180.207.208' (ED25519) to the list of known hosts.
 
+root@207.180.207.208: Permission denied (publickey,password).
+
+
+2026-07-30T09:33:29+0400 | ST=0 | PID=42900 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T09:33:29+0400 | ST=0 | PID=42900 | INFO    |   sudo mode: interactive (password provided via wizard)
+2026-07-30T09:57:36+0400 | ST=0 | PID=4396 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T09:57:36+0400 | ST=0 | PID=4396 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T09:57:36+0400 | ST=0 | PID=4396 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T09:57:37+0400 | ST=0 | PID=4396 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+
+  207.180.207.208 (port 22)
+
+You have no guarantee that the server is the computer you
+
+think it is.
+
+The server's ssh-ed25519 key fingerprint is:
+
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+
+Connection abandoned.
+
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+
+2026-07-30T10:08:30+0400 | ST=0 | PID=37940 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T10:08:30+0400 | ST=0 | PID=37940 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T10:08:30+0400 | ST=0 | PID=37940 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T10:08:31+0400 | ST=0 | PID=37940 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+
+  207.180.207.208 (port 22)
+
+You have no guarantee that the server is the computer you
+
+think it is.
+
+The server's ssh-ed25519 key fingerprint is:
+
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+
+Connection abandoned.
+
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+
+2026-07-30T10:23:05+0400 | ST=0 | PID=29684 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T10:23:05+0400 | ST=0 | PID=29684 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T10:23:05+0400 | ST=0 | PID=29684 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T10:23:05+0400 | ST=0 | PID=29684 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+
+  207.180.207.208 (port 22)
+
+You have no guarantee that the server is the computer you
+
+think it is.
+
+The server's ssh-ed25519 key fingerprint is:
+
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+
+Connection abandoned.
+
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+
+2026-07-30T10:40:10+0400 | ST=0 | PID=32980 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T10:40:10+0400 | ST=0 | PID=32980 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T10:40:10+0400 | ST=0 | PID=32980 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T10:40:11+0400 | ST=0 | PID=32980 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+
+  207.180.207.208 (port 22)
+
+You have no guarantee that the server is the computer you
+
+think it is.
+
+The server's ssh-ed25519 key fingerprint is:
+
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+
+Connection abandoned.
+
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+
+2026-07-30T11:13:23+0400 | ST=0 | PID=30636 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T11:13:23+0400 | ST=0 | PID=30636 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T11:13:23+0400 | ST=0 | PID=30636 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T11:13:24+0400 | ST=0 | PID=30636 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T11:13:24+0400 | ST=0 | PID=30636 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T11:13:24+0400 | ST=0 | PID=30636 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T11:13:24+0400 | ST=0 | PID=30636 | DEBUG   | STDOUT: # Host 207.180.207.208 found: line 4
+C:\Users\younis.badawi/.ssh/known_hosts updated.
+Original contents retained as C:\Users\younis.badawi/.ssh/known_hosts.old
+
+2026-07-30T11:13:24+0400 | ST=0 | PID=30636 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T11:13:24+0400 | ST=0 | PID=30636 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+
+  207.180.207.208 (port 22)
+
+You have no guarantee that the server is the computer you
+
+think it is.
+
+The server's ssh-ed25519 key fingerprint is:
+
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+
+Connection abandoned.
+
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+
+2026-07-30T11:04:41+0400 | ST=0 | PID=6216 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T11:04:41+0400 | ST=0 | PID=6216 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T11:04:41+0400 | ST=0 | PID=6216 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T11:04:42+0400 | ST=0 | PID=6216 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+
+  207.180.207.208 (port 22)
+
+You have no guarantee that the server is the computer you
+
+think it is.
+
+The server's ssh-ed25519 key fingerprint is:
+
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+
+Connection abandoned.
+
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+
+2026-07-30T11:59:24+0400 | ST=0 | PID=28688 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T11:59:24+0400 | ST=0 | PID=28688 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T11:59:33+0400 | ST=0 | PID=28688 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T11:59:43+0400 | ST=0 | PID=28688 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T11:59:52+0400 | ST=0 | PID=28688 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T12:00:01+0400 | ST=0 | PID=28688 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T12:00:10+0400 | ST=0 | PID=28688 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T12:00:19+0400 | ST=0 | PID=28688 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T12:00:28+0400 | ST=0 | PID=28688 | ERROR   | Remote script upload failed:
+The host key is not cached for this server:
+  207.180.207.208 (port 22)
+You have no guarantee that the server is the computer you
+think it is.
+The server's ssh-ed25519 key fingerprint is:
+  ssh-ed25519 255 SHA256:aogXOILOWvZHIRSP33UcWBlTfc++F+CjRHnkTSTBy1E
+Connection abandoned.
+FATAL ERROR: Cannot confirm a host key in batch mode
+
+2026-07-30T12:15:03+0400 | ST=0 | PID=34020 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T12:15:03+0400 | ST=0 | PID=34020 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T12:15:03+0400 | ST=0 | PID=34020 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T12:15:03+0400 | ST=0 | PID=34020 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | INFO    | [hostkey/plink] fingerprint sha256@6a88173882ce… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | INFO    | [hostkey/plink] retrying with explicit -hostkey sha256@6a88173882ce……
+2026-07-30T12:15:04+0400 | ST=0 | PID=34020 | ERROR   | Remote script upload failed:
+plink: 'sha256@6a88173882ce5af64721148fdf751c5819537dcfbe17e0a34479e44d24c1cb51' is not a valid format for a manual host key specification
+
+2026-07-30T12:26:35+0400 | ST=0 | PID=41640 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T12:26:35+0400 | ST=0 | PID=41640 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T12:26:35+0400 | ST=0 | PID=41640 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | INFO    | [hostkey/plink] fingerprint SHA256:aogXOILOWvZH… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T12:26:36+0400 | ST=0 | PID=41640 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T12:26:40+0400 | ST=0 | PID=41640 | INFO    | Upload OK (248959 bytes script transferred)
+2026-07-30T12:26:40+0400 | ST=0 | PID=41640 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T12:26:40+0400 | ST=0 | PID=41640 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T12:26:40+0400 | ST=0 | PID=41640 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T12:26:41+0400 | ST=0 | PID=41640 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T12:26:41+0400 | ST=0 | PID=41640 | INFO    | [hostkey/plink] fingerprint SHA256:aogXOILOWvZH… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T12:26:41+0400 | ST=0 | PID=41640 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T12:26:41+0400 | ST=0 | PID=41640 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T12:26:42+0400 | ST=0 | PID=41640 | INFO    | REMOTE exit=0
+2026-07-30T12:43:48+0400 | ST=0 | PID=2764 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T12:43:48+0400 | ST=0 | PID=2764 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T12:43:48+0400 | ST=0 | PID=2764 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | INFO    | [hostkey/plink] fingerprint SHA256:aogXOILOWvZH… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T12:43:49+0400 | ST=0 | PID=2764 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T12:43:52+0400 | ST=0 | PID=2764 | INFO    | Upload OK (251258 bytes script transferred)
+2026-07-30T12:43:52+0400 | ST=0 | PID=2764 | INFO    | [hostkey/plink] reusing prior -hostkey SHA256:aogXOILOWvZH… (cache hit for 22:207.180.207.208).
+2026-07-30T12:43:52+0400 | ST=0 | PID=2764 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T12:43:54+0400 | ST=0 | PID=2764 | INFO    | REMOTE exit=0
+2026-07-30T12:51:02+0400 | ST=0 | PID=10548 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T12:51:02+0400 | ST=0 | PID=10548 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T12:51:02+0400 | ST=0 | PID=10548 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | INFO    | [hostkey/plink] fingerprint SHA256:aogXOILOWvZH… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T12:51:03+0400 | ST=0 | PID=10548 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T12:51:06+0400 | ST=0 | PID=10548 | INFO    | Upload OK (252917 bytes script transferred)
+2026-07-30T12:51:06+0400 | ST=0 | PID=10548 | INFO    | [hostkey/plink] reusing prior -hostkey SHA256:aogXOILOWvZH… (cache hit for 22:207.180.207.208).
+2026-07-30T12:51:06+0400 | ST=0 | PID=10548 | INFO    | [hostkey/plink] using explicit -hostkey SHA256:aogXOILOWvZH… on first attempt (from local cache).
+2026-07-30T12:51:08+0400 | ST=0 | PID=10548 | INFO    | REMOTE exit=0
+2026-07-30T13:06:02+0400 | ST=0 | PID=41072 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T13:06:02+0400 | ST=0 | PID=41072 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T13:06:02+0400 | ST=0 | PID=41072 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T13:06:02+0400 | ST=0 | PID=41072 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T13:06:02+0400 | ST=0 | PID=41072 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T13:06:02+0400 | ST=0 | PID=41072 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T13:06:03+0400 | ST=0 | PID=41072 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T13:06:03+0400 | ST=0 | PID=41072 | INFO    | [hostkey/plink] fingerprint SHA256:aogXOILOWvZH… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T13:06:03+0400 | ST=0 | PID=41072 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T13:06:03+0400 | ST=0 | PID=41072 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T13:06:06+0400 | ST=0 | PID=41072 | INFO    | Upload OK (252917 bytes script transferred)
+2026-07-30T13:06:06+0400 | ST=0 | PID=41072 | INFO    | [hostkey/plink] reusing prior -hostkey SHA256:aogXOILOWvZH… (cache hit for 22:207.180.207.208).
+2026-07-30T13:06:06+0400 | ST=0 | PID=41072 | INFO    | [hostkey/plink] using explicit -hostkey SHA256:aogXOILOWvZH… on first attempt (from local cache).
+2026-07-30T13:06:08+0400 | ST=0 | PID=41072 | INFO    | REMOTE exit=0
+2026-07-30T13:18:11+0400 | ST=0 | PID=36440 | INFO    |   SSH user='root' → auto-skipping sudo wrapper (remote is root already).
+2026-07-30T13:18:11+0400 | ST=0 | PID=36440 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T13:18:11+0400 | ST=0 | PID=36440 | INFO    |   auth: remote=root (no sudo required)
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | WARNING | [hostkey] Detected stale SSH host key for 207.180.207.208 — running ssh-keygen -R then retrying
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | INFO    | [hostkey] Running: ssh-keygen -R 207.180.207.208
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | DEBUG   | RUN ssh-keygen -R 207.180.207.208
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | DEBUG   | STDERR: Host 207.180.207.208 not found in C:\\Users\\younis.badawi/.ssh/known_hosts
+
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | INFO    | [hostkey/plink] fingerprint SHA256:aogXOILOWvZH… parsed from stderr; retry will append -hostkey flag.
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | INFO    | [hostkey] Retrying SSH connection with fresh host keys...
+2026-07-30T13:18:12+0400 | ST=0 | PID=36440 | INFO    | [hostkey/plink] retrying with explicit -hostkey SHA256:aogXOILOWvZH…
+2026-07-30T13:18:16+0400 | ST=0 | PID=36440 | INFO    | Upload OK (259337 bytes script transferred)
+2026-07-30T13:18:16+0400 | ST=0 | PID=36440 | INFO    | [hostkey/plink] reusing prior -hostkey SHA256:aogXOILOWvZH… (cache hit for 22:207.180.207.208).
+2026-07-30T13:18:16+0400 | ST=0 | PID=36440 | INFO    | [hostkey/plink] using explicit -hostkey SHA256:aogXOILOWvZH… on first attempt (from local cache).
+2026-07-30T13:18:18+0400 | ST=0 | PID=36440 | INFO    | REMOTE exit=0
