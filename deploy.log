@@ -1,0 +1,16 @@
+2026-07-29T14:44:50+0400 | ST=0 | PID=38160 | INFO    | REMOTE MODE → deploy_user@10.0.0.1
+2026-07-29T14:47:20+0400 | ST=0 | PID=14932 | INFO    | REMOTE MODE → deploy_user@10.0.0.1
+2026-07-29T14:48:18+0400 | ST=0 | PID=27636 | INFO    | REMOTE MODE → deploy_user@10.0.0.1
+2026-07-29T14:48:33+0400 | ST=0 | PID=27636 | ERROR   | Remote script upload failed:
+ssh: connect to host 10.0.0.1 port 22: Connection timed out
+
+2026-07-30T08:55:52+0400 | ST=0 | PID=19424 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T08:55:53+0400 | ST=0 | PID=19424 | ERROR   | Remote script upload failed:
+Warning: Permanently added '207.180.207.208' (ED25519) to the list of known hosts.
+root@207.180.207.208: Permission denied (publickey,password).
+
+2026-07-30T09:02:25+0400 | ST=0 | PID=38268 | INFO    | REMOTE MODE → root@207.180.207.208
+2026-07-30T09:02:26+0400 | ST=0 | PID=38268 | ERROR   | Remote script upload failed:
+Warning: Permanently added '207.180.207.208' (ED25519) to the list of known hosts.
+root@207.180.207.208: Permission denied (publickey,password).
+
