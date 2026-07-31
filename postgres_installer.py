@@ -137,9 +137,9 @@ def build_role_sql(app_user: str, app_pass: str) -> str:
     DO $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{normalize_sql_literal(app_user)}') THEN
-            CREATE ROLE "{u}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}';
+            CREATE ROLE "{u}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}' CREATEDB;
         ELSE
-            ALTER ROLE "{u}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}';
+            ALTER ROLE "{u}" LOGIN PASSWORD '{normalize_sql_literal(app_pass)}' CREATEDB;
         END IF;
     END
     $$;
@@ -165,8 +165,12 @@ def build_grant_sql(db_name: str, app_user: str, schema_name: str = "public") ->
         f'GRANT ALL ON SCHEMA "{s}" TO "{u}";'
         f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "{s}" TO "{u}";'
         f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "{s}" TO "{u}";'
+        f'GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA "{s}" TO "{u}";'
+        f'GRANT ALL PRIVILEGES ON ALL TYPES IN SCHEMA "{s}" TO "{u}";'
         f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{s}" GRANT ALL ON TABLES TO "{u}";'
         f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{s}" GRANT ALL ON SEQUENCES TO "{u}";'
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{s}" GRANT ALL ON FUNCTIONS TO "{u}";'
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{s}" GRANT ALL ON TYPES TO "{u}";'
     )
 
 
