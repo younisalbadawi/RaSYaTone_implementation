@@ -2853,9 +2853,8 @@ def _remove_host_key(host: str, port: Optional[int] = None, log=None) -> int:
     def _run(cmd):
         return run_ok(cmd, log=log, check=False, timeout=60).returncode
     r1 = _run(["ssh-keygen", "-R", host])
-    r2 = 0
-    if port and port != 22:
-        r2 = _run(["ssh-keygen", "-R", f"[{host}]:{port}"])
+    effective_port = port or 22
+    r2 = _run(["ssh-keygen", "-R", f"[{host}]:{effective_port}"])
     rp = _clear_putty_host_keys(host, port=port, log=log)
     openssh_ok = (r1 == 0 or r2 == 0)
     if openssh_ok or rp == 0:
@@ -3679,14 +3678,21 @@ def ssh_run(*, host: str, user: str, port: Optional[int], identity: Optional[Pat
         # PuTTY 0.77–0.78 specific retry: first -batch attempt returned a SHA256
         # fingerprint stanza; parse it before clearing caches, then carry into retry.
         parsed_fp = None
+        err_text = first.stderr or ""
+        first_connect = ("server's host key is not cached" in err_text) or \
+            ("Cannot confirm a host key in batch mode" in err_text)
         if _geteuid_or_none() is None:
-            parsed_fp = _plink_parse_hostkey_fingerprint(first.stderr or "")
+            parsed_fp = _plink_parse_hostkey_fingerprint(err_text)
         if log is not None:
-            log.warning("[hostkey] Detected stale SSH host key for %s — running ssh-keygen -R then retrying",
-                        host)
-            log.info("[hostkey] Running: ssh-keygen -R %s%s",
-                     host, f" -R [{host}]:{port}" if port and port != 22 else "")
-        _remove_host_key(host, port=port, log=log)
+            if first_connect and parsed_fp:
+                log.warning("[hostkey] Host key not cached for %s — pinning fingerprint and retrying", host)
+            else:
+                log.warning("[hostkey] Detected SSH host key problem for %s — running ssh-keygen -R then retrying",
+                            host)
+                log.info("[hostkey] Running: ssh-keygen -R %s%s",
+                         host, f" -R [{host}]:{port or 22}")
+        if not (first_connect and parsed_fp):
+            _remove_host_key(host, port=port, log=log)
         if parsed_fp:
             # Cache parsed fingerprint in two places: (1) closure list to pass to
             # immediate retry below, (2) process-global _PLINK_PARSED_FP_CACHE dict
@@ -3771,6 +3777,10 @@ def remote_deploy_wrapper(args, log, scrub_env) -> int:
             log.info("  sudo mode: interactive (password provided via wizard)")
         else:
             log.info("  sudo mode: non-interactive (sudo -n; NOPASSWD sudo required)")
+        log.info("  stage: %s", getattr(args, "stage", None))
+        remote_log_dir = getattr(args, "log_dir", None)
+        if remote_log_dir:
+            log.info("  remote log (requested): %s", f"{remote_log_dir.rstrip('/')}/deploy.log")
     # Read this script body + encode b64 (bytes = piped over ssh stdin; never placed on argv)
     import base64
     this_file = Path(__file__).resolve()
@@ -4922,6 +4932,13 @@ def main(argv: list[str]) -> int:
                                   no_color=args.no_color)
         dummy_scrub_env: dict[str, str] = {}
         try:
+            try:
+                _loaded = _load_plink_hostkey_cache(log=dummy_log)
+                if _loaded:
+                    dummy_log.info("[hostkey/plink] loaded %d persistent hostkey fingerprint%s from on-disk cache.",
+                                   _loaded, "s" if _loaded != 1 else "")
+            except Exception:
+                pass
             return remote_deploy_wrapper(args, log=dummy_log, scrub_env=dummy_scrub_env)
         except DeployError as de:
             # DeployError from wrapper = expected error (no plink 41, upload failed 40, etc)
@@ -4954,9 +4971,16 @@ def main(argv: list[str]) -> int:
         log_dir = Path(args.log_dir)
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
+        except OSError as exc:
             # Fallback to /tmp if we can't create log dir
-            log_dir = Path(tempfile.mkdtemp(prefix="rasyatone_logs_"))
+            fallback_dir = tempfile.mkdtemp(prefix="rasyatone_logs_")
+            log_dir = Path(fallback_dir)
+            _safe_stderr_print(
+                f"Log directory not writable: {args.log_dir} ({type(exc).__name__}: {exc})\n"
+                f"Falling back to: {fallback_dir}",
+                no_unicode=True,
+                error=True,
+            )
         log = setup_logging(log_dir, quiet=args.quiet, verbose=args.verbose, no_color=args.no_color)
     except Exception as exc:
         try:
