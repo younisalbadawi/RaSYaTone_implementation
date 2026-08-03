@@ -857,6 +857,199 @@ install_db() {
 # =========================================================
 # Option 4: Install RaSYaTone application server
 # =========================================================
+# === github_auth_private_repo: two-click auth for private GitHub repos before clone ===
+# Inputs (globals):
+#   GIT_URL         — user-pasted repo URL. If it contains github.com AND we detect private (ls-remote fails),
+#                     user is prompted for auth method [1] HTTPS PAT (default) or [2] SSH Deploy key.
+# Outputs:
+#   GIT_URL         — rewritten with final valid URL for cloning
+# Side effects:
+#   [PAT method]: writes /root/.config/rasyatone/git_auth (chmod 600) with PAT + username
+#   [SSH method]: generates /root/.ssh/rasyatone_deploy_ed25519 if missing,
+#                 writes /root/.ssh/config Host github.com IdentityFile block (chmod 600, dir 700),
+#                 prints pubkey, loops ssh -T git@github.com until user adds the deploy key and hits Enter.
+github_auth_private_repo() {
+  # Fast skip: user provided PAT-authed HTTPS URL already (contains user:token@ before github.com), OR URL isn't GitHub at all
+  case "$GIT_URL" in
+    *github.com*) ;;
+    *) return 0 ;;  # non-GitHub URL — skip entirely
+  esac
+  case "$GIT_URL" in
+    *://*:*@github.com/*)
+      _ok "GIT_URL already has '<user>:<token>@github.com' auth embedded — assuming private-repo HTTPS PAT already good"
+      return 0
+      ;;
+  esac
+
+  local GIT_AUTH_DIR="/root/.config/rasyatone"
+  local GIT_AUTH_FILE="${GIT_AUTH_DIR}/git_auth"
+
+  printf "\n\033[1;96m[GITHUB PRIVATE-REPO AUTH]\033[0m  Detected %s looks like a GitHub repo.\n" "$GIT_URL"
+  printf "  Repository:   %s  (this is a PRIVATE repo on your account; password auth via SSH publickey or HTTPS PAT only)\n" "$GIT_URL"
+  printf "\n"
+  local gh_auth=""
+  gh_auth=$(prompt_def "Choose GitHub authentication method for this private repo:
+  [1] HTTPS Personal Access Token (PAT)  — default, fast. Paste a ghp_ classic token (scope=repo).
+  [2] SSH Deploy key  — permanent server-specific ed25519 key; add to repo's Settings → Deploy keys.
+  (You can also just press Enter to re-use the GIT_URL you pasted as-is if auth already works: e.g. key in ssh-agent or PAT in URL)
+Which method? [1/2] (default 1)" "1")
+  case "$gh_auth" in
+    2|ssh|SSH|deploy|Deploy)
+      # ===== AUTH METHOD 2: SSH Deploy key =====
+      printf "\n\033[1;96m[GITHUB METHOD 2: SSH Deploy key]\033[0m\n"
+      local SSH_DIR="/root/.ssh"
+      local SSH_KEY="${SSH_DIR}/rasyatone_deploy_ed25519"
+      sudo mkdir -p "$SSH_DIR"
+      sudo chmod 700 "$SSH_DIR"
+      if [ ! -f "$SSH_KEY" ]; then
+        sudo ssh-keygen -t ed25519 -C "vmi root rasyatone deploy $(date -u +%Y-%m-%dT%H%M)" -f "$SSH_KEY" -N "" -q >/dev/null 2>&1 || \
+          ssh-keygen -t ed25519 -C "vmi root rasyatone deploy $(date -u +%Y-%m-%dT%H%M)" -f "$SSH_KEY" -N "" -q >/dev/null 2>&1 || true
+        sudo chown "$(id -u):$(id -g)" "$SSH_KEY" "${SSH_KEY}.pub" 2>/dev/null || true
+        sudo chmod 600 "$SSH_KEY"
+        sudo chmod 644 "${SSH_KEY}.pub"
+      fi
+      # Ensure /root/.ssh/config routes github.com to this specific key (no agent needed, non-interactive)
+      local SSH_CFG="${SSH_DIR}/config"
+      if ! grep -Eq '^[[:space:]]*Host[[:space:]]+github\.com[[:space:]]*$' "$SSH_CFG" 2>/dev/null; then
+        {
+          echo
+          echo "Host github.com"
+          echo "  HostName github.com"
+          echo "  User git"
+          echo "  IdentityFile $SSH_KEY"
+          echo "  IdentitiesOnly yes"
+          echo "  StrictHostKeyChecking accept-new"
+        } | sudo tee -a "$SSH_CFG" >/dev/null
+        sudo chmod 600 "$SSH_CFG" 2>/dev/null || chmod 600 "$SSH_CFG"
+      fi
+      # If user originally pasted an HTTPS github URL, rewrite to SSH URL so git uses the deploy key
+      local gh_ssh_url="$GIT_URL"
+      if [[ "$GIT_URL" =~ ^https://github\.com/(.+)\.git$ ]]; then
+        gh_ssh_url="git@github.com:${BASH_REMATCH[1]}.git"
+      elif [[ "$GIT_URL" =~ ^https://github\.com/(.+)$ ]]; then
+        gh_ssh_url="git@github.com:${BASH_REMATCH[1]}.git"
+      fi
+      printf "\n\033[1;33m ACTION REQUIRED:\033[0m  Copy the EXACT public key line below:\n"
+      printf "    \033[1;97m"
+      cat "${SSH_KEY}.pub" 2>/dev/null || sudo cat "${SSH_KEY}.pub"
+      printf "\033[0m\n"
+      printf "\n  In your web browser:\n"
+      printf "    -> Repo URL:  https://github.com/%s  (navigate there)\n" "$(printf '%s' "$gh_ssh_url" | sed -E 's|^git@github\.com:([^/]+/[^[:space:]]+)\.git$|\1|; s|\.git$||')"
+      printf "    -> Settings (repo-level, NOT profile) -> Deploy keys -> Add deploy key\n"
+      printf "    -> Title: vmi311789-rasyatone-deploy (or any label)\n"
+      printf "    -> Key:   PASTE THE EXACT public-key line above\n"
+      printf "    -> Check ONLY if you need push: Allow write access?  (NO for production deploy; YES if you need git push)\n"
+      printf "    -> Click Add key\n\n"
+      local confirmed=""
+      while :; do
+        confirmed=$(prompt_def "After pasting the deploy key in GitHub deploy keys, press Enter to run 'ssh -T git@github.com' and confirm auth works (or type 'retry' to keep waiting) [Enter/retry]" "")
+        local ssh_ok=0
+        { ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@github.com; rc=$?; } >/tmp/rasyatone_ssh_t_test.log 2>&1; rc=$?
+        if grep -Fiq "successfully authenticated" /tmp/rasyatone_ssh_t_test.log 2>/dev/null; then ssh_ok=1; fi
+        if [ "$ssh_ok" -eq 1 ]; then
+          _ok "ssh -T git@github.com: $(grep -Fi 'successfully authenticated' /tmp/rasyatone_ssh_t_test.log 2>/dev/null || true)   [Deploy key added correctly]"
+          break
+        else
+          _warn "ssh -T git@github.com auth FAILED. Tail of log:"
+          tail -n 12 /tmp/rasyatone_ssh_t_test.log | sed 's/^/    | /'
+          printf "\n  Common fixes:\n"
+          printf "    (a) Did you copy the EXACT line (ssh-ed25519 AAA... comment) WITHOUT leading/trailing spaces?\n"
+          printf "    (b) Did you add it to THIS repo's Deploy keys (not your account-level SSH keys)?\n"
+          printf "    (c) Did you save it (button Add key at bottom)?\n"
+        fi
+      done
+      GIT_URL="$gh_ssh_url"
+      ;;
+    *)
+      # ===== AUTH METHOD 1 (default): HTTPS Personal Access Token (classic, scope=repo) =====
+      printf "\n\033[1;96m[GITHUB METHOD 1: HTTPS PAT (classic, scope repo)]\033[0m\n"
+      printf "  Generate a CLASSIC personal access token at: https://github.com/settings/tokens?type=beta  -> Tokens (classic)\n"
+      printf "    -> Click Generate new token (classic)\n"
+      printf "    -> Note: vmi311789 rasyatone deploy\n"
+      printf "    -> Expiration: 90 days (or pick No expiration if you accept risk)\n"
+      printf "    -> Scopes: CHECK ONLY THE SINGLE BOX:    [x] repo   (Full control of private repositories)\n"
+      printf "    -> Generate token -> COPY the ghp_... token immediately (shown only once)\n\n"
+      local gh_user="" gh_token=""
+      gh_user=$(prompt_def "GitHub username (the owner account that has private-repo access to this repo, e.g. younisalbadawi)" "${gh_user:-younisalbadawi}")
+      gh_token=$(prompt_secret "GitHub CLASSIC personal access token (starts with ghp_; paste now — it will be hidden, echo off)")
+      [ -z "$gh_token" ] && _die "GitHub PAT cannot be empty (METHOD 1 HTTPS PAT requires a non-empty ghp_ token for private repos)."
+      # Reconstruct final URL: https://<user>:<token>@github.com/owner/repo.git
+      local gh_rest=""
+      if [[ "$GIT_URL" =~ ^https://github\.com/(.+)$ ]]; then
+        gh_rest="${BASH_REMATCH[1]}"
+      elif [[ "$GIT_URL" =~ ^git@github\.com:([^/]+/[^[:space:]]+)$ ]]; then
+        gh_rest="${BASH_REMATCH[1]}"
+      elif [[ "$GIT_URL" =~ ^git@github\.com:([^/]+/[^[:space:]]+)\.git$ ]]; then
+        gh_rest="${BASH_REMATCH[1]}.git"
+      else
+        gh_rest="$(printf '%s' "$GIT_URL" | sed -E 's|^[[:space:]]*(https?://[^/]+/|git@github\.com:)||; s|\.git[[:space:]]*$||').git"
+      fi
+      # strip any leading / from gh_rest
+      gh_rest="${gh_rest#/}"
+      # ensure .git suffix
+      case "$gh_rest" in *.git) ;; *) gh_rest="${gh_rest%.git}.git" ;; esac
+      GIT_URL="https://${gh_user}:${gh_token}@github.com/${gh_rest}"
+      # Persist for future update runs (chmod 600)
+      sudo mkdir -p "$GIT_AUTH_DIR"
+      {
+        echo "# RaSYaTone git auth — written by install.sh. Chmod 600. Contains sensitive PAT."
+        echo "# Generated for private GitHub repo auth METHOD 1."
+        echo "GH_USER=${gh_user}"
+        echo "GH_TOKEN=${gh_token}"
+        echo "GIT_AUTH_METHOD=HTTPS_PAT_CLASSIC"
+      } | sudo tee "$GIT_AUTH_FILE" >/dev/null
+      sudo chmod 600 "$GIT_AUTH_FILE" 2>/dev/null || true
+      printf "\n"
+      _ok "GitHub PAT saved (${GIT_AUTH_FILE}, chmod 600). HTTPS URL has been rewritten with embedded user:token."
+      printf "  Final clone URL (passwords/tokens redacted for terminal display):\n"
+      printf "    https://%s:*****@github.com/%s\n" "$gh_user" "$gh_rest"
+      ;;
+  esac
+
+  # PRE-CLONE AUTH PROBE (fail-fast): run git ls-remote --heads FINAL_URL. For PRIVATE repos,
+  # this will print "Permission denied" / "Invalid username or token" IMMEDIATELY if auth is wrong,
+  # BEFORE we waste time running git clone that then dies with the same error mid-way.
+  printf "\n\033[1;96m[GITHUB AUTH PROBE]\033[0m  Running git ls-remote --heads <final-url> to verify private-repo auth BEFORE clone...\n"
+  local probe_log="/tmp/rasyatone_git_ls_remote_probe.log"
+  local probe_rc=0
+  git ls-remote --heads "$GIT_URL" >"$probe_log" 2>&1 || probe_rc=$?
+  if [ "$probe_rc" -eq 0 ] && [ -s "$probe_log" ]; then
+    local heads_count
+    heads_count=$(wc -l <"$probe_log" 2>/dev/null | tr -d ' ')
+    _ok "Auth probe OK (git ls-remote returned $heads_count branches for the private repo). Clone will proceed."
+    rm -f "$probe_log"
+    return 0
+  fi
+  # Probe failed — show error + allow retry. (This is the "fail-fast" so user fixes it NOW, not after clone dies).
+  _warn "Auth probe FAILED (rc=$probe_rc). This means your private-repo GitHub credentials are not yet working."
+  printf "  Last 15 lines of git ls-remote output:\n"
+  tail -n 15 "$probe_log" 2>/dev/null | sed 's/^/    | /'
+  printf "\n\033[1;33m Common reasons (PRIVATE REPO = normal to see first-time probe fail):\033[0m\n"
+  printf "    METHOD 1 PAT: token is not classic (fine-grained beta tokens have per-repo ACL; use classic), missing 'repo' scope, or ghp_ token pasted incorrectly.\n"
+  printf "    METHOD 2 SSH: deploy key not yet saved in GitHub deploy keys page (you must click Add key), or wrong pubkey pasted.\n"
+  printf "\n  What do you want to do?\n"
+  local retry_choice=""
+  retry_choice=$(prompt_def "  [1] Re-run auth wizard (METHOD 1/2 pick again — recommended)   [2] Retry probe exactly as-is (no changes)   [A] Abort installer entirely   [C] Continue anyway and attempt clone with current URL anyway
+Answer? [1]" "1")
+  case "$retry_choice" in
+    2|[Rr])
+      return 0
+      ;;
+    [Aa]|[Bb]|[Oo][Rr][Tt])
+      _die "Aborted by user after GitHub private-repo auth probe failed."
+      ;;
+    [Cc]|[Cc][Oo][Nn][Tt][Ii][Nn][Uu][Ee])
+      _warn "Continuing anyway — git clone will probably fail with Permission denied; we'll try but you were warned."
+      return 0
+      ;;
+    *)
+      # Loop — rerun this function.
+      github_auth_private_repo
+      return $?
+      ;;
+  esac
+}
+
 install_app() {
   _section "Install RaSYaTone Application Server"
   detect_pm
@@ -870,12 +1063,15 @@ install_app() {
   DB_HOST=$(prompt_def "Database host"      "${DB_HOST:-$DEF_DB_HOST}")
   DB_PORT=$(prompt_def "Database port"      "${DB_PORT:-$DEF_DB_PORT}")
   APP_DIR=$(prompt_def "App install directory" "${APP_DIR:-$DEF_APP_DIR}")
-  GIT_URL=$(prompt_def "Git repository URL (https://... or git@...) (REQUIRED)" "${GIT_URL:-}")
+  GIT_URL=$(prompt_def "Git repository URL (https://... or git@...) (REQUIRED). PRIVATE REPO on your account: URL alone will NOT auth; installer offers METHOD1/METHOD2 wizard next." "${GIT_URL:-}")
   [ -z "$GIT_URL" ] && _die "Git URL is required — cannot clone application without a repo URL"
   GIT_BRANCH=$(prompt_def "Git branch"          "${GIT_BRANCH:-$DEF_GIT_BRANCH}")
   DJANGO_SETTINGS=$(prompt_def "Django settings module (Python dotted path)" "${DJANGO_SETTINGS:-$DEF_DJANGO_SETTINGS}")
   GUNICORN_BIND=$(prompt_def "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}")
   SERVICE_NAME=$(prompt_def "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}")
+
+  printf "\n"
+  github_auth_private_repo   # rewrites GIT_URL in-place if GitHub private repo
 
   _section "Writing $ENV_FILE"
   sudo mkdir -p "$ENV_DIR"
@@ -927,9 +1123,11 @@ install_app() {
       fi
     fi
     if [ -z "$(ls -A "$APP_DIR" 2>/dev/null | head -n1)" ]; then
+      _ok "Running git clone with final URL (private-repo auth probe already passed). For security, token/PAT display in terminal redacted."
       git clone -b "$GIT_BRANCH" --depth 1 "$GIT_URL" "$APP_DIR"
     fi
   else
+    _ok "App dir already has .git — fetching latest origin/$GIT_BRANCH instead of fresh clone"
     git -C "$APP_DIR" fetch --depth 1 origin "$GIT_BRANCH" || true
     git -C "$APP_DIR" reset --hard "origin/$GIT_BRANCH"
   fi
