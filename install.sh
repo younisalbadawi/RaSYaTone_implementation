@@ -93,6 +93,10 @@ confirm_yn() {
   val=$(printf "%s" "${val:-$def}" | tr '[:upper:]' '[:lower:]' | cut -c1)
   [ "$val" = "y" ]
 }
+# prompt_yn: same confirm_yn but returns literal "y"/"n" (for $() capture, not boolean exit code)
+prompt_yn() {
+  if confirm_yn "$@"; then printf "y"; else printf "n"; fi
+}
 
 # --- package manager auto-detect --------------------------------------------
 declare -g PM="" PKG_INSTALL="" PKG_UPDATE=""
@@ -115,9 +119,149 @@ service_control() {
     sudo systemctl "$action" "$name" 2>/dev/null || sudo systemctl "$action" "postgresql" 2>/dev/null || true
   elif command -v rc-service >/dev/null 2>&1; then
     sudo rc-service "$name" "$action" 2>/dev/null || sudo rc-service postgresql "$action" 2>/dev/null || true
+  elif command -v rc-update >/dev/null 2>&1; then
+    sudo rc-service "$name" "$action" 2>/dev/null || true
   else
     _warn "No systemctl/rc-service; service '$action $name' must be run manually"
   fi
+}
+
+# --- firewall helpers: auto-detect ufw / firewalld / generic iptables -------------
+# Safety rule: SSH (22/TCP) is ALWAYS opened BEFORE enabling any firewall, so user
+# isn't locked out of their SSH session on a remote server.
+firewall_detect() {
+  if command -v ufw >/dev/null 2>&1; then
+    FW_BACKEND="ufw"; return 0
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    FW_BACKEND="firewalld"; return 0
+  elif command -v iptables >/dev/null 2>&1; then
+    FW_BACKEND="iptables"; return 0
+  fi
+  FW_BACKEND="none"; return 1
+}
+
+firewall_install_and_enable() {
+  # Installs firewall package if missing; enables it. Returns 0 on success.
+  # After this call, SSH port 22/TCP is guaranteed open and firewall is active.
+  firewall_detect || true
+  case "$FW_BACKEND" in
+    ufw)
+      if ! command -v ufw >/dev/null 2>&1; then
+        _section "Installing ufw firewall package via $PM"
+        $PKG_UPDATE >/dev/null || true
+        $PKG_INSTALL ufw >/dev/null 2>&1 || return 1
+      fi
+      # CRITICAL: allow SSH BEFORE enabling the firewall
+      sudo ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
+      sudo ufw --force enable >/dev/null 2>&1 || return 1
+      sudo ufw default deny incoming >/dev/null 2>&1 || true
+      sudo ufw default allow outgoing >/dev/null 2>&1 || true
+      return 0
+      ;;
+    firewalld)
+      if ! command -v firewall-cmd >/dev/null 2>&1; then
+        _section "Installing firewalld package via $PM"
+        $PKG_UPDATE >/dev/null || true
+        $PKG_INSTALL firewalld >/dev/null 2>&1 || return 1
+      fi
+      # start + enable firewalld
+      if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl enable --now firewalld >/dev/null 2>&1 || return 1
+      elif command -v rc-service >/dev/null 2>&1; then
+        sudo rc-update add firewalld default >/dev/null 2>&1 || true
+        sudo rc-service firewalld start >/dev/null 2>&1 || return 1
+      fi
+      # CRITICAL: SSH FIRST (add permanent + immediate)
+      sudo firewall-cmd --permanent --add-service=ssh --zone=public >/dev/null 2>&1 || \
+        sudo firewall-cmd --permanent --add-port=22/tcp --zone=public >/dev/null 2>&1 || true
+      sudo firewall-cmd --add-service=ssh --zone=public >/dev/null 2>&1 || \
+        sudo firewall-cmd --add-port=22/tcp --zone=public >/dev/null 2>&1 || true
+      return 0
+      ;;
+    iptables)
+      # Generic: just install iptables-persistent / iptables-services if available,
+      # ensure SSH 22/tcp ACCEPT rule at top of INPUT chain, then save.
+      if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive $PKG_INSTALL iptables-persistent netfilter-persistent >/dev/null 2>&1 || true
+      elif command -v dnf >/dev/null 2>&1; then
+        $PKG_INSTALL iptables-services >/dev/null 2>&1 || true
+      fi
+      # Add SSH allow rule FIRST (if not already present)
+      if ! sudo iptables -C INPUT -p tcp --dport 22 -j ACCEPT >/dev/null 2>&1; then
+        sudo iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT || return 1
+      fi
+      # Drop defaults for incoming; allow established/related; loopback
+      sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+      sudo iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+      sudo iptables -P INPUT DROP 2>/dev/null || true
+      # Save rules
+      if command -v netfilter-persistent >/dev/null 2>&1; then sudo netfilter-persistent save >/dev/null 2>&1 || true
+      elif command -v iptables-save >/dev/null 2>&1; then sudo sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null || true
+      elif command -v service >/dev/null 2>&1; then sudo service iptables save >/dev/null 2>&1 || true
+      fi
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+firewall_add_port() {
+  # Usage: firewall_add_port <proto> <port> [comment]
+  # proto = tcp|udp; port = numeric or service name
+  local proto="$1" port="$2" comment="${3:-}"
+  [ -z "$proto" ] && return 1
+  [ -z "$port" ]  && return 1
+  firewall_detect || true
+  case "$FW_BACKEND" in
+    ufw)
+      if [ -n "$comment" ]; then
+        sudo ufw allow "${port}/${proto}" comment "$comment" >/dev/null 2>&1 || return 1
+      else
+        sudo ufw allow "${port}/${proto}" >/dev/null 2>&1 || return 1
+      fi
+      ;;
+    firewalld)
+      sudo firewall-cmd --permanent --add-port="${port}/${proto}" --zone=public >/dev/null 2>&1 || return 1
+      sudo firewall-cmd            --add-port="${port}/${proto}" --zone=public >/dev/null 2>&1 || return 1
+      ;;
+    iptables)
+      if ! sudo iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        # insert right after the SSH rule at position 2 (top-ish of chain)
+        sudo iptables -I INPUT 2 -p "$proto" --dport "$port" -j ACCEPT || return 1
+      fi
+      if command -v netfilter-persistent >/dev/null 2>&1; then sudo netfilter-persistent save >/dev/null 2>&1 || true
+      elif command -v iptables-save >/dev/null 2>&1; then sudo sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null || true
+      elif command -v service >/dev/null 2>&1; then sudo service iptables save >/dev/null 2>&1 || true
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+firewall_summary() {
+  local fw=""
+  firewall_detect || true
+  printf "\nFirewall summary (backend=%s):\n" "$FW_BACKEND"
+  case "$FW_BACKEND" in
+    ufw)
+      printf "  ufw status:\n"
+      sudo ufw status numbered 2>/dev/null | sed 's/^/    /' || true
+      ;;
+    firewalld)
+      printf "  public zone permanent ports/services:\n"
+      sudo firewall-cmd --permanent --list-all --zone=public 2>/dev/null | sed 's/^/    /' || true
+      ;;
+    iptables)
+      printf "  iptables INPUT chain:\n"
+      sudo iptables -L INPUT -v -n --line-numbers 2>/dev/null | sed 's/^/    /' || true
+      ;;
+    *)
+      printf "  (no ufw/firewalld/iptables backend detected — skip firewall summary)\n"
+      ;;
+  esac
 }
 
 # --- environment loader (DB_* vars from .env; returns 0 if file existed) ----
@@ -452,6 +596,32 @@ install_db() {
   if [ -n "$row" ]; then _ok "psql connect verify OK: $row"
   else _die "Could not connect as $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME after install — review pg_hba / listen_addresses above"; fi
 
+  # ================ Firewall enable + PostgreSQL rule ================
+  _section "Enable system firewall (Option 3 firewall step)"
+  local do_fw=""
+  do_fw=$(prompt_yn "Enable firewall and open needed ports (PostgreSQL ${DB_PORT}/tcp + SSH 22/tcp)? [Y/n] — SSH 22 is ALWAYS opened first so you won't be locked out" "y")
+  if [ "$do_fw" = "y" ]; then
+    firewall_detect || true
+    _ok "Detected firewall backend: ${FW_BACKEND}"
+    if firewall_install_and_enable; then
+      _ok "Firewall installed/enabled; SSH 22/tcp already open"
+      if [ "$LISTEN_ADDRESSES" = "localhost" ] || [ "$LISTEN_ADDRESSES" = "127.0.0.1" ] || [ "$LISTEN_ADDRESSES" = "::1" ]; then
+        _warn "listen_addresses='${LISTEN_ADDRESSES}' (localhost only); skipping firewall rule for PostgreSQL ${DB_PORT}/tcp (no remote access needed)."
+      else
+        if firewall_add_port tcp "$DB_PORT" "PostgreSQL (rasyatone DB)"; then
+          _ok "Firewall rule added: PostgreSQL ${DB_PORT}/tcp"
+        else
+          _warn "Could not add PostgreSQL ${DB_PORT}/tcp firewall rule — add manually if needed."
+        fi
+      fi
+      firewall_summary
+    else
+      _warn "Could not install/enable firewall (backend=${FW_BACKEND}). Review manually — SSH 22/tcp and PostgreSQL ${DB_PORT}/tcp remain open per current network rules."
+    fi
+  else
+    _warn "Firewall skipped by user choice. SSH 22/tcp and PostgreSQL ${DB_PORT}/tcp visibility depend on existing network/firewall rules."
+  fi
+
   _section "PostgreSQL install POST-INSTALL SUMMARY"
   service_control status postgresql || true
   printf "  DB_HOST=%s  DB_PORT=%s  DB_NAME=%s  DB_USER=%s\n" "$DB_HOST" "$DB_PORT" "$DB_NAME" "$DB_USER"
@@ -597,6 +767,35 @@ install_app() {
     _ok "systemd unit written and started: $unit_file"
   else
     _warn "systemd not present — skipped service install (run gunicorn manually)"
+  fi
+
+  # ================ Firewall enable + app + web ports ================
+  _section "Enable system firewall (Option 4 firewall step)"
+  local bind_port do_fw="" do_webfw=""
+  bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
+  do_fw=$(prompt_yn "Enable firewall and open needed ports (Gunicorn ${bind_port}/tcp + SSH 22/tcp)? [Y/n] — SSH 22 is ALWAYS opened first so you won't be locked out" "y")
+  if [ "$do_fw" = "y" ]; then
+    firewall_detect || true
+    _ok "Detected firewall backend: ${FW_BACKEND}"
+    if firewall_install_and_enable; then
+      _ok "Firewall installed/enabled; SSH 22/tcp already open"
+      if firewall_add_port tcp "$bind_port" "Gunicorn / RaSYaTone app (${SERVICE_NAME})"; then
+        _ok "Firewall rule added: Gunicorn ${bind_port}/tcp"
+      else
+        _warn "Could not add Gunicorn ${bind_port}/tcp firewall rule — add manually if needed."
+      fi
+      do_webfw=$(prompt_yn "Also open HTTP (80/tcp) and HTTPS (443/tcp) for a future nginx reverse proxy / Let's Encrypt? [y/N]" "n")
+      if [ "$do_webfw" = "y" ]; then
+        firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"  || true
+        firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)" || true
+        _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+      fi
+      firewall_summary
+    else
+      _warn "Could not install/enable firewall (backend=${FW_BACKEND}). Review manually — SSH 22/tcp and Gunicorn ${bind_port}/tcp visibility depend on existing network rules."
+    fi
+  else
+    _warn "Firewall skipped by user choice. SSH 22/tcp and Gunicorn ${bind_port}/tcp visibility depend on existing network/firewall rules."
   fi
 
   _section "RaSYaTone app install POST-INSTALL SUMMARY"
