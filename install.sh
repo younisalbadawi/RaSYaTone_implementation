@@ -469,6 +469,36 @@ install_db() {
   DB_PORT=$(prompt_def "Database port"            "${DB_PORT:-$DEF_DB_PORT}")
   LISTEN_ADDRESSES=$(prompt_def "PostgreSQL listen_addresses ('*' = all, 'localhost' = local only)" \
                               "${LISTEN_ADDRESSES:-$DEF_LISTEN_ADDRESSES}")
+  local ALLOW_PG_DBS="SELF"  # SELF = only $DB_NAME; ALL = also allow postgres/maintenance DB; prompt below
+  ALLOW_PG_DBS_RAW=$(prompt_def "Which databases should '$DB_USER' connect to remotely? [SELF = only '$DB_NAME', ALL = '$DB_NAME' + postgres/all DBs]" "SELF")
+  ALLOW_PG_DBS_RAW=$(printf "%s" "$ALLOW_PG_DBS_RAW" | tr '[:lower:]' '[:upper:]')
+  case "$ALLOW_PG_DBS_RAW" in
+    ALL) ALLOW_PG_DBS="ALL" ;;
+    *)   ALLOW_PG_DBS="SELF" ;;
+  esac
+  local PG_ALLOW_IPS=""
+  PG_ALLOW_IPS=$(prompt_def \
+    "Remote client IPs allowed (comma-separated CIDRs). Examples:
+     Single IP: 5.32.252.64/32
+     Two clients: 5.32.252.64/32,84.242.41.112/32
+     Any IPv4 client (open to internet): 0.0.0.0/0
+     Any IPv4+IPv6: 0.0.0.0/0,::/0
+     Local only (default if listen=localhost): 127.0.0.1/32,::1/128
+     (Press Enter for default: samenet + localhost + 0.0.0.0/0 only when listen_addresses is not localhost)" "")
+  if [ -z "${PG_ALLOW_IPS:-}" ]; then
+    if [ "$LISTEN_ADDRESSES" = "localhost" ] || [ "$LISTEN_ADDRESSES" = "127.0.0.1" ] || [ "$LISTEN_ADDRESSES" = "::1" ]; then
+      PG_ALLOW_IPS="127.0.0.1/32,::1/128,samenet"
+    else
+      # User selected * / public listen → default to a moderately open set that works,
+      # with an explicit warning that 0.0.0.0/0 is internet-wide.
+      PG_ALLOW_IPS="samenet,127.0.0.1/32,::1/128,0.0.0.0/0,::/0"
+      _warn "Default remote allow set includes 0.0.0.0/0 + ::/0 (any IPv4/IPv6 client). If you want to restrict to specific client IPs, rerun Option 3 and provide comma-separated CIDRs. PostgreSQL will still require valid scram-sha-256 password auth."
+    fi
+  fi
+  local PG_HBA_DBS=","
+  if [ "$ALLOW_PG_DBS" = "ALL" ]; then PG_HBA_DBS="${DB_NAME},postgres,all"; else PG_HBA_DBS="${DB_NAME}"; fi
+  _ok "pg_hba allow CIDRs: ${PG_ALLOW_IPS}"
+  _ok "pg_hba allow DB list: ${PG_HBA_DBS}  (user=$DB_USER, auth=scram-sha-256, SSL+plain allowed)"
 
   _section "Installing PostgreSQL packages via $PM"
   eval "$PKG_UPDATE" >/dev/null 2>&1 || true
@@ -571,30 +601,144 @@ install_db() {
   _ok "Granted ALL on ${DB_NAME} to ${DB_USER}; owner set (via -f $SQL_DB_GRANT)"
   printf "\033[1;93m[DB-STEP 3/6 done] All DB create SQL scripts located in /tmp/rasyatone_*.sql (cat them after run if ever suspicious)\033[0m\n"
 
-  _section "Configuring listen_addresses + pg_hba.conf"
-  local pg_conf pg_hba
+  _section "Configuring listen_addresses + pg_hba.conf + SSL"
+  local pg_conf pg_hba pg_data="" cert_found=0 ssl_on=0
   pg_conf=$(sudo -u postgres psql -tAc "SHOW config_file" 2>/dev/null | tr -d '[:space:]' || true)
   pg_hba=$(sudo -u postgres psql -tAc "SHOW hba_file"    2>/dev/null | tr -d '[:space:]' || true)
+  pg_data=$(sudo -u postgres psql -tAc "SHOW data_directory" 2>/dev/null | tr -d '[:space:]' || true)
+
   if [ -n "$pg_conf" ]; then
     sudo sed -i -E "s|^#?[[:space:]]*listen_addresses[[:space:]]*=.*|listen_addresses = '${LISTEN_ADDRESSES}'|" "$pg_conf"
     sudo sed -i -E "s|^#?[[:space:]]*port[[:space:]]*=.*|port = ${DB_PORT}|" "$pg_conf"
     _ok "Set listen_addresses='${LISTEN_ADDRESSES}', port=${DB_PORT} in ${pg_conf}"
-  else _warn "Could not locate postgresql.conf"; fi
-  if [ -n "$pg_hba" ]; then
-    if ! grep -Eq "^host[[:space:]]+${DB_NAME}[[:space:]]+${DB_USER}[[:space:]]+" "$pg_hba" 2>/dev/null; then
-      printf 'host    %s    %s    samenet                 scram-sha-256\n' "$DB_NAME" "$DB_USER" | sudo tee -a "$pg_hba" >/dev/null
-      printf 'host    %s    %s    127.0.0.1/32            scram-sha-256\n' "$DB_NAME" "$DB_USER" | sudo tee -a "$pg_hba" >/dev/null
-      printf 'host    %s    %s    ::1/128                 scram-sha-256\n' "$DB_NAME" "$DB_USER" | sudo tee -a "$pg_hba" >/dev/null
-      _ok "Appended scram-sha-256 host rules for ${DB_USER}/${DB_NAME} to ${pg_hba}"
+
+    # SSL: enable if the default snakeoil certs exist (Debian/Ubuntu generate them automatically
+    # via ssl-cert package; or user's data dir already has server.crt+server.key from initdb).
+    local ssl_crt="" ssl_key=""
+    if [ -n "$pg_data" ] && [ -f "${pg_data}/server.crt" ] && [ -f "${pg_data}/server.key" ]; then
+      ssl_crt="${pg_data}/server.crt"; ssl_key="${pg_data}/server.key"
+    elif [ -f "/etc/ssl/certs/ssl-cert-snakeoil.pem" ] && [ -f "/etc/ssl/private/ssl-cert-snakeoil.key" ]; then
+      ssl_crt="/etc/ssl/certs/ssl-cert-snakeoil.pem"
+      ssl_key="/etc/ssl/private/ssl-cert-snakeoil.key"
+      # Ensure postgres user can read the snakeoil key (ssl-cert group on Debian)
+      sudo chmod 640 "$ssl_key" 2>/dev/null || true
+      sudo chgrp postgres "$ssl_key" 2>/dev/null || true
+      sudo usermod -aG ssl-cert postgres 2>/dev/null || true
     fi
+    if [ -n "$ssl_crt" ] && [ -n "$ssl_key" ]; then
+      sudo sed -i -E "s|^#?[[:space:]]*ssl[[:space:]]*=.*|ssl = on|" "$pg_conf"
+      sudo sed -i -E "s|^#?[[:space:]]*ssl_cert_file[[:space:]]*=.*|ssl_cert_file = '${ssl_crt}'|" "$pg_conf"
+      sudo sed -i -E "s|^#?[[:space:]]*ssl_key_file[[:space:]]*=.*|ssl_key_file = '${ssl_key}'|" "$pg_conf"
+      # password_encryption → scram-sha-256 so the user's CREATE ROLE password hash method aligns with pg_hba
+      sudo sed -i -E "s|^#?[[:space:]]*password_encryption[[:space:]]*=.*|password_encryption = scram-sha-256|" "$pg_conf"
+      _ok "SSL enabled in postgresql.conf: ssl=on cert=${ssl_crt} key=${ssl_key}; password_encryption=scram-sha-256"
+      ssl_on=1
+    else
+      _warn "No server SSL certs found (expected either \$PGDATA/server.crt + server.key from initdb, or Debian ssl-cert snakeoil). Clients that prefer SSL (many GUI clients) will still fall back to plain TCP if pg_hba rules allow it."
+      ssl_on=0
+    fi
+  else _warn "Could not locate postgresql.conf"; fi
+
+  # pg_hba rules: split user-provided CIDRs by comma; for each CIDR, for each DB in PG_HBA_DBS list,
+  # write TWO rules: hostssl + host (so SSL clients match hostssl, non-SSL clients match host).
+  # Auth = scram-sha-256 for every rule.
+  if [ -n "$pg_hba" ]; then
+    # Remove any OLD rasyatone-generated rules from prior runs (so re-running Option 3 is idempotent)
+    local marker="## RASyatone installer rules"
+    if grep -Fq "$marker" "$pg_hba" 2>/dev/null; then
+      sudo sed -i "/^${marker}/,/^## END RASyatone/d" "$pg_hba" 2>/dev/null || true
+    fi
+
+    local IFS_save="$IFS" cidr db_list db
+    printf '%s\n' "$marker  (user=$DB_USER CIDRs=$PG_ALLOW_IPS DBs=$PG_HBA_DBS  auth=scram-sha-256 ssl_on=${ssl_on})" | sudo tee -a "$pg_hba" >/dev/null
+    # Split DB list (comma-separated: e.g. rasyatone_db,postgres,all  →  each one gets rules per CIDR)
+    db_list=""
+    IFS=',' read -ra DBARR <<<"$PG_HBA_DBS"
+    for db in "${DBARR[@]}"; do
+      db=$(printf "%s" "$db" | tr -d '[:space:]')
+      [ -z "$db" ] && continue
+      db_list="${db_list:+${db_list},}${db}"
+      # Write local (unix socket) rule first for convenience (CIDR irrelevant for local socket)
+      printf 'local   %-24s %-24s                         scram-sha-256\n' "$db" "$DB_USER" | sudo tee -a "$pg_hba" >/dev/null
+    done
+    # Loop user CIDRs: for each CIDR + for each DB → hostssl rule, then host rule (scram-sha-256)
+    IFS=',' read -ra CIDRARR <<<"$PG_ALLOW_IPS"
+    for cidr in "${CIDRARR[@]}"; do
+      cidr=$(printf "%s" "$cidr" | tr -d '[:space:]')
+      [ -z "$cidr" ] && continue
+      # Skip samenet / samehost / local keywords in the CIDR loop for the hostssl/host dual rules:
+      #   samenet → PostgreSQL auto-keyword; write plain 'host' rule (no hostssl needed, same as host)
+      case "$cidr" in
+        samenet|samehost)
+          for db in "${DBARR[@]}"; do
+            db=$(printf "%s" "$db" | tr -d '[:space:]')
+            [ -z "$db" ] && continue
+            printf 'host    %-24s %-24s %-24s scram-sha-256\n' "$db" "$DB_USER" "$cidr" | sudo tee -a "$pg_hba" >/dev/null
+          done
+          continue
+          ;;
+      esac
+      for db in "${DBARR[@]}"; do
+        db=$(printf "%s" "$db" | tr -d '[:space:]')
+        [ -z "$db" ] && continue
+        # SSL rule first: clients that prefer SSL will match this one.
+        printf 'hostssl %-24s %-24s %-24s scram-sha-256\n' "$db" "$DB_USER" "$cidr" | sudo tee -a "$pg_hba" >/dev/null
+        # Plain host rule as fallback: for clients that don't do SSL, or for SSL off cases.
+        printf 'host    %-24s %-24s %-24s scram-sha-256\n' "$db" "$DB_USER" "$cidr" | sudo tee -a "$pg_hba" >/dev/null
+      done
+    done
+    IFS="$IFS_save"
+    printf '%s\n' "## END RASyatone" | sudo tee -a "$pg_hba" >/dev/null
+    _ok "pg_hba.conf updated (marker=RASyatone, DB list=${db_list}, CIDRs=${PG_ALLOW_IPS}, auth=scram-sha-256, ssl=${ssl_on})"
+    printf "  %s last 30 lines:\n" "$pg_hba"; sudo tail -n 30 "$pg_hba" 2>/dev/null | sed 's/^/    | /' || true
   else _warn "Could not locate pg_hba.conf"; fi
   service_control restart postgresql
 
   _section "Verify connection with new user"
   local row
-  row=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
-  if [ -n "$row" ]; then _ok "psql connect verify OK: $row"
-  else _die "Could not connect as $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME after install — review pg_hba / listen_addresses above"; fi
+  # 1) Localhost / local host verification (always, to ensure pg_hba + password auth works)
+  row=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "127.0.0.1" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
+  if [ -n "$row" ]; then _ok "psql connect verify (127.0.0.1, DB=$DB_NAME): OK — $row"
+  else _warn "Local 127.0.0.1 connect to $DB_NAME failed. Retrying with DB=postgres ALLOW_PG_DBS check…"
+       if [ "$ALLOW_PG_DBS" = "ALL" ]; then
+         row2=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "127.0.0.1" -p "$DB_PORT" -U "$DB_USER" -d postgres -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
+         if [ -n "$row2" ]; then _ok "psql connect verify (127.0.0.1, DB=postgres): OK — $row2"
+         else _die "Could not connect locally as $DB_USER to either DB=$DB_NAME or DB=postgres — review pg_hba rules printed above"; fi
+       else _die "Could not connect as $DB_USER@127.0.0.1:$DB_PORT/$DB_NAME after install — review pg_hba rules printed above. If you need DB=postgres access, rerun Option 3 and answer ALLOW_PG_DBS=ALL"; fi
+  fi
+  # 2) Optional public-host reachability test — if listen_addresses=* or contains a non-local IP, try to self-connect via hostname/primary IP if discoverable
+  if [ "$LISTEN_ADDRESSES" != "localhost" ] && [ "$LISTEN_ADDRESSES" != "127.0.0.1" ] && [ "$LISTEN_ADDRESSES" != "::1" ]; then
+    local public_ips="" pubip=""
+    if command -v hostname >/dev/null 2>&1; then
+      public_ips=$(hostname -I 2>/dev/null || true)
+    fi
+    if [ -z "${public_ips:-}" ]; then
+      public_ips=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | paste -sd' ' - || true)
+    fi
+    if [ -z "${public_ips:-}" ] && command -v dig >/dev/null 2>&1; then
+      pubip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | awk 'NR==1{print;exit}' || true)
+      public_ips="$pubip"
+    fi
+    for oneip in $public_ips; do
+      row=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$oneip" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
+      if [ -n "$row" ]; then
+        _ok "psql connect verify (public IP $oneip, DB=$DB_NAME): OK — $row  (if remote client still fails: double-check firewall ufw/firewalld/iptables rule for $DB_PORT/tcp + CIDR in pg_hba allows remote client IP)"
+      else
+        _warn "psql connect via self-host IP $oneip failed to reach DB=$DB_NAME — possible causes: firewall not opened ($DB_PORT/tcp rule pending), listen_addresses=$LISTEN_ADDRESSES still needs restart, or pg_hba CIDR set (current: $PG_ALLOW_IPS) excludes $oneip."
+      fi
+    done
+  fi
+  # 3) User action checklist for remote clients (prevent common pg_hba confusion)
+  printf "\n\033[1;33mRemote client troubleshooting checklist (if login still prompts for password / pg_hba reject):\033[0m\n"
+  printf "   (a) Connect to database='%s', NOT database='postgres'  (you selected ALLOW_PG_DBS=%s)\n" "$DB_NAME" "$ALLOW_PG_DBS"
+  printf "   (b) Remote client IP must appear in PG_ALLOW_IPS = %s  (rerun Option 3 to add it if missing)\n" "$PG_ALLOW_IPS"
+  printf "   (c) User/password must be exactly: user='%s' password='<the value you typed>'\n" "$DB_USER"
+  if [ "$ssl_on" -eq 1 ]; then
+    printf "   (d) Server SSL is ON → client can connect with sslmode=require/prefer for TLS (pg_hba has both hostssl + host rules)\n"
+  else
+    printf "   (d) Server SSL is OFF → pg_hba 'host' rule matches plain TCP; if your client insists on SSL rerun Option 3 or install ssl-cert package before running it.\n"
+  fi
+  printf "\n"
 
   # ================ Firewall enable + PostgreSQL rule ================
   _section "Enable system firewall (Option 3 firewall step)"
