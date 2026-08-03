@@ -16,14 +16,34 @@
 #   bash install.sh --precheck-app    # run option 2, exit with precheck rc
 #   bash install.sh --install-db      # run option 3 interactive prompts then exit
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
+#
+# --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
+SCRIPT_VERSION_BUILD="2026-08-03T1900-nodox-psqlscriptfiles"
+EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
+
+# --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
+printf "\n\033[1;97m=======================================================\033[0m\n"
+printf "\033[1;97m RaSYaTone Installer — build stamp: %s\033[0m\n" "$SCRIPT_VERSION_BUILD"
+printf "\033[1;97m Expected marker:          %s\033[0m\n"           "$EXPECTED_VERSION_MARKER"
+if command -v sha256sum >/dev/null 2>&1; then
+  _s=$(sha256sum "$0" 2>/dev/null | awk '{print $1}')
+  [ -n "${_s:-}" ] && printf "\033[1;37m SHA256: %s\033[0m\n" "$_s"
+elif command -v shasum >/dev/null 2>&1; then
+  _s=$(shasum -a 256 "$0" 2>/dev/null | awk '{print $1}')
+  [ -n "${_s:-}" ] && printf "\033[1;37m SHA256: %s\033[0m\n" "$_s"
+fi
+printf "\033[1;97m=======================================================\033[0m\n"
+printf "If build stamp above is NOT exactly:  %s\n"         "$EXPECTED_VERSION_MARKER"
+printf "=> your server copy is OUTDATED. Re-copy install.sh from local Windows machine NOW.\n\n"
+
 set -euo pipefail
 umask 022
 
 # --- global defaults --------------------------------------------------------
 ENV_DIR="/etc/rasyatone/static"
 ENV_FILE="${ENV_DIR}/rasyatone.env"
-DEF_DB_NAME="rasyatone"
-DEF_DB_USER="rasyatone"
+DEF_DB_NAME="rasyatone_db"
+DEF_DB_USER="rasyatone_db_user"
 DEF_DB_HOST="localhost"
 DEF_DB_PORT="5432"
 DEF_LISTEN_ADDRESSES="*"
@@ -329,23 +349,83 @@ install_db() {
   service_control start postgresql
 
   _section "Creating database + user"
-  local esc_pw
+  local esc_pw db_locale="" db_create_flags="" db_exists="" role_exists=""
   esc_pw=$(printf "%s" "$DB_PASSWORD" | sed -e "s/'/''/g")
-  sudo -u postgres psql -v ON_ERROR_STOP=1 <<EOF
-DO \$\$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
-    CREATE ROLE ${DB_USER} LOGIN PASSWORD '${esc_pw}';
-  ELSE
-    ALTER ROLE ${DB_USER} WITH PASSWORD '${esc_pw}';
-  END IF;
-END \$\$;
-DO \$\$ BEGIN
-  CREATE DATABASE ${DB_NAME} OWNER ${DB_USER} ENCODING 'UTF8' LC_COLLATE = 'en_US.UTF-8' LC_CTYPE = 'en_US.UTF-8' TEMPLATE template0;
-EXCEPTION WHEN duplicate_database THEN NULL; END \$\$;
-GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
-ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};
-EOF
-  _ok "Created user '${DB_USER}', database '${DB_NAME}', granted ALL"
+
+  # Bug fix 2: auto-detect best available UTF-8 locale for LC_COLLATE / LC_CTYPE.
+  # en_US.UTF-8 is not installed on minimal/cloud/Raspberry images (only C.UTF-8/C).
+  for cand in en_US.UTF-8 en_US.utf8 C.UTF-8 C.utf8; do
+    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_collation WHERE collname ILIKE '${cand}' LIMIT 1" postgres 2>/dev/null | grep -q "^1$"; then
+      db_locale="$cand"
+      break
+    fi
+  done
+  if [ -n "$db_locale" ]; then
+    db_create_flags="ENCODING 'UTF8' LC_COLLATE = '${db_locale}' LC_CTYPE = '${db_locale}' TEMPLATE template0"
+    _ok "Auto-detected DB locale: ${db_locale}"
+  else
+    db_create_flags="ENCODING 'UTF8' TEMPLATE template0"
+    _warn "No en_US.UTF-8 / C.UTF-8 collation found in pg_collation; using ENCODING UTF8 only (template0 default)."
+  fi
+
+  local esc_user esc_db
+  esc_user=$(printf "%s" "$DB_USER" | sed -e "s/'/''/g")
+  esc_db=$(printf "%s" "$DB_NAME" | sed -e "s/'/''/g")
+
+  # ===== GUARD: print SCRIPT_VERSION_BUILD again immediately before DB SQL runs =====
+  printf "\n\033[1;93m[DB-STEP 0/6] version guard: SCRIPT_VERSION_BUILD=%s\033[0m\n" "$SCRIPT_VERSION_BUILD"
+  [ "$SCRIPT_VERSION_BUILD" = "$EXPECTED_VERSION_MARKER" ] || _die "Version guard mismatch (stale server copy? exit)"
+
+  # Use /tmp PSQL SCRIPT FILES + psql -f (no heredocs, no DO blocks, 100% visible SQL artifacts)
+  # User can cat these files after run to verify statements are standalone.
+  SQL_ROLE_CREATE="/tmp/rasyatone_role_create.sql"
+  SQL_ROLE_ALTER="/tmp/rasyatone_role_alter.sql"
+  SQL_DB_CREATE="/tmp/rasyatone_db_create.sql"
+  SQL_DB_GRANT="/tmp/rasyatone_db_grant.sql"
+
+  # (A) Idempotent role create/alter — pure shell existence + standalone SQL script files.
+  role_exists=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${esc_user}'" postgres 2>/dev/null | tr -d '[:space:]' || true)
+  if [ "$role_exists" != "1" ]; then
+    printf "\033[1;93m[DB-STEP 1/6] role does NOT exist -> writing %s (CREATE ROLE standalone, NO DO block)\033[0m\n" "$SQL_ROLE_CREATE"
+    printf 'CREATE ROLE %s LOGIN PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$esc_pw" > "$SQL_ROLE_CREATE"
+    printf "  contents of %s:\n" "$SQL_ROLE_CREATE"; sed 's/^/    | /' "$SQL_ROLE_CREATE"
+    sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_CREATE"
+    _ok "Role ${DB_USER} created (via -f $SQL_ROLE_CREATE)"
+  else
+    printf "\033[1;93m[DB-STEP 1/6] role exists -> writing %s (ALTER ROLE standalone, NO DO block)\033[0m\n" "$SQL_ROLE_ALTER"
+    printf 'ALTER ROLE %s WITH PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$esc_pw" > "$SQL_ROLE_ALTER"
+    printf "  contents of %s:\n" "$SQL_ROLE_ALTER"; sed 's/^/    | /' "$SQL_ROLE_ALTER"
+    sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_ALTER"
+    _ok "Role ${DB_USER} existed -> password updated (via -f $SQL_ROLE_ALTER)"
+  fi
+
+  # (B) CREATE DATABASE — standalone -c call OR standalone SQL script file. No heredocs. No DO.
+  db_exists=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${esc_db}'" postgres 2>/dev/null | tr -d '[:space:]' || true)
+  if [ "$db_exists" != "1" ]; then
+    printf "\033[1;93m[DB-STEP 2/6] DB does NOT exist -> writing %s (CREATE DATABASE STANDALONE outside any block)\033[0m\n" "$SQL_DB_CREATE"
+    printf 'CREATE DATABASE %s OWNER %s %s;\n' "$DB_NAME" "$DB_USER" "$db_create_flags" > "$SQL_DB_CREATE"
+    printf "  contents of %s:\n" "$SQL_DB_CREATE"; sed 's/^/    | /' "$SQL_DB_CREATE"
+    # Fail-fast safety: refuse to run if SQL file contents contain "DO " or "BEGIN" anywhere
+    if grep -Eiq 'DO[[:space:]]*\$|BEGIN' "$SQL_DB_CREATE" 2>/dev/null; then
+      _die "Refusing to run $SQL_DB_CREATE — grep found DO/BEGIN inside. This MUST never happen for a CREATE DATABASE standalone statement."
+    fi
+    sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_DB_CREATE"
+    _ok "Database ${DB_NAME} created (owner=${DB_USER}, locale=${db_locale:-template0 default}) via -f $SQL_DB_CREATE"
+  else
+    printf "\033[1;93m[DB-STEP 2/6] DB exists -> skip CREATE DATABASE\033[0m\n"
+    _ok "Database ${DB_NAME} already exists — skipping CREATE DATABASE, re-granting only"
+  fi
+
+  # (C) GRANT + ALTER OWNER -> standalone SQL script file
+  printf "\033[1;93m[DB-STEP 3/6] writing %s (GRANT + OWNER standalone)\033[0m\n" "$SQL_DB_GRANT"
+  {
+    printf 'GRANT ALL PRIVILEGES ON DATABASE %s TO %s;\n' "$DB_NAME" "$DB_USER"
+    printf 'ALTER DATABASE %s OWNER TO %s;\n' "$DB_NAME" "$DB_USER"
+  } > "$SQL_DB_GRANT"
+  printf "  contents of %s:\n" "$SQL_DB_GRANT"; sed 's/^/    | /' "$SQL_DB_GRANT"
+  sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_DB_GRANT"
+  _ok "Granted ALL on ${DB_NAME} to ${DB_USER}; owner set (via -f $SQL_DB_GRANT)"
+  printf "\033[1;93m[DB-STEP 3/6 done] All DB create SQL scripts located in /tmp/rasyatone_*.sql (cat them after run if ever suspicious)\033[0m\n"
 
   _section "Configuring listen_addresses + pg_hba.conf"
   local pg_conf pg_hba
