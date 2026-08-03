@@ -476,6 +476,20 @@ install_db() {
     ALL) ALLOW_PG_DBS="ALL" ;;
     *)   ALLOW_PG_DBS="SELF" ;;
   esac
+  local ROLE_CREATEDB="YES"  # DEFAULT = YES per user request: the DB user MUST be able to CREATE DATABASE after install.
+  ROLE_CREATEDB_RAW=$(prompt_def "Grant '$DB_USER' permission to CREATE DATABASE (CREATEDB attribute)? [RECOMMENDED YES — allows application / user / migration scripts to run 'CREATE DATABASE ...' without sudo -u postgres. NO = only postgres/superuser can create DBs]" "YES")
+  ROLE_CREATEDB_RAW=$(printf "%s" "$ROLE_CREATEDB_RAW" | tr '[:lower:]' '[:upper:]')
+  case "$ROLE_CREATEDB_RAW" in
+    NO|N) ROLE_CREATEDB="NO" ;;
+    *)    ROLE_CREATEDB="YES" ;;
+  esac
+  local ROLE_ATTRS=""
+  if [ "$ROLE_CREATEDB" = "YES" ]; then
+    ROLE_ATTRS="CREATEDB"
+    _ok "Role attributes: ${ROLE_ATTRS}  (user '$DB_USER' will be able to run CREATE DATABASE after install)"
+  else
+    _warn "Role attributes: NO special attributes (user '$DB_USER' CANNOT run CREATE DATABASE — only superuser/postgres can create DBs). If this is wrong, rerun Option 3 and answer YES."
+  fi
   # If user chose SELF and listen_addresses != localhost, GIANT WARNING. This is the #1 cause of 'no pg_hba.conf entry for database postgres' FATALs.
   if [ "$ALLOW_PG_DBS" = "SELF" ] && [ "$LISTEN_ADDRESSES" != "localhost" ] && [ "$LISTEN_ADDRESSES" != "127.0.0.1" ] && [ "$LISTEN_ADDRESSES" != "::1" ]; then
     printf "\n\033[1;31m====================================================================\n"
@@ -574,17 +588,33 @@ install_db() {
   # (A) Idempotent role create/alter — pure shell existence + standalone SQL script files.
   role_exists=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${esc_user}'" postgres 2>/dev/null | tr -d '[:space:]' || true)
   if [ "$role_exists" != "1" ]; then
-    printf "\033[1;93m[DB-STEP 1/6] role does NOT exist -> writing %s (CREATE ROLE standalone, NO DO block)\033[0m\n" "$SQL_ROLE_CREATE"
-    printf 'CREATE ROLE %s LOGIN PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$esc_pw" > "$SQL_ROLE_CREATE"
+    printf "\033[1;93m[DB-STEP 1/6] role does NOT exist -> writing %s (CREATE ROLE standalone, attrs=%s NO DO block)\033[0m\n" "$SQL_ROLE_CREATE" "$ROLE_ATTRS"
+    printf 'CREATE ROLE %s %s LOGIN PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$ROLE_ATTRS" "$esc_pw" > "$SQL_ROLE_CREATE"
     printf "  contents of %s:\n" "$SQL_ROLE_CREATE"; sed 's/^/    | /' "$SQL_ROLE_CREATE"
     sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_CREATE"
-    _ok "Role ${DB_USER} created (via -f $SQL_ROLE_CREATE)"
+    _ok "Role ${DB_USER} created (attrs=${ROLE_ATTRS:-NONE}, via -f $SQL_ROLE_CREATE)"
   else
-    printf "\033[1;93m[DB-STEP 1/6] role exists -> writing %s (ALTER ROLE standalone, NO DO block)\033[0m\n" "$SQL_ROLE_ALTER"
-    printf 'ALTER ROLE %s WITH PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$esc_pw" > "$SQL_ROLE_ALTER"
+    printf "\033[1;93m[DB-STEP 1/6] role exists -> writing %s (ALTER ROLE standalone, attrs=%s NO DO block)\033[0m\n" "$SQL_ROLE_ALTER" "$ROLE_ATTRS"
+    printf 'ALTER ROLE %s WITH %s PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$ROLE_ATTRS" "$esc_pw" > "$SQL_ROLE_ALTER"
     printf "  contents of %s:\n" "$SQL_ROLE_ALTER"; sed 's/^/    | /' "$SQL_ROLE_ALTER"
     sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_ALTER"
-    _ok "Role ${DB_USER} existed -> password updated (via -f $SQL_ROLE_ALTER)"
+    _ok "Role ${DB_USER} existed -> password updated + attrs=${ROLE_ATTRS:-NONE} applied (via -f $SQL_ROLE_ALTER)"
+  fi
+  # (A2) POST-VERIFY role attributes. Ensure CREATEDB is actually set (if user requested YES) before continuing.
+  local cd_check=""
+  cd_check=$(sudo -u postgres psql -tAc "SELECT rolcreatedb FROM pg_roles WHERE rolname='${esc_user}'" postgres 2>/dev/null | tr -d '[:space:]' || true)
+  if [ "$ROLE_CREATEDB" = "YES" ]; then
+    if [ "$cd_check" = "t" ]; then
+      _ok "Role attribute verify -> rolcreatedb = TRUE (user '$DB_USER' CAN run CREATE DATABASE — verified OK)"
+    else
+      _die "VERIFY FAILED: ROLE CREATEDB NOT SET. Requested ROLE_CREATEDB=YES but pg_roles says rolcreatedb=$cd_check. Build=$SCRIPT_VERSION_BUILD"
+    fi
+  else
+    if [ "$cd_check" = "t" ]; then
+      _warn "Role attribute verify: rolcreatedb = TRUE even though you requested NO. Attribute leak from prior role state; leaving as-is (has create DB permission)"
+    else
+      _ok "Role attribute verify -> rolcreatedb = FALSE (user '$DB_USER' cannot CREATE DATABASE — matches NO request)"
+    fi
   fi
 
   # (B) CREATE DATABASE — standalone -c call OR standalone SQL script file. No heredocs. No DO.
