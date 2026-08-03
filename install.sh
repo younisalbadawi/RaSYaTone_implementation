@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-03T1900-nodox-psqlscriptfiles"
+SCRIPT_VERSION_BUILD="2026-08-03T2015-fix-default-ALL-pg-hba"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -469,13 +469,29 @@ install_db() {
   DB_PORT=$(prompt_def "Database port"            "${DB_PORT:-$DEF_DB_PORT}")
   LISTEN_ADDRESSES=$(prompt_def "PostgreSQL listen_addresses ('*' = all, 'localhost' = local only)" \
                               "${LISTEN_ADDRESSES:-$DEF_LISTEN_ADDRESSES}")
-  local ALLOW_PG_DBS="SELF"  # SELF = only $DB_NAME; ALL = also allow postgres/maintenance DB; prompt below
-  ALLOW_PG_DBS_RAW=$(prompt_def "Which databases should '$DB_USER' connect to remotely? [SELF = only '$DB_NAME', ALL = '$DB_NAME' + postgres/all DBs]" "SELF")
+  local ALLOW_PG_DBS="ALL"  # DEFAULT = ALL (strongly recommended). Only SELF if user explicitly chooses it.
+  ALLOW_PG_DBS_RAW=$(prompt_def "Which databases should '$DB_USER' connect to? [RECOMMENDED: ALL = '$DB_NAME' + postgres + all DBs. SELF = ONLY '$DB_NAME' — NOTE: pgAdmin / DBeaver default test connection uses database='postgres' and WILL FAIL if you pick SELF]" "ALL")
   ALLOW_PG_DBS_RAW=$(printf "%s" "$ALLOW_PG_DBS_RAW" | tr '[:lower:]' '[:upper:]')
   case "$ALLOW_PG_DBS_RAW" in
     ALL) ALLOW_PG_DBS="ALL" ;;
     *)   ALLOW_PG_DBS="SELF" ;;
   esac
+  # If user chose SELF and listen_addresses != localhost, GIANT WARNING. This is the #1 cause of 'no pg_hba.conf entry for database postgres' FATALs.
+  if [ "$ALLOW_PG_DBS" = "SELF" ] && [ "$LISTEN_ADDRESSES" != "localhost" ] && [ "$LISTEN_ADDRESSES" != "127.0.0.1" ] && [ "$LISTEN_ADDRESSES" != "::1" ]; then
+    printf "\n\033[1;31m====================================================================\n"
+    printf "  WARNING: You chose ALLOW_PG_DBS=SELF (only DB=$DB_NAME allowed)\n"
+    printf "  BUT listen_addresses is PUBLIC ($LISTEN_ADDRESSES).\n"
+    printf "\n"
+    printf "  -> GUI PostgreSQL clients (pgAdmin, DBeaver, psql default)\n"
+    printf "     try to connect with database='postgres' as a test.\n"
+    printf "     With SELF, PostgreSQL will REJECT them with:\n"
+    printf "       FATAL: no pg_hba.conf entry for host … database \"postgres\"\n"
+    printf "\n"
+    printf "  RECOMMENDED FIX: rerun Option 3 and answer ALLOW_PG_DBS = ALL.\n"
+    printf "  Continuing with SELF anyway in 10 seconds (Ctrl-C to abort)...\n"
+    printf "====================================================================\033[0m\n"
+    sleep 10
+  fi
   local PG_ALLOW_IPS=""
   PG_ALLOW_IPS=$(prompt_def \
     "Remote client IPs allowed (comma-separated CIDRs). Examples:
@@ -483,22 +499,20 @@ install_db() {
      Two clients: 5.32.252.64/32,84.242.41.112/32
      Any IPv4 client (open to internet): 0.0.0.0/0
      Any IPv4+IPv6: 0.0.0.0/0,::/0
-     Local only (default if listen=localhost): 127.0.0.1/32,::1/128
-     (Press Enter for default: samenet + localhost + 0.0.0.0/0 only when listen_addresses is not localhost)" "")
+     (Press Enter: listen=localhost → local only; else → samenet + 127 + ::1 + 0.0.0.0/0 + ::/0  [internet-wide open; password required])" "")
   if [ -z "${PG_ALLOW_IPS:-}" ]; then
     if [ "$LISTEN_ADDRESSES" = "localhost" ] || [ "$LISTEN_ADDRESSES" = "127.0.0.1" ] || [ "$LISTEN_ADDRESSES" = "::1" ]; then
       PG_ALLOW_IPS="127.0.0.1/32,::1/128,samenet"
     else
-      # User selected * / public listen → default to a moderately open set that works,
-      # with an explicit warning that 0.0.0.0/0 is internet-wide.
       PG_ALLOW_IPS="samenet,127.0.0.1/32,::1/128,0.0.0.0/0,::/0"
-      _warn "Default remote allow set includes 0.0.0.0/0 + ::/0 (any IPv4/IPv6 client). If you want to restrict to specific client IPs, rerun Option 3 and provide comma-separated CIDRs. PostgreSQL will still require valid scram-sha-256 password auth."
+      _warn "Default allow set = any internet client (0.0.0.0/0 + ::/0). Scram-sha-256 password auth required; if you want to restrict, rerun Option 3 and paste comma CIDRs like: 84.242.41.112/32,5.32.252.64/32"
     fi
   fi
-  local PG_HBA_DBS=","
+  local PG_HBA_DBS=""
   if [ "$ALLOW_PG_DBS" = "ALL" ]; then PG_HBA_DBS="${DB_NAME},postgres,all"; else PG_HBA_DBS="${DB_NAME}"; fi
   _ok "pg_hba allow CIDRs: ${PG_ALLOW_IPS}"
   _ok "pg_hba allow DB list: ${PG_HBA_DBS}  (user=$DB_USER, auth=scram-sha-256, SSL+plain allowed)"
+  _ok "ALLOW_PG_DBS resolved = ${ALLOW_PG_DBS}  [DEFAULT: ALL; your GUI clients connecting with database='postgres' will work]"
 
   _section "Installing PostgreSQL packages via $PM"
   eval "$PKG_UPDATE" >/dev/null 2>&1 || true
@@ -643,14 +657,22 @@ install_db() {
   # write TWO rules: hostssl + host (so SSL clients match hostssl, non-SSL clients match host).
   # Auth = scram-sha-256 for every rule.
   if [ -n "$pg_hba" ]; then
-    # Remove any OLD rasyatone-generated rules from prior runs (so re-running Option 3 is idempotent)
     local marker="## RASyatone installer rules"
+    # (A) DELETE LEGACY OLD RULES from pre-marker installer versions (lines containing our DB_USER + scram-sha-256
+    #     that are NOT inside the current marker block, plus the old 3-rule pattern without a marker header).
+    #     This is CRITICAL: if the user previously ran an OLD installer build (no markers), those rules
+    #     sit above the new marker block and never get cleaned up by the marker range delete — re-running
+    #     the script would silently add duplicates (worse: old rules only covered DB_NAME, not postgres).
+    sudo sed -i -E "/^[[:space:]]*#.*R[Aa][Ss][Yy].*marker|^${marker}/,/^## END RASyatone/! {
+                      /^[[:space:]]*(local|host|hostssl|hostnossl)[[:space:]]+.*[[:space:]]${DB_USER}[[:space:]]+.*scram-sha-256[[:space:]]*$/d
+                    }" "$pg_hba" 2>/dev/null || true
+    # (B) Delete the current marker block (if exists) — idempotent on reruns.
     if grep -Fq "$marker" "$pg_hba" 2>/dev/null; then
       sudo sed -i "/^${marker}/,/^## END RASyatone/d" "$pg_hba" 2>/dev/null || true
     fi
 
     local IFS_save="$IFS" cidr db_list db
-    printf '%s\n' "$marker  (user=$DB_USER CIDRs=$PG_ALLOW_IPS DBs=$PG_HBA_DBS  auth=scram-sha-256 ssl_on=${ssl_on})" | sudo tee -a "$pg_hba" >/dev/null
+    printf '%s\n' "$marker  (build=$SCRIPT_VERSION_BUILD  user=$DB_USER  CIDRs=$PG_ALLOW_IPS  DBs=$PG_HBA_DBS  auth=scram-sha-256  ssl_on=${ssl_on})" | sudo tee -a "$pg_hba" >/dev/null
     # Split DB list (comma-separated: e.g. rasyatone_db,postgres,all  →  each one gets rules per CIDR)
     db_list=""
     IFS=',' read -ra DBARR <<<"$PG_HBA_DBS"
@@ -695,20 +717,32 @@ install_db() {
   service_control restart postgresql
 
   _section "Verify connection with new user"
-  local row
-  # 1) Localhost / local host verification (always, to ensure pg_hba + password auth works)
+  local row row2 row_any=0
+  # 1) Always verify DB_NAME connection (127.0.0.1)
   row=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "127.0.0.1" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
-  if [ -n "$row" ]; then _ok "psql connect verify (127.0.0.1, DB=$DB_NAME): OK — $row"
-  else _warn "Local 127.0.0.1 connect to $DB_NAME failed. Retrying with DB=postgres ALLOW_PG_DBS check…"
-       if [ "$ALLOW_PG_DBS" = "ALL" ]; then
-         row2=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "127.0.0.1" -p "$DB_PORT" -U "$DB_USER" -d postgres -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
-         if [ -n "$row2" ]; then _ok "psql connect verify (127.0.0.1, DB=postgres): OK — $row2"
-         else _die "Could not connect locally as $DB_USER to either DB=$DB_NAME or DB=postgres — review pg_hba rules printed above"; fi
-       else _die "Could not connect as $DB_USER@127.0.0.1:$DB_PORT/$DB_NAME after install — review pg_hba rules printed above. If you need DB=postgres access, rerun Option 3 and answer ALLOW_PG_DBS=ALL"; fi
+  if [ -n "$row" ]; then _ok "psql connect verify (127.0.0.1, DB=$DB_NAME): OK — $row"; row_any=1; fi
+  # 2) If ALLOW_PG_DBS=ALL (the new default), VERIFY DB=postgres CONNECTS TOO. This is the EXACT test
+  #    the user's GUI client (pgAdmin/DBeaver) performs by default. If this fails → die loud because
+  #    the exact FATAL the user reported cannot happen if the script produced correct rules.
+  if [ "$ALLOW_PG_DBS" = "ALL" ]; then
+    row2=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "127.0.0.1" -p "$DB_PORT" -U "$DB_USER" -d postgres -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
+    if [ -n "$row2" ]; then
+      _ok "psql connect verify (127.0.0.1, DB=postgres): OK — $row2   [GUI clients connecting with database='postgres' will work]"
+      row_any=1
+    else
+      _die "VERIFY FAILED — DB=postgres connect as '$DB_USER' rejected (exactly the GUI error you reported). pg_hba rules are wrong or postgres did not restart cleanly. Review pg_hba tail above (the RASyatone marker block); it MUST contain a 'host(ssl)? postgres $DB_USER <yourcidr> scram-sha-256' line. If not, marker delete regex may have failed. Report as bug: build=$SCRIPT_VERSION_BUILD"
+    fi
   fi
-  # 2) Optional public-host reachability test — if listen_addresses=* or contains a non-local IP, try to self-connect via hostname/primary IP if discoverable
+  if [ "$row_any" -eq 0 ]; then
+    if [ "$ALLOW_PG_DBS" = "ALL" ]; then
+      _die "Could not connect locally as $DB_USER to either DB=$DB_NAME or DB=postgres — review pg_hba rules printed above"
+    else
+      _die "Could not connect as $DB_USER@127.0.0.1:$DB_PORT/$DB_NAME after install — review pg_hba rules printed above. If you need DB=postgres access, rerun Option 3 and keep ALLOW_PG_DBS=ALL (the default)"
+    fi
+  fi
+  # 3) Optional public-host reachability test — if listen_addresses is NOT localhost only
   if [ "$LISTEN_ADDRESSES" != "localhost" ] && [ "$LISTEN_ADDRESSES" != "127.0.0.1" ] && [ "$LISTEN_ADDRESSES" != "::1" ]; then
-    local public_ips="" pubip=""
+    local public_ips="" pubip="" oneip row3 any_ok=0 any_fail=0
     if command -v hostname >/dev/null 2>&1; then
       public_ips=$(hostname -I 2>/dev/null || true)
     fi
@@ -720,13 +754,29 @@ install_db() {
       public_ips="$pubip"
     fi
     for oneip in $public_ips; do
+      # Test both DB_NAME and postgres (if ALL) against every discoverable public / global IP
       row=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$oneip" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
       if [ -n "$row" ]; then
-        _ok "psql connect verify (public IP $oneip, DB=$DB_NAME): OK — $row  (if remote client still fails: double-check firewall ufw/firewalld/iptables rule for $DB_PORT/tcp + CIDR in pg_hba allows remote client IP)"
+        _ok "psql connect verify (public IP $oneip, DB=$DB_NAME): OK — $row   (firewall port $DB_PORT/tcp is open; listener=$LISTEN_ADDRESSES correct)"
+        any_ok=$((any_ok + 1))
       else
-        _warn "psql connect via self-host IP $oneip failed to reach DB=$DB_NAME — possible causes: firewall not opened ($DB_PORT/tcp rule pending), listen_addresses=$LISTEN_ADDRESSES still needs restart, or pg_hba CIDR set (current: $PG_ALLOW_IPS) excludes $oneip."
+        _warn "psql connect via self-host IP $oneip DB=$DB_NAME FAILED. Causes: firewall $DB_PORT/tcp not open (run firewall enable step Option 3), listen_addresses wrong, pg_hba CIDR ($PG_ALLOW_IPS) missing $oneip entry."
+        any_fail=$((any_fail + 1))
+      fi
+      if [ "$ALLOW_PG_DBS" = "ALL" ]; then
+        row3=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$oneip" -p "$DB_PORT" -U "$DB_USER" -d postgres -tAc "SELECT current_database(), current_user" 2>/dev/null || true)
+        if [ -n "$row3" ]; then
+          _ok "psql connect verify (public IP $oneip, DB=postgres): OK — $row3   (the EXACT test your GUI client performed — works now!)"
+          any_ok=$((any_ok + 1))
+        else
+          _warn "psql connect via self-host IP $oneip DB=postgres FAILED (this is the GUI test). If local DB=postgres passed but this fails: firewall issue ($DB_PORT/tcp on $oneip), or pg_hba CIDR missing public IP of client network, or ISP NAT $oneip unreachable from server side."
+          any_fail=$((any_fail + 1))
+        fi
       fi
     done
+    if [ "$any_fail" -gt 0 ] && [ "$any_ok" -eq 0 ]; then
+      _warn "ALL public-IP self-connects failed — check firewall $DB_PORT/tcp rule status (Option 3 enables it and prints rules). If firewall OFF enable it with: sudo ufw allow 5432/tcp  or  firewall-cmd --permanent --add-port=5432/tcp ; firewall-cmd --reload"
+    fi
   fi
   # 3) User action checklist for remote clients (prevent common pg_hba confusion)
   printf "\n\033[1;33mRemote client troubleshooting checklist (if login still prompts for password / pg_hba reject):\033[0m\n"
