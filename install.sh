@@ -1080,29 +1080,43 @@ github_auth_private_repo() {
   # This line will NOT allow the script to proceed to a git clone that will definitely die
   # with "Permission denied (publickey)" or "Invalid username or token". We retry forever.
   local PROBE_LOG="/tmp/rasyatone_git_ls_remote_probe.log"
+  local SKIP_PROBE_NEXT="0"
   while :; do
-    printf "\n\033[1;96m[GITHUB AUTH PROBE]\033[0m  Running: git ls-remote --heads <authed URL>  (validates token works for private repo before spending time cloning)\n"
     local prc=0
-    git ls-remote --heads "$GIT_URL" >"$PROBE_LOG" 2>&1 || prc=$?
+    if [ "$SKIP_PROBE_NEXT" = "1" ]; then
+      SKIP_PROBE_NEXT="0"
+      prc=1
+      : >"$PROBE_LOG" 2>/dev/null || true
+      _warn "Skipping redundant probe (user entered empty token on the last retry — showing choice menu directly)."
+    else
+      printf "\n\033[1;96m[GITHUB AUTH PROBE]\033[0m  Running: git ls-remote --heads <authed URL>  (validates token works for private repo before spending time cloning)\n"
+      git ls-remote --heads "$GIT_URL" >"$PROBE_LOG" 2>&1 || prc=$?
+    fi
     if [ "$prc" -eq 0 ] && [ -s "$PROBE_LOG" ]; then
       local hc
-      hc=$(wc -l <"$PROBE_LOG" | tr -d ' ')
-      _ok "Auth probe OK — private repo '%s' is reachable with this token (git ls-remote returned %d branches). Clone will proceed." "$OWNER_REPO" "$hc"
+      hc=$(wc -l <"$PROBE_LOG" 2>/dev/null | tr -d ' ' 2>/dev/null || echo "0")
+      [ -n "${hc:-}" ] || hc="0"
+      _ok "Auth probe OK — private repo '${OWNER_REPO}' is reachable with this token (git ls-remote returned ${hc} branches). Clone will proceed."
       rm -f "$PROBE_LOG"
       return 0
     fi
     # Probe failed. Diagnose + re-prompt.
-    _warn "Auth probe FAILED (rc=$prc) — token cannot read private repo. Common causes (fix BEFORE retrying):"
-    printf "    1) Token pasted with leading/trailing whitespace (copy/paste glitch)? Re-paste cleanly.\n"
-    printf "    2) Wrong token type used? MUST be Fine-Grained (type=beta URL above), NOT classic 'Tokens (classic)'.\n"
-    printf "    3) Repository access NOT set to 'Only select repositories -> %s'?\n" "$OWNER_REPO"
-    printf "    4) Contents permission NOT Read-only?\n"
-    printf "    5) Token already expired (you set 7 day expire and it's day 8)?\n\n"
-    printf "  Last 15 lines of the git probe error:\n"
-    tail -n 15 "$PROBE_LOG" 2>/dev/null | sed 's/^/    | /'
+    if [ "$prc" -ne 0 ] || [ ! -s "$PROBE_LOG" ]; then
+      _warn "Auth probe FAILED (rc=$prc) — token cannot read private repo. Common causes (fix BEFORE retrying):"
+      printf "    1) Token pasted with leading/trailing whitespace (copy/paste glitch)? Re-paste cleanly.\n"
+      printf "    2) Wrong token type used? MUST be Fine-Grained (type=beta URL above), NOT classic 'Tokens (classic)'.\n"
+      printf "    3) Repository access NOT set to 'Only select repositories -> %s'?\n" "$OWNER_REPO"
+      printf "    4) Contents permission NOT Read-only?\n"
+      printf "    5) Token already expired (you set 7 day expire and it's day 8)?\n\n"
+      printf "  Last 15 lines of the git probe error:\n"
+      tail -n 15 "$PROBE_LOG" 2>/dev/null | sed 's/^/    | /' || true
+    fi
     local retry=""
-    retry=$(prompt_def "What to do now? [1] Paste NEW token and try again  /  [C] Continue anyway (risky: clone will likely fail)  /  [A] Abort installer
-  Answer? [1]" "1")
+    printf "\n\033[1mProbe failed — choices:\033[0m\n"
+    printf "  [1] Paste NEW token and try again   (default)\n"
+    printf "  [C] Continue anyway   (RISKY: git clone will almost certainly fail)\n"
+    printf "  [A] Abort installer now\n"
+    retry=$(prompt_def "Your choice? [1]" "1")
     case "$retry" in
       [Cc]|[Cc][Oo][Nn][Tt][Ii][Nn][Uu][Ee])
         _warn "Continuing anyway; we warned you."
@@ -1115,8 +1129,14 @@ github_auth_private_repo() {
         ;;
       *)
         # Default: prompt for a NEW token, rewrite GIT_URL, keep looping.
-        TOKEN=$(prompt_secret "Paste a NEW valid Fine-Grained token (github_pat_/ghs_...). Hidden input.")
-        if [ -z "$TOKEN" ]; then continue; fi
+        local new_token=""
+        new_token=$(prompt_secret "Paste a NEW valid Fine-Grained token (github_pat_/ghs_...). Hidden input.")
+        if [ -z "${new_token:-}" ]; then
+          _warn "Empty token entered — skipping probe and returning to choice menu."
+          SKIP_PROBE_NEXT="1"
+          continue
+        fi
+        TOKEN="$new_token"
         FINAL_GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
         GIT_URL="$FINAL_GIT_URL"
         sudo mkdir -p "$(dirname "$GIT_TOKEN_FILE")"
