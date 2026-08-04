@@ -62,6 +62,18 @@ _warn() { printf "  \033[93m[WARN]\033[0m %s\n" "$*"; }
 _die()  { printf "\n\033[91mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 _section(){ printf "\n\033[1;97m=== %s ===\033[0m\n" "$*"; }
 
+# Canonicalize ANY GitHub HTTPS URL (with or without x-access-token auth) so it has exactly ONE trailing .git,
+# no doubled .git.git, and no trailing slashes. Works as an output safety net on ANY GitHub URL form.
+# sed: strip trailing slashes; then label loop strips ALL trailing .git (optionally with trailing / after each);
+#      then strip trailing slashes again; then append exactly ONE .git at the very end.
+_normalize_github_url() {
+  printf '%s' "${1:-}" | sed -E \
+    -e 's|[/]*$||' \
+    -e ':gitloop' -e 's|(\.git)[/]*$||' -e 't gitloop' \
+    -e 's|[/]*$||' \
+    -e 's|$|.git|'
+}
+
 prompt_def() {
   local text="$1" def="${2:-}" val=""
   if [ -n "$def" ]; then printf "%s [%s]: " "$text" "$def" >&2
@@ -867,31 +879,61 @@ install_db() {
 # Outputs (globals): GIT_URL rewritten to canonical form: https://x-access-token:<FINE_GRAINED_PAT>@github.com/<owner>/<repo>.git
 # Side effects: Writes /etc/rasyatone/static/git_token.env with GITHUB_TOKEN= chmod 600 (preserved across reinstalls).
 github_auth_private_repo() {
-  # Fast skip: already a fully authed x-access-token GitHub HTTPS URL, OR not GitHub at all.
+  # Fast skip: not GitHub at all.
   case "$GIT_URL" in
     *github.com*) ;;
     *) return 0 ;;
   esac
-  case "$GIT_URL" in
-    *x-access-token:*@github.com/*)
-      _ok "GIT_URL already has canonical 'x-access-token:<token>@github.com' auth — skipping auth wizard."
-      return 0
-      ;;
-  esac
 
-  # Extract owner/repo from the URL the user actually pasted — supports HTTPS or SSH URL.
+  # =====================================================================
+  # Step 1: Extract OWNER_REPO from ANY GitHub URL form. Run ALWAYS so
+  #         previously-saved buggy URLs (e.g. .git.git / trailing /) get
+  #         re-normalized on every rerun, not just first-time paste.
+  # =====================================================================
+  # Supported input forms:
+  #   https://github.com/owner/repo
+  #   https://github.com/owner/repo.git
+  #   https://github.com/owner/repo.git/
+  #   https://x-access-token:<token>@github.com/owner/repo
+  #   https://x-access-token:<token>@github.com/owner/repo(.git){1,}/?
+  #   git@github.com:owner/repo(.git)?
   local OWNER_REPO=""
-  if [[ "$GIT_URL" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(\.git)?/?$ ]]; then
+  if [[ "$GIT_URL" =~ @github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) ]]; then
     OWNER_REPO="${BASH_REMATCH[1]}"
-  elif [[ "$GIT_URL" =~ ^git@github\.com:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(\.git)?$ ]]; then
+  elif [[ "$GIT_URL" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) ]]; then
     OWNER_REPO="${BASH_REMATCH[1]}"
   else
-    # Generic fallback: strip https://github.com/ prefix then strip .git/ suffix
-    OWNER_REPO="$(printf '%s' "$GIT_URL" | sed -E 's|^[[:space:]]*(https?://[^/]+/|git@github\.com:)||; s|\.git[[:space:]]*$||; s|/+$||')"
+    OWNER_REPO="$(printf '%s' "$GIT_URL" | sed -E 's|^[[:space:]]*(https?://[^/]+/|git@github\.com:)||')"
   fi
+  # Aggressive sanitize — GUARANTEED to strip 1+ trailing .git + any leading/trailing slashes.
+  # Rationale: user may paste https://github.com/owner/repo.git  →  regex captures owner/repo.git  (includes .git because [A-Za-z0-9_.-] matches '.')
+  #            OR pasted URL may come from prior buggy run with .git.git already baked in.
+  #            Canonical URL construction appends exactly ONE .git, so we must strip ALL trailing .git here.
+  # sed: first strip leading/trailing slashes; then label `:a` + `t a` loops stripping ONE trailing .git (+ optional trailing / after it)
+  #      until the substitution fails — removes .git, .git.git, .git.git.git, etc, regardless of stack depth.
+  OWNER_REPO="$(printf '%s' "$OWNER_REPO" | sed -E -e 's|^[/]*||' -e 's|[/]*$||' -e ':a' -e 's|(\.git)[/]*$||' -e 't a' -e 's|[/]*$||')"
   # Safety: if owner/repo still empty, abort early instead of producing malformed URL.
   if [ -z "$OWNER_REPO" ] || [[ "$OWNER_REPO" != */* ]]; then
     _die "Could not extract owner/repo from GIT_URL='$GIT_URL'. Paste HTTPS URL like https://github.com/younisalbadawi/RaSYaT_SpAcE_Solution or SSH URL like git@github.com:younisalbadawi/RaSYaT_SpAcE_Solution.git"
+  fi
+  # Final canonical form: owner/repo WITHOUT any trailing .git or /
+  local GIT_OWNER="${OWNER_REPO%%/*}"
+  printf "\n"
+  _info "Parsed GitHub private repo: owner='%s', repo='%s' (full: github.com/%s)" "$GIT_OWNER" "${OWNER_REPO#*/}" "$OWNER_REPO"
+
+  # =====================================================================
+  # Step 2: Already-authed fast path — but REBUILD URL with sanitized
+  #         OWNER_REPO first, so legacy .git.git / trailing-slash bugs
+  #         are fixed on every rerun (old env files auto-heal).
+  # =====================================================================
+  local IN_URL_TOKEN=""
+  if [[ "$GIT_URL" =~ ^https://x-access-token:([^@]+)@github\.com/ ]]; then
+    IN_URL_TOKEN="${BASH_REMATCH[1]}"
+  fi
+  if [ -n "$IN_URL_TOKEN" ]; then
+    GIT_URL="$(_normalize_github_url "https://x-access-token:${IN_URL_TOKEN}@github.com/${OWNER_REPO}.git")"
+    _ok "GIT_URL already has 'x-access-token:<token>@github.com' auth — auto-normalized to canonical form, skipping wizard."
+    return 0
   fi
 
   printf "\n\033[1;96m[GITHUB PRIVATE-REPO AUTH — SCALABLE MULTI-SERVER]\033[0m\n"
@@ -939,7 +981,8 @@ github_auth_private_repo() {
   # Canonical GitHub HTTPS token auth. The username is literally "x-access-token" —
   # this is the GitHub-documented canonical username for token auth, works with SSO/SAML orgs, never conflicts.
   # Doc reference https://docs.github.com/en/rest/overview/authenticating-to-the-rest-api#authenticating-with-a-personal-access-token
-  local FINAL_GIT_URL="https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git"
+  # _normalize_github_url acts as a final safety net: strips any accidental .git.git + appends exactly one .git.
+  local FINAL_GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
   GIT_URL="$FINAL_GIT_URL"
 
   # Persist token for future runs/update scripts. chmod 600 = owner root only; never readable by any other account.
@@ -955,7 +998,7 @@ github_auth_private_repo() {
   sudo chown 0:0 "$GIT_TOKEN_FILE"
   _ok "Saved Fine-Grained token to $GIT_TOKEN_FILE (chmod 600, owner root)."
   printf "  Final clone URL shown with token REDACTED for terminal display:\n"
-  printf "    https://x-access-token:********@github.com/%s.git\n" "$OWNER_REPO"
+  printf "    %s\n" "$(printf '%s' "$GIT_URL" | sed -E 's|(https://x-access-token:)[^@]+(@github\.com/)|\1********\2|')"
 
   # =============== PRE-CLONE AUTH PROBE (FAIL-FAST RECURSIVE RETRY) ===============
   # This line will NOT allow the script to proceed to a git clone that will definitely die
@@ -998,7 +1041,7 @@ github_auth_private_repo() {
         # Default: prompt for a NEW token, rewrite GIT_URL, keep looping.
         TOKEN=$(prompt_secret "Paste a NEW valid Fine-Grained token (github_pat_/ghs_...). Hidden input.")
         if [ -z "$TOKEN" ]; then continue; fi
-        FINAL_GIT_URL="https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git"
+        FINAL_GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
         GIT_URL="$FINAL_GIT_URL"
         sudo mkdir -p "$(dirname "$GIT_TOKEN_FILE")"
         {
