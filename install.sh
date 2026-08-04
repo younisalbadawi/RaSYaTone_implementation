@@ -54,6 +54,7 @@ DEF_GUNICORN_BIND="0.0.0.0:8000"
 DEF_SERVICE="rasyatone"
 MIN_PYTHON_MAJOR=3
 MIN_PYTHON_MINOR=10
+declare -g PYTHON_BIN=""
 
 # --- tiny helpers -----------------------------------------------------------
 _ok()   { printf "  \033[92m[ OK ]\033[0m %s\n" "$*"; }
@@ -89,6 +90,51 @@ _normalize_github_url() {
     *".git.git"*) _die "BUG: _normalize_github_url leaked '.git.git'! Input='${1:-}' Output='${s}' — refusing to continue to avoid a broken git clone." ;;
   esac
   printf '%s' "$s"
+}
+
+# --- Python version helpers ---------------------------------------------------
+# Checks whether a python binary ($1 = full path or basename like python3.11)
+# satisfies >= MIN_PYTHON_MAJOR.MIN_PYTHON_MINOR. Prints binary path on stdout
+# and returns 0 if OK; returns non-zero silently otherwise.
+_py_version_ok() {
+  local bin="$1" py_ver py_maj py_min
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  py_ver=$("$bin" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
+  read -r py_maj py_min <<<"$py_ver"
+  [ "$py_maj" -ge 0 ] 2>/dev/null || return 1
+  [ "$py_min" -ge 0 ] 2>/dev/null || return 1
+  if [ "$py_maj" -gt "$MIN_PYTHON_MAJOR" ]; then return 0; fi
+  if [ "$py_maj" -eq "$MIN_PYTHON_MAJOR" ] && [ "$py_min" -ge "$MIN_PYTHON_MINOR" ]; then return 0; fi
+  return 1
+}
+
+# Scans for ANY python3* binary on PATH with version >= 3.10 (Django 5 floor).
+# Prefers highest available minor (e.g. 3.12 over 3.11 over 3.10). Sets global
+# PYTHON_BIN to the absolute path of the chosen binary (fallback "python3" if
+# nothing else found — caller must re-check and install if needed).
+_detect_compatible_python3() {
+  PYTHON_BIN=""
+  local cand best_bin="" best_maj=0 best_min=0 py_ver py_maj py_min
+  for cand in python3.13 python3.12 python3.11 python3.10 python3; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if _py_version_ok "$(command -v "$cand")"; then
+      py_ver=$("$cand" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
+      read -r py_maj py_min <<<"$py_ver"
+      if [ "$py_maj" -gt "$best_maj" ] || { [ "$py_maj" -eq "$best_maj" ] && [ "$py_min" -gt "$best_min" ]; }; then
+        best_bin="$(command -v "$cand")"
+        best_maj="$py_maj"
+        best_min="$py_min"
+      fi
+    fi
+  done
+  if [ -n "$best_bin" ]; then
+    PYTHON_BIN="$best_bin"
+    _info "Selected compatible Python: ${PYTHON_BIN} (v${best_maj}.${best_min} >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR})"
+    return 0
+  fi
+  # Nothing >= 3.10 found. Still record the default python3 for error messages.
+  command -v python3 >/dev/null 2>&1 && PYTHON_BIN="$(command -v python3)" || PYTHON_BIN="python3"
+  return 1
 }
 
 prompt_def() {
@@ -415,20 +461,23 @@ precheck_app_prereqs() {
   if [ "${free_kb:-0}" -ge 1048576 ]; then _ok "$probe_dir free space: ${free_kb} KB (>= 1 GB)"
   else _nok "$probe_dir free space ${free_kb:-0} KB < 1 GB (needs ~600 MB min for venv)" || ((fail++)); fi
 
-  # 4. python3 version
-  if command -v python3 >/dev/null 2>&1; then
-    local py_ver py_maj py_min
-    py_ver=$(python3 -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
-    read -r py_maj py_min <<<"$py_ver"
-    if [ "$py_maj" -gt "$MIN_PYTHON_MAJOR" ] || { [ "$py_maj" -eq "$MIN_PYTHON_MAJOR" ] && [ "$py_min" -ge "$MIN_PYTHON_MINOR" ]; }; then
-      _ok "python3 version: ${py_maj}.${py_min} (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR})"
-    else _nok "python3 version ${py_maj}.${py_min} too old; Django 5 requires >= 3.10" || ((fail++)); fi
-  else _nok "python3 binary not installed" || ((fail++)); fi
+  # 4. python3 version (Django 5 floor: >= 3.10)
+  if _detect_compatible_python3; then
+    local show_ver
+    show_ver=$("$PYTHON_BIN" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
+    _ok "python3 version OK: ${PYTHON_BIN} -> v${show_ver} (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR})"
+  else
+    local cur_ver="0.0"
+    if command -v python3 >/dev/null 2>&1; then
+      cur_ver=$(python3 -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null || echo "0.0")
+    fi
+    _nok "NO compatible Python found (need >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR} for Django 5). Current python3=${cur_ver}. Rerun Option 4 and installer will try to install python3.11 for your distro." || ((fail++))
+  fi
 
-  # 5. venv + pip modules
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -m venv --help >/dev/null 2>&1 && _ok "python3 -m venv module available" || { _nok "python3-venv package missing"; ((fail++)); }
-    python3 -m pip --version >/dev/null 2>&1  && _ok "python3 -m pip module available"  || { _nok "python3-pip package missing";  ((fail++)); }
+  # 5. venv + pip modules (only if we found a compatible python)
+  if [ -n "${PYTHON_BIN:-}" ] && command -v "${PYTHON_BIN##*/}" >/dev/null 2>&1; then
+    "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 && _ok "${PYTHON_BIN} -m venv module available" || { _nok "${PYTHON_BIN##*/}-venv / python3-venv package missing — Option 4 will install it"; ((fail++)); }
+    "$PYTHON_BIN" -m pip --version >/dev/null 2>&1  && _ok "${PYTHON_BIN} -m pip module available"  || { _nok "${PYTHON_BIN##*/}-pip / python3-pip package missing — Option 4 will install it";  ((fail++)); }
   fi
 
   # 6. git + URL reachable
@@ -1151,13 +1200,68 @@ install_app() {
   sudo chmod 0640 "$ENV_FILE" 2>/dev/null || true
   _ok "$ENV_FILE written (0640). Edit manually if desired."
 
-  _section "Installing system packages (python3-venv/pip/git/build tools + psql client) via $PM"
+  _section "Installing system packages (python >= 3.10 enforced, venv/pip/git/build tools + psql client) via $PM"
   eval "$PKG_UPDATE" >/dev/null 2>&1 || true
+  # Step A: Pre-scan for a compatible python BEFORE packages install. If none
+  # exists, install distro-specific python3.11 (old-stable LTS, guaranteed Django
+  # 5 compatible) alongside the system python3. Python 3.11 is preferred over
+  # 3.10/3.12 because it's the sweet spot of mature + supported by every wheel.
+  _detect_compatible_python3 || true
   case "$PM" in
-    apt) sudo $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev curl gettext-base postgresql-client ;;
-    dnf) sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel curl postgresql ;;
-    apk) sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev curl postgresql-client ;;
+    apt)
+      # apt (Debian/Ubuntu): default python3 is >=3.10 on Ubuntu 22.04+ / Debian 12+.
+      # On older releases install python3.11 from the standard repos or deadsnakes.
+      sudo $PKG_INSTALL software-properties-common ca-certificates >/dev/null 2>&1 || true
+      if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && ! _py_version_ok python3.13; then
+        if command -v add-apt-repository >/dev/null 2>&1; then
+          sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
+          sudo $PKG_UPDATE >/dev/null 2>&1 || true
+        fi
+        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.11 python3.11-venv python3.11-pip python3.11-dev 2>/dev/null || \
+        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.10 python3.10-venv python3.10-pip python3.10-dev 2>/dev/null || true
+      fi
+      # Always install the baseline python3 meta-packages (required for symlinks
+      # and distro tooling that expects bare `python3`).
+      sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev curl gettext-base postgresql-client
+      ;;
+    dnf)
+      # dnf (RHEL/Fedora/Rocky/Alma):
+      #   - Fedora 38+ ships python >= 3.11 as `python3` — baseline pkg works.
+      #   - RHEL 8/9 AppStream: default `python3` is 3.6/3.9 (TOO OLD). Install
+      #     `python3.11` explicitly via module / AppStream, then pip/venv pkgs.
+      if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && ! _py_version_ok python3.13; then
+        if [ -r /etc/redhat-release ] || [ -r /etc/almalinux-release ] || [ -r /etc/rocky-release ] || [ -r /etc/oracle-release ]; then
+          sudo dnf module enable -y python3.11 >/dev/null 2>&1 || true
+        fi
+        sudo $PKG_INSTALL python3.11 python3.11-devel python3.11-pip 2>/dev/null || \
+        sudo $PKG_INSTALL python3.10 python3.10-devel python3.10-pip 2>/dev/null || true
+      fi
+      # Baseline: install python3 base + build tools + postgresql server/client meta-pkg.
+      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel curl postgresql postgresql-contrib 2>/dev/null || \
+      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel curl postgresql
+      ;;
+    apk)
+      # Alpine: python3 is kept very current (3.11/3.12) in edge + stable branches.
+      sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev curl postgresql-client
+      ;;
   esac
+
+  # Step B: Re-detect after install. Fail LOUDLY if we still don't have >= 3.10.
+  _detect_compatible_python3 || _die "\
+No compatible Python (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}) found AFTER system package install.
+Django 5 (in your repo) REFUSES to install on Python < 3.10. What to do:
+  * Ubuntu 20.04 / Debian 11 : install python3.11 from deadsnakes PPA manually (apt install software-properties-common; add-apt-repository ppa:deadsnakes/ppa; apt install python3.11 python3.11-venv python3.11-pip) then rerun.
+  * RHEL 8 / CentOS 8        : dnf module enable python3.11 -y && dnf install -y python3.11 python3.11-devel python3.11-pip
+  * RHEL 9 / Rocky 9 / Alma 9: dnf install -y python3.11 python3.11-devel python3.11-pip
+  * Any distro               : compile Python 3.11+ from source (./configure --enable-optimizations --prefix=/usr/local && make -j && sudo make altinstall)
+  * Check PYTHON_BIN is on PATH first: try command -v python3.11 ; python3.11 --version"
+
+  # Step C: Verify PYTHON_BIN really does have venv + pip modules (distros ship
+  # these as separate packages; a broken `apt-get install` can leave PYTHON_BIN
+  # functional but `pythonX -m venv` missing).
+  "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || _die "PYTHON_BIN=${PYTHON_BIN} has no 'venv' module. Install the matching -venv / -devel package for this Python (e.g. apt install ${PYTHON_BIN##*/}-venv)."
+  "$PYTHON_BIN" -m pip  --version  >/dev/null 2>&1 || _die "PYTHON_BIN=${PYTHON_BIN} has no 'pip' module. Install the matching -pip package for this Python (e.g. apt install ${PYTHON_BIN##*/}-pip)."
+  _ok "Python runtime locked: ${PYTHON_BIN} $("$PYTHON_BIN" --version 2>&1 | head -n1) — venv+pip modules verified"
 
   _section "Validate DB connectivity (DB_PASSWORD from $ENV_FILE)"
   set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
@@ -1198,27 +1302,49 @@ install_app() {
   _ok "App dir populated (branch=$GIT_BRANCH)"
 
   _section "Create virtualenv at $APP_DIR/.venv + install dependencies"
-  if [ ! -d "$APP_DIR/.venv" ]; then python3 -m venv "$APP_DIR/.venv"; fi
+  if [ ! -d "$APP_DIR/.venv" ]; then
+    _info "Creating venv with PYTHON_BIN=${PYTHON_BIN} (this ensures Django 5 gets a Python >= 3.10 regardless of system python3 default)"
+    "$PYTHON_BIN" -m venv "$APP_DIR/.venv" || _die "venv creation FAILED with PYTHON_BIN=${PYTHON_BIN}. Check disk free space in $APP_DIR (>= 1 GB) and that ${PYTHON_BIN##*/}-venv / ensurepip is installed."
+  fi
   # shellcheck disable=SC1091
-  . "$APP_DIR/.venv/bin/activate"
-  python -m pip install --quiet --upgrade pip setuptools wheel
+  # NOTE: `set -u` (nounset) from top of script causes activate scripts to crash
+  # when they reference variables like _OLD_VIRTUAL_PATH that may not exist.
+  # We temporarily disable nounset during activate and re-enable it after.
+  set +u
+  . "$APP_DIR/.venv/bin/activate" 2>/dev/null || true
+  set -u
+  # Sanity check: verify the activated `python` is the same one we chose
+  local active_py=""
+  active_py="$(command -v python 2>/dev/null || echo "")"
+  [ -n "$active_py" ] || _die "After sourcing .venv/bin/activate, 'python' command is not on PATH — venv is broken. Wipe $APP_DIR/.venv and rerun."
+  _py_version_ok "$active_py" || _die "Activated venv python ($active_py, version=$($active_py -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null)) is TOO OLD for Django 5 (< ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}). This means venv was created with the WRONG python binary earlier. Wipe $APP_DIR/.venv and rerun Option 4 — this time it will use PYTHON_BIN=${PYTHON_BIN}."
+  python -m pip install --quiet --upgrade pip setuptools wheel 2>&1 | tail -n 3 || _die "pip upgrade failed — venv Python is broken or no internet. Try: $active_py -m ensurepip --upgrade"
   if [ -f "$APP_DIR/requirements.txt" ]; then
-    python -m pip install --quiet -r "$APP_DIR/requirements.txt"
+    python -m pip install --quiet -r "$APP_DIR/requirements.txt" 2>&1 | tail -n 20 || _die "pip install -r requirements.txt FAILED. Check the output above — common fixes: (a) install libpq-dev for psycopg2/psycopg build, (b) increase RAM if OOM killed during compile, (c) use psycopg[binary] instead of psycopg2."
   else
     _warn "No $APP_DIR/requirements.txt found — skipping pip install -r (install manually)"
   fi
-  python -m pip install --quiet gunicorn 2>/dev/null || true
-  _ok "venv ready; gunicorn: $(gunicorn --version 2>&1 | head -n1)"
+  python -m pip install --quiet gunicorn 2>/dev/null || python -m pip install gunicorn || _die "Failed to install gunicorn into venv — cannot create systemd unit / start app."
+  _ok "venv ready; python=$(command -v python) ($(python --version 2>&1 | head -n1)); gunicorn: $(gunicorn --version 2>&1 | head -n1)"
 
   _section "Run Django collectstatic + migrate"
   (
     cd "$APP_DIR"
     set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
     export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
-    . "./.venv/bin/activate"
-    if python manage.py collectstatic --noinput >/dev/null; then _ok "collectstatic ok"
-    else _warn "collectstatic exited non-zero (STATIC_ROOT unset? continue if expected)"; fi
-    python manage.py migrate || _die "manage.py migrate failed — DB credentials in $ENV_FILE?"
+    # Same set -u safety for nested activate inside subshell
+    set +u
+    # shellcheck disable=SC1091
+    . "./.venv/bin/activate" 2>/dev/null || true
+    set -u
+    if python manage.py collectstatic --noinput >/dev/null 2>&1; then _ok "collectstatic ok"
+    else
+      # Re-run noisily so user sees WHY it failed (STATIC_ROOT / permission errors)
+      _warn "collectstatic exited non-zero — re-running with output for debugging:"
+      python manage.py collectstatic --noinput 2>&1 | tail -n 20 || true
+      _warn "Continuing anyway — if STATIC_ROOT was unset or wrong path this is expected."
+    fi
+    python manage.py migrate || _die "manage.py migrate failed — most common causes: (1) DB credentials in $ENV_FILE wrong? (2) DB_USER missing CREATEDB / CONNECT on DB=$DB_NAME? (3) Wrong Python version in venv ($(python --version 2>&1) when Django 5 needs >= 3.10?)"
   )
   _ok "Django migrate OK"
 
@@ -1286,6 +1412,9 @@ install_app() {
   _section "RaSYaTone app install POST-INSTALL SUMMARY"
   printf "  APP_DIR=%s\n" "$APP_DIR"
   printf "  VENV_PYTHON=%s\n" "$APP_DIR/.venv/bin/python"
+  if [ -x "$APP_DIR/.venv/bin/python" ]; then
+    printf "  VENV_PYTHON_VERSION=%s\n" "$("$APP_DIR/.venv/bin/python" --version 2>&1 | head -n1)"
+  fi
   printf "  DJANGO_SETTINGS=%s\n" "$DJANGO_SETTINGS"
   printf "  ENV_FILE=%s\n" "$ENV_FILE"
   if command -v systemctl >/dev/null 2>&1; then
