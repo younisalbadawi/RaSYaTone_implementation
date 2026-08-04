@@ -269,6 +269,68 @@ detect_pm() {
   fi
 }
 
+# Install Python runtime (>= 3.10 AND <= MAX_ALLOWED_PYTHON_MINOR), plus build
+# essentials (git/libpq-dev/libffi-dev/postgresql-client). Runs from BOTH:
+#   * precheck_app_prereqs() — so "Run prechecks first?" flow won't fail on
+#     servers that only have python 3.14+ (which we refuse to use) BEFORE the
+#     precheck detection pass runs.
+#   * install_app() — Option 4 proper. If already called in precheck, the apt/dnf
+#     calls are idempotent and take ~0s (all packages already marked "installed").
+# Returns 0 if a compatible python is available after install (or already was),
+# non-zero otherwise (caller decides whether to continue).
+_install_compatible_python_runtime() {
+  detect_pm
+  load_env_file || true
+  # Run pkg update quietly once (idempotent if mirrors already current)
+  eval "$PKG_UPDATE" >/dev/null 2>&1 || true
+  case "$PM" in
+    apt)
+      # apt (Debian/Ubuntu):
+      #   * New: Ubuntu 24.04 may ship python 3.14 if using experimental.
+      #     If deadsnakes is NOT available (e.g. Debian testing) we try standard
+      #     repos first, but must fall back to deadsnakes on older Ubuntu LTS.
+      sudo $PKG_INSTALL software-properties-common ca-certificates >/dev/null 2>&1 || true
+      # If NO acceptable python is present (<3.10 acceptable range OR too new),
+      # explicitly install python3.11 (known-good Django + wheels sweet spot).
+      if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && { ! _py_version_ok python3.13 || [ "${MAX_ALLOWED_PYTHON_MINOR:-13}" -lt 13 ]; }; then
+        if command -v add-apt-repository >/dev/null 2>&1; then
+          sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
+          sudo $PKG_UPDATE >/dev/null 2>&1 || true
+        fi
+        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.11 python3.11-venv python3.11-pip python3.11-dev 2>/dev/null || \
+        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.10 python3.10-venv python3.10-pip python3.10-dev 2>/dev/null || true
+      fi
+      # Always install the baseline python3 meta-packages (required for symlinks
+      # and distro tooling that expects bare `python3`). NOTE: libffi-dev MUST
+      # be here — cffi / cryptography / bcrypt / PyNaCl ALL require `ffi.h`.
+      sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client
+      ;;
+    dnf)
+      # dnf (RHEL/Fedora/Rocky/Alma):
+      #   * Fedora 40+ ships python 3.14 sometimes. RHEL 8/9 default python3 is
+      #     3.6/3.9 (TOO OLD). Force python3.11 via module / AppStream.
+      if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && { ! _py_version_ok python3.13 || [ "${MAX_ALLOWED_PYTHON_MINOR:-13}" -lt 13 ]; }; then
+        if [ -r /etc/redhat-release ] || [ -r /etc/almalinux-release ] || [ -r /etc/rocky-release ] || [ -r /etc/oracle-release ]; then
+          sudo dnf module enable -y python3.11 >/dev/null 2>&1 || true
+        fi
+        sudo $PKG_INSTALL python3.11 python3.11-devel python3.11-pip 2>/dev/null || \
+        sudo $PKG_INSTALL python3.10 python3.10-devel python3.10-pip 2>/dev/null || true
+      fi
+      # Baseline: python + build tools + postgresql server/client meta-pkg.
+      # libffi-devel needed for cffi / cryptography / bcrypt builds (ffi.h header).
+      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib 2>/dev/null || \
+      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql
+      ;;
+    apk)
+      # Alpine: python3 is kept very current (3.11/3.12) in edge + stable branches.
+      # libffi-dev: ffi.h header for cffi / cryptography / bcrypt sdists.
+      sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client
+      ;;
+  esac
+  # Final post-install check: is there now a compatible python?
+  _detect_compatible_python3 2>/dev/null
+}
+
 service_control() {
   local action="$1" name="${2:-postgresql}"
   if command -v systemctl >/dev/null 2>&1; then
@@ -523,6 +585,24 @@ precheck_app_prereqs() {
   detect_pm; _ok "Package manager detected: $PM"
   load_env_file || true
 
+  # 0. Python runtime auto-install (same code as Option 4 proper — idempotent).
+  #    If this server ONLY has Python >= 3.14 (MAX cap), or Python < 3.10 (too old),
+  #    we MUST resolve it HERE before running detection checks, because the user
+  #    defaulted "Run prechecks first?" to Y. Otherwise the precheck would fail
+  #    immediately on the hard-cap DIE (even though install_app would have fixed
+  #    it one step later). This is the exact bug the user reported: Option 4 ->
+  #    prechecks ran first, hit 3.14-only, died before install_app got a chance.
+  printf "  Auto-installing python3.11 / build tools (if needed) — mirrors + apt/dnf may run ...\n" >&2
+  set +e
+  _install_compatible_python_runtime
+  local pyrc=$?
+  set -e
+  if [ "$pyrc" -eq 0 ]; then
+    _ok "Python runtime auto-install OK: PYTHON_BIN=${PYTHON_BIN:-<pending>}"
+  else
+    _warn "Python runtime auto-install completed but post-check still unmet (will run normal detection next to get exact fail reason)"
+  fi
+
   # 1. privilege
   if sudo -n true 2>/dev/null || [ "$(id -u)" = "0" ]; then _ok "Root/sudo privilege available"
   else _nok "No sudo access; install requires sudo for system packages" || ((fail++)); fi
@@ -542,17 +622,20 @@ precheck_app_prereqs() {
   if [ "${free_kb:-0}" -ge 1048576 ]; then _ok "$probe_dir free space: ${free_kb} KB (>= 1 GB)"
   else _nok "$probe_dir free space ${free_kb:-0} KB < 1 GB (needs ~600 MB min for venv)" || ((fail++)); fi
 
-  # 4. python3 version (Django 5 floor: >= 3.10)
+  # 4. python3 version (Django 5 floor: >= 3.10, MAX_ALLOWED_PYTHON_MINOR cap).
+  #    NOTE: _install_compatible_python_runtime already ran above, so if this
+  #    still fails → deadsnakes PPA was unreachable OR repo index is stale —
+  #    give the user EXACT commands to run (not vague "rerun Option 4").
   if _detect_compatible_python3; then
     local show_ver
     show_ver=$("$PYTHON_BIN" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
-    _ok "python3 version OK: ${PYTHON_BIN} -> v${show_ver} (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR})"
+    _ok "python3 version OK: ${PYTHON_BIN} -> v${show_ver} (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}, <= 3.${MAX_ALLOWED_PYTHON_MINOR:-13})"
   else
     local cur_ver="0.0"
     if command -v python3 >/dev/null 2>&1; then
       cur_ver=$(python3 -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null || echo "0.0")
     fi
-    _nok "NO compatible Python found (need >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR} for Django 5). Current python3=${cur_ver}. Rerun Option 4 and installer will try to install python3.11 for your distro." || ((fail++))
+    _nok "NO compatible Python (need >= 3.${MIN_PYTHON_MINOR} AND <= 3.${MAX_ALLOWED_PYTHON_MINOR:-13}). System python3=${cur_ver}. The installer tried AUTO-INSTALL python3.11 but it FAILED (deadsnakes PPA unreachable? no internet?). Exact manual fix: apt install software-properties-common ca-certificates ; DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa ; apt update ; DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv python3.11-pip python3.11-dev  — then rerun Option 2 / 4." || ((fail++))
   fi
 
   # 5. venv + pip modules (only if we found a compatible python)
@@ -1380,65 +1463,39 @@ install_app() {
   _ok "$ENV_FILE written (0640). Edit manually if desired."
 
   _section "Installing system packages (python >= 3.10 enforced, venv/pip/git/build tools + psql client) via $PM"
-  eval "$PKG_UPDATE" >/dev/null 2>&1 || true
-  # Step A: Pre-scan for a compatible python BEFORE packages install. If none
-  # exists, install distro-specific python3.11 (old-stable LTS, guaranteed Django
-  # 5 compatible) alongside the system python3. Python 3.11 is preferred over
-  # 3.10/3.12 because it's the sweet spot of mature + supported by every wheel.
-  _detect_compatible_python3 || true
-  case "$PM" in
-    apt)
-      # apt (Debian/Ubuntu): default python3 is >=3.10 on Ubuntu 22.04+ / Debian 12+.
-      # On older releases install python3.11 from the standard repos or deadsnakes.
-      sudo $PKG_INSTALL software-properties-common ca-certificates >/dev/null 2>&1 || true
-      if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && ! _py_version_ok python3.13; then
-        if command -v add-apt-repository >/dev/null 2>&1; then
-          sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
-          sudo $PKG_UPDATE >/dev/null 2>&1 || true
-        fi
-        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.11 python3.11-venv python3.11-pip python3.11-dev 2>/dev/null || \
-        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.10 python3.10-venv python3.10-pip python3.10-dev 2>/dev/null || true
-      fi
-      # Always install the baseline python3 meta-packages (required for symlinks
-      # and distro tooling that expects bare `python3`).
-      # NOTE: libffi-dev MUST be here — cffi / cryptography / bcrypt / PyNaCl
-      # ALL require ffi.h at build time. Without it you get:
-      #   "src/c/_cffi_backend.c:15:10: fatal error: ffi.h: No such file or directory"
-      sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client
-      ;;
-    dnf)
-      # dnf (RHEL/Fedora/Rocky/Alma):
-      #   - Fedora 38+ ships python >= 3.11 as `python3` — baseline pkg works.
-      #   - RHEL 8/9 AppStream: default `python3` is 3.6/3.9 (TOO OLD). Install
-      #     `python3.11` explicitly via module / AppStream, then pip/venv pkgs.
-      if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && ! _py_version_ok python3.13; then
-        if [ -r /etc/redhat-release ] || [ -r /etc/almalinux-release ] || [ -r /etc/rocky-release ] || [ -r /etc/oracle-release ]; then
-          sudo dnf module enable -y python3.11 >/dev/null 2>&1 || true
-        fi
-        sudo $PKG_INSTALL python3.11 python3.11-devel python3.11-pip 2>/dev/null || \
-        sudo $PKG_INSTALL python3.10 python3.10-devel python3.10-pip 2>/dev/null || true
-      fi
-      # Baseline: install python3 base + build tools + postgresql server/client meta-pkg.
-      # libffi-devel needed for cffi / cryptography / bcrypt builds (ffi.h header).
-      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib 2>/dev/null || \
-      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql
-      ;;
-    apk)
-      # Alpine: python3 is kept very current (3.11/3.12) in edge + stable branches.
-      # libffi-dev: ffi.h header for cffi / cryptography / bcrypt sdists.
-      sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client
-      ;;
-  esac
+  # NOTE: _install_compatible_python_runtime is the SINGLE SOURCE OF TRUTH for
+  # python install logic — SAME exact code runs in both precheck_app_prereqs()
+  # AND here. If user answered Y to "Run prechecks first?" (the default), apt
+  # marked all these packages "installed" already and this block takes ~0s
+  # (fully idempotent). If the user jumped straight to Option 4 without running
+  # prechecks, this installs them. Either way, we don't duplicate the distro
+  # install switch-statement — zero divergence risk.
+  set +e
+  _install_compatible_python_runtime
+  local prc=$?
+  set -e
 
-  # Step B: Re-detect after install. Fail LOUDLY if we still don't have >= 3.10.
-  _detect_compatible_python3 || _die "\
-No compatible Python (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}) found AFTER system package install.
-Django 5 (in your repo) REFUSES to install on Python < 3.10. What to do:
-  * Ubuntu 20.04 / Debian 11 : install python3.11 from deadsnakes PPA manually (apt install software-properties-common; add-apt-repository ppa:deadsnakes/ppa; apt install python3.11 python3.11-venv python3.11-pip) then rerun.
+  # Re-detect after install. Fail LOUDLY with distro-specific manual commands
+  # if deadsnakes / module enable failed (network down? repo mirror stale?).
+  if [ "$prc" -ne 0 ]; then
+    _detect_compatible_python3 2>/dev/null || true
+  fi
+  if [ -z "${PYTHON_BIN:-}" ] || ! _py_version_ok "$PYTHON_BIN" 2>/dev/null; then
+    _die "\
+No compatible Python (>= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}, <= 3.${MAX_ALLOWED_PYTHON_MINOR:-13}) found AFTER system package install.
+Django 5 (in your repo) REFUSES to install on Python < 3.10, and Python >= 3.14
+breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
+  * Ubuntu 20.04 / Debian 11 : install python3.11 from deadsnakes PPA manually:
+      apt install software-properties-common ca-certificates
+      DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa
+      apt update
+      DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv python3.11-pip python3.11-dev
   * RHEL 8 / CentOS 8        : dnf module enable python3.11 -y && dnf install -y python3.11 python3.11-devel python3.11-pip
   * RHEL 9 / Rocky 9 / Alma 9: dnf install -y python3.11 python3.11-devel python3.11-pip
   * Any distro               : compile Python 3.11+ from source (./configure --enable-optimizations --prefix=/usr/local && make -j && sudo make altinstall)
-  * Check PYTHON_BIN is on PATH first: try command -v python3.11 ; python3.11 --version"
+  * Check PYTHON_BIN is on PATH first: command -v python3.11 ; python3.11 --version"
+  fi
+  _ok "Post-package PYTHON_BIN=${PYTHON_BIN} OK (confirmed >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR} and <= 3.${MAX_ALLOWED_PYTHON_MINOR:-13})"
 
   # Step C: Verify PYTHON_BIN really does have venv + pip modules (distros ship
   # these as separate packages; a broken `apt-get install` can leave PYTHON_BIN
