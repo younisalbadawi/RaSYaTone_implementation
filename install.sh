@@ -945,35 +945,82 @@ install_db() {
 # =========================================================
 # Option 4: Install RaSYaTone application server
 # =========================================================
-# === github_auth_private_repo: single scalable GitHub Fine-Grained PAT auth for private repos ===
-# Purpose: Your app is deployed on MANY servers in MANY locations at DIFFERENT times.
-# This function uses the OFFICIAL GitHub-supported approach documented at:
-#   https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-fine-grained-personal-access-token
-# ONE token, generated ONCE in your GitHub account, reused on EVERY deployment server (paste same token).
-# No per-server Deploy keys. No classic PAT. No SSH setup. Exactly one auth flow.
-# Inputs (globals): GIT_URL (user-pasted repo URL, https:// or git@github.com: form)
-# Outputs (globals): GIT_URL rewritten to canonical form: https://x-access-token:<FINE_GRAINED_PAT>@github.com/<owner>/<repo>.git
-# Side effects: Writes /etc/rasyatone/static/git_token.env with GITHUB_TOKEN= chmod 600 (preserved across reinstalls).
+# === github_auth_private_repo: GitHub Fine-Grained PAT auth for private repos ===
+# Architectural principles (this is the ONE TRUE implementation for this flow):
+#   1. VERIFY BEFORE TRUST  : Any persisted token is *always* re-verified via git ls-remote probe
+#                             before returning. No expired/revoked tokens auto-fast-path past the check.
+#   2. WRITE AFTER VERIFY    : Token file on disk is written/updated ONLY after a successful probe.
+#                             Bad/invalid tokens never pollute the persisted state.
+#   3. ONE CANONICAL WRITER  : Single helper _save_github_token() writes git_token.env —
+#                             zero duplication between initial/retry branches.
+#   4. SANITIZE EVERY INPUT  : All URLs go through _normalize_github_url. Owner/repo split on
+#                             single '/' — no "../../etc/passwd" style tricks possible.
+#   5. TIMEOUT EVERY NETWORK : All git ls-remote calls use timeout(1) — no hangs.
+#   6. SSH URL DETECTION     : User pastes git@github.com: form → we ASK whether they already
+#                             configured SSH keys on this server (skip wizard) or want to switch to
+#                             the Fine-Grained PAT HTTPS method documented here.
+# Reference: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-fine-grained-personal-access-token
+# Inputs (globals)  : GIT_URL  — user-pasted URL. HTTPS or SSH git@github.com: form.
+# Outputs (globals) : GIT_URL  — rewritten to canonical https://x-access-token:<TOKEN>@github.com/<owner>/<repo>.git
+# Side effects      : Writes /etc/rasyatone/static/git_token.env (GITHUB_TOKEN=… chmod 600 root:root)
 github_auth_private_repo() {
-  # Fast skip: not GitHub at all.
+  # ── Fast skip: not GitHub at all ──────────────────────────────────────────
   case "$GIT_URL" in
     *github.com*) ;;
     *) return 0 ;;
   esac
 
-  # =====================================================================
-  # Step 1: Extract OWNER_REPO from ANY GitHub URL form. Run ALWAYS so
-  #         previously-saved buggy URLs (e.g. .git.git / trailing /) get
-  #         re-normalized on every rerun, not just first-time paste.
-  # =====================================================================
-  # Supported input forms:
-  #   https://github.com/owner/repo
-  #   https://github.com/owner/repo.git
-  #   https://github.com/owner/repo.git/
-  #   https://x-access-token:<token>@github.com/owner/repo
-  #   https://x-access-token:<token>@github.com/owner/repo(.git){1,}/?
-  #   git@github.com:owner/repo(.git)?
-  local OWNER_REPO=""
+  # ── Helper: save token to disk (ONE CANONICAL WRITER, writes AFTER verify) ─
+  _save_github_token() {
+    # Caller must have already verified token works.
+    sudo mkdir -p "$(dirname "$GIT_TOKEN_FILE")"
+    {
+      echo "# RaSYaTone GitHub token — single Fine-Grained PAT reused across all deployment servers."
+      echo "# Written by install.sh github_auth_private_repo()."
+      echo "# Rotation: re-generate in GitHub UI when it expires, re-run Option 4, paste new token."
+      echo "# SENSITIVE: DO NOT commit. Disk chmod: 600 owner=root:root."
+      printf 'GITHUB_TOKEN=%s\n' "$TOKEN"
+    } | sudo tee "$GIT_TOKEN_FILE" >/dev/null
+    sudo chmod 0600 "$GIT_TOKEN_FILE"
+    sudo chown 0:0 "$GIT_TOKEN_FILE"
+  }
+
+  # ── Helper: prompt for a token (ONE prompt text, used everywhere) ─────────
+  _prompt_token() {
+    local label="${1:-Paste the Fine-Grained token (github_pat_.../ghs_...) here. Hidden input, echo off.}"
+    local t=""
+    while [ -z "${t:-}" ]; do
+      t=$(prompt_secret "$label")
+      [ -n "${t:-}" ] || printf "  Token cannot be empty. Try again (or Ctrl-C to abort).\n" >&2
+    done
+    printf '%s' "$t"
+  }
+
+  # ── Helper: run probe + set globals passed by reference names ─────────────
+  # Sets: $1 (out_rc) exit code, $2 (out_log) log contents trimmed, $3 (out_headcount) branch count
+  _run_auth_probe() {
+    local __rcvar="$1" __logvar="$2" __hcvar="$3" log="" rc=0 hc="0"
+    log="$(GIT_TERMINAL_PROMPT=0 timeout 15 git ls-remote --heads "$GIT_URL" 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [ -n "$log" ]; then
+      hc=$(printf '%s\n' "$log" | grep -c '^' 2>/dev/null || echo "0")
+      # hc=$(wc -l <<< trimmed) but grep -c '^' is robust to empty input on busybox
+      hc=$(printf '%s' "$log" | awk 'END{print NR}' 2>/dev/null || echo "0")
+    fi
+    eval "$__rcvar=\"$rc\""
+    eval "$__logvar=\$log"
+    eval "$__hcvar=\"$hc\""
+  }
+
+  # ── Step 1: Extract + sanitize OWNER_REPO. Run ALWAYS. ────────────────────
+  local OWNER_REPO="" GIT_OWNER="" GIT_REPO="" IN_URL_TOKEN=""
+  local GIT_TOKEN_FILE="/etc/rasyatone/static/git_token.env"
+  local EXISTING_TOKEN="" TOKEN="" INPUT_WAS_SSH="0"
+
+  # Detect SSH URL (git@github.com:owner/repo) BEFORE regex extraction — user might want SSH skip
+  case "$GIT_URL" in
+    git@github.com:*) INPUT_WAS_SSH="1" ;;
+  esac
+
   if [[ "$GIT_URL" =~ @github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) ]]; then
     OWNER_REPO="${BASH_REMATCH[1]}"
   elif [[ "$GIT_URL" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) ]]; then
@@ -981,172 +1028,196 @@ github_auth_private_repo() {
   else
     OWNER_REPO="$(printf '%s' "$GIT_URL" | sed -E 's|^[[:space:]]*(https?://[^/]+/|git@github\.com:)||')"
   fi
-  # Aggressive sanitize — GUARANTEED to strip 1+ trailing .git + any leading/trailing slashes.
-  # Rationale: user may paste https://github.com/owner/repo.git  →  regex captures owner/repo.git  (includes .git because [A-Za-z0-9_.-] matches '.')
-  #            OR pasted URL may come from prior buggy run with .git.git already baked in.
-  #            Canonical URL construction appends exactly ONE .git, so we must strip ALL trailing .git here.
-  # sed: first strip leading/trailing slashes; then label `:a` + `t a` loops stripping ONE trailing .git (+ optional trailing / after it)
-  #      until the substitution fails — removes .git, .git.git, .git.git.git, etc, regardless of stack depth.
-  OWNER_REPO="$(printf '%s' "$OWNER_REPO" | sed -E -e 's|^[/]*||' -e 's|[/]*$||' -e ':a' -e 's|(\.git)[/]*$||' -e 't a' -e 's|[/]*$||')"
-  # Safety: if owner/repo still empty, abort early instead of producing malformed URL.
-  if [ -z "$OWNER_REPO" ] || [[ "$OWNER_REPO" != */* ]]; then
-    _die "Could not extract owner/repo from GIT_URL='$GIT_URL'. Paste HTTPS URL like https://github.com/younisalbadawi/RaSYaT_SpAcE_Solution or SSH URL like git@github.com:younisalbadawi/RaSYaT_SpAcE_Solution.git"
-  fi
-  # Final canonical form: owner/repo WITHOUT any trailing .git or /
-  local GIT_OWNER="${OWNER_REPO%%/*}"
-  printf "\n"
-  _info "Parsed GitHub private repo: owner='%s', repo='%s' (full: github.com/%s)" "$GIT_OWNER" "${OWNER_REPO#*/}" "$OWNER_REPO"
 
-  # =====================================================================
-  # Step 2: Already-authed fast path — but REBUILD URL with sanitized
-  #         OWNER_REPO first, so legacy .git.git / trailing-slash bugs
-  #         are fixed on every rerun (old env files auto-heal).
-  # =====================================================================
-  local IN_URL_TOKEN=""
+  # Layer 1 strip: sed label loop (portable)
+  OWNER_REPO="$(printf '%s' "$OWNER_REPO" | sed -E \
+    -e 's|^[/]*||' -e 's|[/]*$||' \
+    -e ':a' -e 's|(\.git)[/]*$||' -e 't a' -e 's|[/]*$||')"
+  # Layer 2 strip: bash parameter-expansion fixed-point loop (backup for weird sed builds)
+  local prev=""
+  while [ "$prev" != "$OWNER_REPO" ]; do
+    prev="$OWNER_REPO"
+    while [ "${OWNER_REPO%/}" != "$OWNER_REPO" ]; do OWNER_REPO="${OWNER_REPO%/}"; done
+    while [ "${OWNER_REPO%.git}" != "$OWNER_REPO" ]; do OWNER_REPO="${OWNER_REPO%.git}"; done
+  done
+  while [ "${OWNER_REPO#/}" != "$OWNER_REPO" ]; do OWNER_REPO="${OWNER_REPO#/}"; done
+  while [ "${OWNER_REPO%/}" != "$OWNER_REPO" ]; do OWNER_REPO="${OWNER_REPO%/}"; done
+
+  # Structural validation: MUST be exactly owner/repo — no more, no fewer slashes, non-empty parts
+  case "$OWNER_REPO" in
+    */*) : ;;
+    *)   _die "GIT_URL='$GIT_URL' did not parse into owner/repo form. Paste HTTPS (https://github.com/owner/repo) or SSH (git@github.com:owner/repo)." ;;
+  esac
+  GIT_OWNER="${OWNER_REPO%%/*}"
+  GIT_REPO="${OWNER_REPO#*/}"
+  GIT_REPO="${GIT_REPO%%/*}"          # drop everything after second '/' (path injection guard)
+  OWNER_REPO="${GIT_OWNER}/${GIT_REPO}"
+  [ -n "$GIT_OWNER" ] || _die "GitHub owner name empty from GIT_URL='$GIT_URL'"
+  [ -n "$GIT_REPO" ]  || _die "GitHub repo name empty from GIT_URL='$GIT_URL'"
+  printf "\n"
+  _info "Parsed GitHub repo: owner='%s', repo='%s' (canonical: github.com/%s)" "$GIT_OWNER" "$GIT_REPO" "$OWNER_REPO"
+
+  # ── Step 2: SSH URL branch — ask user what they want ─────────────────────
+  if [ "$INPUT_WAS_SSH" = "1" ]; then
+    printf "\n"
+    _warn "You pasted an SSH URL (git@github.com:${OWNER_REPO})."
+    printf "  Fine-Grained PAT wizard uses HTTPS token auth (works on EVERY server without SSH key setup).\n"
+    local ssh_choice=""
+    ssh_choice=$(prompt_def "Pick auth method: [1] Switch to Fine-Grained PAT HTTPS method (RECOMMENDED — no SSH key needed per server)  /  [S] Skip wizard: I already have SSH keys configured correctly on THIS server for 'git@github.com' and want to use them.  Answer? [1]" "1")
+    case "$ssh_choice" in
+      [Ss]|[Ss][Ss][Hh])
+        _ok "Skipping Fine-Grained PAT wizard — using your SSH-key-based git@github.com URL as-is."
+        GIT_URL="$(_normalize_github_url "git@github.com:${OWNER_REPO}.git")"
+        _ok "Final canonical SSH URL: ${GIT_URL}"
+        return 0
+        ;;
+      *)
+        _ok "Proceeding with Fine-Grained PAT HTTPS method."
+        ;;
+    esac
+  fi
+
+  # ── Step 3: Read EXISTING_TOKEN safely + detect in-URL token ──────────────
+  # Sourcing env file without set -u guard: use subshell + guarded syntax
+  if [ -f "$GIT_TOKEN_FILE" ] && [ -r "$GIT_TOKEN_FILE" ]; then
+    EXISTING_TOKEN="$(set +u; (. "$GIT_TOKEN_FILE" 2>/dev/null && printf '%s' "${GITHUB_TOKEN:-}") || true; set +u; true)"
+    # Also strip any stray surrounding whitespace/newlines introduced by subshell
+    EXISTING_TOKEN="$(printf '%s' "$EXISTING_TOKEN" | tr -d '[:space:]')"
+  fi
+  # Detect token already embedded inside HTTPS URL (from prior run / saved .env)
   if [[ "$GIT_URL" =~ ^https://x-access-token:([^@]+)@github\.com/ ]]; then
     IN_URL_TOKEN="${BASH_REMATCH[1]}"
   fi
+
+  # ── Step 4: If already-authed fast path — STILL PROBE the token first! ────
+  # Rule: never trust a saved token blindly. Expired/revoked tokens MUST be caught now,
+  # not 90 seconds later at `git clone`.
   if [ -n "$IN_URL_TOKEN" ]; then
-    GIT_URL="$(_normalize_github_url "https://x-access-token:${IN_URL_TOKEN}@github.com/${OWNER_REPO}.git")"
-    _ok "GIT_URL already has 'x-access-token:<token>@github.com' auth — auto-normalized to canonical form, skipping wizard."
-    return 0
+    TOKEN="$IN_URL_TOKEN"
+    GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
+    printf "\n"
+    _info "GIT_URL already contains x-access-token auth — running one probe to verify token is NOT expired/revoked before trusting it."
+    local prc0=0 hc0="" log0=""
+    _run_auth_probe prc0 log0 hc0
+    if [ "$prc0" -eq 0 ] && [ -n "$log0" ]; then
+      _ok "Saved token PROBE OK (git ls-remote returned ${hc0} branches). Auto-normalized + trusting."
+      # Verified OK → (re)write token file (in case it's missing / stale chmod on disk)
+      _save_github_token
+      return 0
+    fi
+    _warn "Saved token inside GIT_URL FAILED probe (rc=${prc0}). Token likely expired / revoked. Dropping into wizard to get a NEW one."
+    IN_URL_TOKEN=""; TOKEN=""
+    GIT_URL="$(_normalize_github_url "https://github.com/${OWNER_REPO}.git")"
   fi
 
-  printf "\n\033[1;96m[GITHUB PRIVATE-REPO AUTH — SCALABLE MULTI-SERVER]\033[0m\n"
-  printf "  Repository:          https://github.com/%s  (PRIVATE repo on your account: owner '%s')\n" "$OWNER_REPO" "${OWNER_REPO%%/*}"
-  printf "  Deploy pattern:      Many servers, different locations, different times (your case)\n"
-  printf "  GitHub auth method:  Fine-Grained Personal Access Token (SINGLE token reused on EVERY server) — 100%% official, documented, always supported.\n"
-  printf "  Why not Deploy Key?  Each GitHub Deploy Key can only be attached to ONE repo once, and CANNOT be reused across N servers.\n"
-  printf "                       That means 10 servers = 10 manual 'paste pubkey' operations. NOT for your multi-server pattern.\n"
-  printf "  Why not Classic PAT? Classic 'repo' scope grants READ+WRITE to ALL private repos in your account. Overly broad on any multi-tenant server.\n\n"
+  # ── Step 5: Wizard banner + step-by-step ──────────────────────────────────
+  printf "\n\033[1;96m[GITHUB PRIVATE-REPO AUTH — FINE-GRAINED PAT WIZARD]\033[0m\n"
+  printf "  Repo:                https://github.com/%s  (PRIVATE repo on your account, owner '%s')\n" "$OWNER_REPO" "$GIT_OWNER"
+  printf "  Pattern:             SINGLE token reused on EVERY deployment server (paste the SAME token on N servers)\n"
+  printf "  Official method:     Fine-Grained Personal Access Token (beta tokens page) — always supported by GitHub\n"
+  printf "  Why not Deploy Key?  1 deploy key = 1 repo, cannot be reused across N servers → N manual key-copy steps.\n"
+  printf "  Why not Classic PAT? Classic 'repo' scope grants R/W to ALL private repos in your account (overly broad).\n"
+  printf "  Why not SSH keys?    Requires per-server keygen + copy-paste of N pubkeys to GitHub. Fine-Grained PAT = paste 1 value.\n\n"
+  printf "  8-step guide to generate the one reusable token NOW (open in a browser):\n"
+  printf "    1) https://github.com/settings/tokens?type=beta   (Fine-grained tokens page, NOT classic)\n"
+  printf "    2) Generate new token\n"
+  printf "    3) Name: rasyatone-app-deploy     (Expire 90 days; rotate as recommended by GitHub)\n"
+  printf "    4) Resource owner: %s   (must be the account that owns the repo)\n" "$GIT_OWNER"
+  printf "    5) Repository access: ONLY SELECT REPOSITORIES  →  pick exactly:  %s\n" "$OWNER_REPO"
+  printf "    6) Repository permissions  →  Contents = Read-only   (all others default 'No access')\n"
+  printf "    7) Generate token at the bottom\n"
+  printf "    8) COPY IT NOW. Starts with 'github_pat_' or 'ghs_'. Shown exactly once.\n\n"
 
-  # Reuse prior token if present and auth-valid in probe (so re-running Option 4 over and over doesn't force re-paste).
-  local GIT_TOKEN_FILE="/etc/rasyatone/static/git_token.env"
-  local EXISTING_TOKEN=""
-  if [ -f "$GIT_TOKEN_FILE" ]; then EXISTING_TOKEN=$(. "$GIT_TOKEN_FILE" 2>/dev/null && printf '%s' "${GITHUB_TOKEN:-}"); fi
-
-  printf "  Step-by-step to generate your one reusable token NOW (do this in a browser):\n"
-  printf "    1) Open:  https://github.com/settings/tokens?type=beta  (Fine-grained tokens page)\n"
-  printf "    2) Click  Generate new token.\n"
-  printf "    3) Token name:  rasyatone-app-deploy  (expire in 90 days; GitHub recommends rotating)\n"
-  printf "    4) Resource owner:  %s  (you)\n" "${OWNER_REPO%%/*}"
-  printf "    5) Repository access:  ONLY SELECT REPOSITORIES  — pick exactly:  %s\n" "$OWNER_REPO"
-  printf "    6) Permissions  ->  Repository permissions  ->  Contents:  Access = Read-only.\n"
-  printf "       (All other permissions keep default 'No access' — clone only needs Contents:Read)\n"
-  printf "    7) Click  Generate token  at the bottom.\n"
-  printf "    8) COPY THE TOKEN NOW (starts with 'github_pat_...' or 'ghs_...'). Shown only once.\n\n"
-
-  local TOKEN=""
+  # ── Step 6: Obtain initial token (reuse-saved prompt if available) ────────
   if [ -n "$EXISTING_TOKEN" ]; then
     local reuse=""
-    reuse=$(prompt_def "Saved token already exists in $GIT_TOKEN_FILE. Reuse existing saved token? [Y/n] (NO = paste a new one)" "Y")
+    reuse=$(prompt_def "Saved token already exists in $GIT_TOKEN_FILE. Reuse it? [Y/n] (No = paste a new one now)" "Y")
     case "$reuse" in
       [Nn]|[Nn][Oo])
-        TOKEN=$(prompt_secret "Paste the Fine-Grained token (github_pat_.../ghs_...) here. Hidden input, echo off")
+        TOKEN="$(_prompt_token "Paste a NEW Fine-Grained token (github_pat_.../ghs_...). Hidden input.")"
         ;;
       *)
         TOKEN="$EXISTING_TOKEN"
-        _ok "Reusing saved Fine-Grained token from $GIT_TOKEN_FILE (token redacted)."
+        _ok "Reusing saved token from $GIT_TOKEN_FILE (display redacted). Will verify via probe next."
         ;;
     esac
   else
-    TOKEN=$(prompt_secret "Paste the Fine-Grained token (github_pat_.../ghs_...) here. Hidden input, echo off. You will paste the SAME exact token on EVERY future deployment server.")
+    TOKEN="$(_prompt_token "Paste the Fine-Grained token (github_pat_.../ghs_...) here. Hidden input. You will paste the EXACT SAME token on EVERY future deployment server.")"
   fi
-  [ -z "$TOKEN" ] && _die "GitHub Fine-Grained token cannot be empty."
 
-  # Canonical GitHub HTTPS token auth. The username is literally "x-access-token" —
-  # this is the GitHub-documented canonical username for token auth, works with SSO/SAML orgs, never conflicts.
-  # Doc reference https://docs.github.com/en/rest/overview/authenticating-to-the-rest-api#authenticating-with-a-personal-access-token
-  # _normalize_github_url acts as a final safety net: strips any accidental .git.git + appends exactly one .git.
-  local FINAL_GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
-  GIT_URL="$FINAL_GIT_URL"
-
-  # Persist token for future runs/update scripts. chmod 600 = owner root only; never readable by any other account.
-  sudo mkdir -p "$(dirname "$GIT_TOKEN_FILE")"
-  {
-    echo "# RaSYaTone GitHub token — single Fine-Grained PAT reused across all deployment servers."
-    echo "# Written by install.sh github_auth_private_repo()."
-    echo "# Rotation: re-generate in GitHub UI when it expires, re-run Option 4, paste new token when prompted."
-    echo "# SENSITIVE: DO NOT commit this file. Chmod on disk: 600 root-only."
-    printf 'GITHUB_TOKEN=%s\n' "$TOKEN"
-  } | sudo tee "$GIT_TOKEN_FILE" >/dev/null
-  sudo chmod 0600 "$GIT_TOKEN_FILE"
-  sudo chown 0:0 "$GIT_TOKEN_FILE"
-  _ok "Saved Fine-Grained token to $GIT_TOKEN_FILE (chmod 600, owner root)."
-  printf "  Final clone URL shown with token REDACTED for terminal display:\n"
+  # Build canonical URL + save token file only AFTER probe passes, not before
+  GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
+  printf "  Final clone URL (token REDACTED for display):\n"
   printf "    %s\n" "$(printf '%s' "$GIT_URL" | sed -E 's|(https://x-access-token:)[^@]+(@github\.com/)|\1********\2|')"
 
-  # =============== PRE-CLONE AUTH PROBE (FAIL-FAST RECURSIVE RETRY) ===============
-  # This line will NOT allow the script to proceed to a git clone that will definitely die
-  # with "Permission denied (publickey)" or "Invalid username or token". We retry forever.
-  local PROBE_LOG="/tmp/rasyatone_git_ls_remote_probe.log"
+  # ── Step 7: Probe + Retry loop (FAIL FAST. Writes token AFTER success.) ──
+  local PROBE_LOG="/tmp/rasyatone_probe_$$.log"
   local SKIP_PROBE_NEXT="0"
   while :; do
-    local prc=0
+    local prc=0 log="" hc="0"
     if [ "$SKIP_PROBE_NEXT" = "1" ]; then
-      SKIP_PROBE_NEXT="0"
-      prc=1
-      : >"$PROBE_LOG" 2>/dev/null || true
-      _warn "Skipping redundant probe (user entered empty token on the last retry — showing choice menu directly)."
+      SKIP_PROBE_NEXT="0"; prc=1; log=""
+      _warn "Skipping redundant probe (returning to menu after empty-token input)."
     else
-      printf "\n\033[1;96m[GITHUB AUTH PROBE]\033[0m  Running: git ls-remote --heads <authed URL>  (validates token works for private repo before spending time cloning)\n"
-      git ls-remote --heads "$GIT_URL" >"$PROBE_LOG" 2>&1 || prc=$?
+      printf "\n\033[1;96m[GITHUB AUTH PROBE]\033[0m  timeout 15 git ls-remote --heads <token-authed URL>  (fail-fast: catch bad tokens NOW)\n"
+      _run_auth_probe prc log hc
+      # Stash full log in file for tail display on failure
+      printf '%s\n' "$log" >"$PROBE_LOG" 2>/dev/null || true
     fi
-    if [ "$prc" -eq 0 ] && [ -s "$PROBE_LOG" ]; then
-      local hc
-      hc=$(wc -l <"$PROBE_LOG" 2>/dev/null | tr -d ' ' 2>/dev/null || echo "0")
-      [ -n "${hc:-}" ] || hc="0"
-      _ok "Auth probe OK — private repo '${OWNER_REPO}' is reachable with this token (git ls-remote returned ${hc} branches). Clone will proceed."
+
+    # Success branch: verified OK → write token file once, return
+    if [ "$prc" -eq 0 ] && [ -n "$log" ]; then
+      hc="${hc:-0}"
+      [ "${hc}" -ge 0 ] 2>/dev/null || hc=0
+      _ok "Auth probe OK: repo '${OWNER_REPO}' reachable (${hc} branch(es) listed). Token validated."
+      _save_github_token
+      _ok "Token persisted to $GIT_TOKEN_FILE (chmod 600, owner=root)."
       rm -f "$PROBE_LOG"
       return 0
     fi
-    # Probe failed. Diagnose + re-prompt.
-    if [ "$prc" -ne 0 ] || [ ! -s "$PROBE_LOG" ]; then
-      _warn "Auth probe FAILED (rc=$prc) — token cannot read private repo. Common causes (fix BEFORE retrying):"
-      printf "    1) Token pasted with leading/trailing whitespace (copy/paste glitch)? Re-paste cleanly.\n"
-      printf "    2) Wrong token type used? MUST be Fine-Grained (type=beta URL above), NOT classic 'Tokens (classic)'.\n"
-      printf "    3) Repository access NOT set to 'Only select repositories -> %s'?\n" "$OWNER_REPO"
-      printf "    4) Contents permission NOT Read-only?\n"
-      printf "    5) Token already expired (you set 7 day expire and it's day 8)?\n\n"
-      printf "  Last 15 lines of the git probe error:\n"
+
+    # Failure branch: diagnose + choice menu
+    if [ "$prc" -ne 0 ] || [ -z "$log" ]; then
+      _warn "Auth probe FAILED (rc=${prc}). Common causes to check BEFORE retrying:"
+      printf "    1) Whitespace at paste edges? Re-paste cleanly (triple-click then Ctrl-Shift-C in terminals often works cleanest).\n"
+      printf "    2) Wrong token TYPE? MUST be Fine-Grained (page URL ends with type=beta). Classic PATs work but the repo selection logic differs.\n"
+      printf "    3) Repository access = Only select repositories → %s selected?\n" "$OWNER_REPO"
+      printf "    4) Permissions → Repository permissions → Contents must be Read-only (No access means clone fails).\n"
+      printf "    5) Token already expired? You set a 7-day expiry and today is day 8.\n"
+      printf "    6) SSO/SAML org? Corporate SSO org tokens require 'Configure SSO' click on the token.\n\n"
+      printf "  Last 15 lines of probe output:\n"
       tail -n 15 "$PROBE_LOG" 2>/dev/null | sed 's/^/    | /' || true
     fi
+
     local retry=""
-    printf "\n\033[1mProbe failed — choices:\033[0m\n"
-    printf "  [1] Paste NEW token and try again   (default)\n"
-    printf "  [C] Continue anyway   (RISKY: git clone will almost certainly fail)\n"
-    printf "  [A] Abort installer now\n"
+    printf "\n\033[1mProbe FAILED — choose action:\033[0m\n"
+    printf "  [1] Paste NEW token     (default)\n"
+    printf "  [C] Continue anyway     (NOT RECOMMENDED — git clone will almost certainly fail)\n"
+    printf "  [A] Abort installer     (exit to shell)\n"
     retry=$(prompt_def "Your choice? [1]" "1")
     case "$retry" in
       [Cc]|[Cc][Oo][Nn][Tt][Ii][Nn][Uu][Ee])
-        _warn "Continuing anyway; we warned you."
+        _warn "Continuing past failed probe — YOU WERE WARNED. Token NOT persisted to token file so next rerun re-prompts cleanly."
         rm -f "$PROBE_LOG"
         return 0
         ;;
       [Aa]|[Aa][Bb][Oo][Rr][Tt])
         rm -f "$PROBE_LOG"
-        _die "Aborted by user after GitHub Fine-Grained PAT auth probe repeatedly failed."
+        _die "Aborted by user after repeated GitHub Fine-Grained PAT auth probe failures."
         ;;
       *)
-        # Default: prompt for a NEW token, rewrite GIT_URL, keep looping.
-        local new_token=""
-        new_token=$(prompt_secret "Paste a NEW valid Fine-Grained token (github_pat_/ghs_...). Hidden input.")
-        if [ -z "${new_token:-}" ]; then
-          _warn "Empty token entered — skipping probe and returning to choice menu."
+        # [1] default: get a new token + rebuild URL + loop back to probe
+        local new_tok=""
+        new_tok="$(_prompt_token "Paste NEW valid Fine-Grained token (github_pat_/ghs_...). Hidden input.")"
+        if [ -z "${new_tok:-}" ]; then
+          _warn "Empty token entered — skipping network probe, showing menu again."
           SKIP_PROBE_NEXT="1"
           continue
         fi
-        TOKEN="$new_token"
-        FINAL_GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
-        GIT_URL="$FINAL_GIT_URL"
-        sudo mkdir -p "$(dirname "$GIT_TOKEN_FILE")"
-        {
-          echo "# RaSYaTone GitHub token — single Fine-Grained PAT reused across all deployment servers."
-          echo "# Written by install.sh github_auth_private_repo() (retry on prior probe failure)."
-          printf 'GITHUB_TOKEN=%s\n' "$TOKEN"
-        } | sudo tee "$GIT_TOKEN_FILE" >/dev/null
-        sudo chmod 0600 "$GIT_TOKEN_FILE"
-        sudo chown 0:0 "$GIT_TOKEN_FILE"
+        TOKEN="$new_tok"
+        GIT_URL="$(_normalize_github_url "https://x-access-token:${TOKEN}@github.com/${OWNER_REPO}.git")"
+        printf "  Updated clone URL (token REDACTED):\n    %s\n" "$(printf '%s' "$GIT_URL" | sed -E 's|(https://x-access-token:)[^@]+(@github\.com/)|\1********\2|')"
+        # Fall through to top of while; next iteration probes the NEW token
         ;;
     esac
   done
