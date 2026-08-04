@@ -108,14 +108,21 @@ _py_version_ok() {
   return 1
 }
 
+# Maximum Python minor version to prefer by default. Python 3.13+ has too many
+# packages (numpy 1.26.x, pandas 2.1.x, psycopg 3.x) with requires-python < 3.13
+# so pip resolve fails on servers with 3.13 installed. 3.11/3.12 are the sweet
+# spot: every Django/numpy/psycopg wheel is built, PEP 668 is honored, stable.
+MAX_PREFERRED_PYTHON_MINOR=12
+
 # Scans for ANY python3* binary on PATH with version >= 3.10 (Django 5 floor).
-# Prefers highest available minor (e.g. 3.12 over 3.11 over 3.10). Sets global
-# PYTHON_BIN to the absolute path of the chosen binary (fallback "python3" if
-# nothing else found — caller must re-check and install if needed).
+# PREFERENCE ORDER: pick highest minor <= MAX_PREFERRED_PYTHON_MINOR (3.12 by
+# default) first; if only 3.13+ are available fall back to newest reluctantly
+# with a warning (user may need to relax constraints or build packages from sdist).
 _detect_compatible_python3() {
   PYTHON_BIN=""
   local cand best_bin="" best_maj=0 best_min=0 py_ver py_maj py_min
-  for cand in python3.13 python3.12 python3.11 python3.10 python3; do
+  # Pass 1: only python3.12, python3.11, python3.10 (sweet spot, no wheel problems)
+  for cand in python3.12 python3.11 python3.10; do
     command -v "$cand" >/dev/null 2>&1 || continue
     if _py_version_ok "$(command -v "$cand")"; then
       py_ver=$("$cand" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
@@ -127,6 +134,24 @@ _detect_compatible_python3() {
       fi
     fi
   done
+  # Pass 2: if no preferred-range Python found (only 3.13+ on the box), reluctantly accept it.
+  if [ -z "$best_bin" ]; then
+    for cand in python3.13 python3.14 python3; do
+      command -v "$cand" >/dev/null 2>&1 || continue
+      if _py_version_ok "$(command -v "$cand")"; then
+        py_ver=$("$cand" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
+        read -r py_maj py_min <<<"$py_ver"
+        if [ -z "$best_bin" ] || { [ "$py_maj" -gt "$best_maj" ] || { [ "$py_maj" -eq "$best_maj" ] && [ "$py_min" -gt "$best_min" ]; }; }; then
+          best_bin="$(command -v "$cand")"
+          best_maj="$py_maj"
+          best_min="$py_min"
+        fi
+      fi
+    done
+    if [ -n "$best_bin" ]; then
+      _warn "No Python 3.10/3.11/3.12 found — falling back to python ${best_maj}.${best_min}. WARNING: many common Django deps (numpy 1.26.x, pandas 2.x) still require-python < 3.13. pip install -r requirements.txt may fail with 'Ignored the following versions that require a different python version'. If that happens: apt install python3.11 python3.11-venv python3.11-pip then rerun Option 4."
+    fi
+  fi
   if [ -n "$best_bin" ]; then
     PYTHON_BIN="$best_bin"
     _info "Selected compatible Python: ${PYTHON_BIN} (v${best_maj}.${best_min} >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR})"
@@ -1411,7 +1436,146 @@ Django 5 (in your repo) REFUSES to install on Python < 3.10. What to do:
   _py_version_ok "$active_py" || _die "Activated venv python ($active_py, version=$($active_py -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null)) is TOO OLD for Django 5 (< ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}). This means venv was created with the WRONG python binary earlier. Wipe $APP_DIR/.venv and rerun Option 4 — this time it will use PYTHON_BIN=${PYTHON_BIN}."
   python -m pip install --quiet --upgrade pip setuptools wheel 2>&1 | tail -n 3 || _die "pip upgrade failed — venv Python is broken or no internet. Try: $active_py -m ensurepip --upgrade"
   if [ -f "$APP_DIR/requirements.txt" ]; then
-    python -m pip install --quiet -r "$APP_DIR/requirements.txt" 2>&1 | tail -n 20 || _die "pip install -r requirements.txt FAILED. Check the output above — common fixes: (a) install libpq-dev for psycopg2/psycopg build, (b) increase RAM if OOM killed during compile, (c) use psycopg[binary] instead of psycopg2."
+    # Helper: list of Windows-only PyPI package names (platform_system == "Windows"
+    # wheels only — they simply don't exist on Linux so 'pip install' aborts with
+    # 'No matching distribution found' for the whole requirements.txt). These are
+    # almost always committed by developers who generated requirements.txt on
+    # their Windows laptop via 'pip freeze' and never noticed the cross-platform
+    # pin. For each one we strip the full line from requirements.txt to build a
+    # Linux-safe filtered copy; we also save a .bak of the original and WARN.
+    # Usage: _filter_linux_requirements <src_requirements.txt> <dst_filtered.txt>
+    # Returns 0 (always), prints a list of skipped lines to stdout (for _info/_warn).
+    _filter_linux_requirements() {
+      local src="$1" dst="$2" skipped="" pkg="" line="" stripped=""
+      local -a WIN_ONLY_PKGS=(
+        pywin32 pypiwin32 "pywin32-ctypes"
+        windows-curses win-unicode-console
+        colorama wmi pywinauto pyad
+        comtypes pyttsx3 pywinrm win32core win32ctypes
+      )
+      : >"$dst"
+      while IFS= read -r line || [ -n "$line" ]; do
+        stripped="$(printf '%s' "$line" | sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+        # Skip blank lines and pure comments (preserve them verbatim)
+        if [ -z "$stripped" ] || [[ "$line" == \#* ]]; then
+          printf '%s\n' "$line" >>"$dst"
+          continue
+        fi
+        # Check if this requirement starts with any of the Windows-only package names
+        local matched=0
+        for pkg in "${WIN_ONLY_PKGS[@]}"; do
+          # Match case-insensitively, exact prefix: "pkg", "pkg==", "pkg>=", "pkg~=", "pkg<=", "pkg[extras]"
+          if printf '%s' "$stripped" | grep -Ei "^${pkg}([\[\=<>~!\ ]|$)" >/dev/null 2>&1; then
+            matched=1
+            break
+          fi
+        done
+        if [ "$matched" -eq 1 ]; then
+          if [ -z "$skipped" ]; then skipped="$line"; else skipped="${skipped}|${line}"; fi
+        else
+          printf '%s\n' "$line" >>"$dst"
+        fi
+      done <"$src"
+      printf '%s' "$skipped"
+    }
+
+    REQ_SRC="$APP_DIR/requirements.txt"
+    REQ_FILTERED="$APP_DIR/requirements.linux-filtered.txt"
+    REQ_BAK="$APP_DIR/requirements.txt.bak"
+    local skipped_lines="" dropped_count=0
+    if ! cp -f "$REQ_SRC" "$REQ_BAK" 2>/dev/null; then
+      _warn "Could not back up requirements.txt to $REQ_BAK (permissions?). Continuing without backup."
+      REQ_BAK=""
+    fi
+    skipped_lines="$(_filter_linux_requirements "$REQ_SRC" "$REQ_FILTERED")"
+    if [ -n "$skipped_lines" ]; then
+      local IFS_SAVE="$IFS"
+      IFS='|'
+      local -a drops=( $skipped_lines )
+      IFS="$IFS_SAVE"
+      dropped_count="${#drops[@]}"
+      _warn "requirements.txt contains ${dropped_count} WINDOWS-ONLY pinned packages that have NO Linux wheels. Removed them from a filtered copy to avoid 'No matching distribution found' abort. If these deps are genuinely required on Linux, remove them from requirements.txt in your repo.\n    Dropped lines:"
+      local dl
+      for dl in "${drops[@]}"; do
+        printf "      - %s\n" "$dl" >&2
+      done
+      _info "Original backed up to: ${REQ_BAK:-<backup unavailable>}  Filtered copy (will be used): $REQ_FILTERED"
+    fi
+
+    local pip_log="/tmp/rasyatone_pip_$$.log"
+    : >"$pip_log"
+    set +e
+    if [ "$dropped_count" -gt 0 ]; then
+      python -m pip install -r "$REQ_FILTERED" >"$pip_log" 2>&1
+    else
+      python -m pip install -r "$REQ_SRC"    >"$pip_log" 2>&1
+    fi
+    local prc=$?
+    set -e
+    if [ "$prc" -ne 0 ]; then
+      # Save full pip log before trimming to 80 lines — user can read it later.
+      local save_log="/tmp/rasyatone_pip_failure_$(date +%Y%m%d_%H%M%S).log"
+      cp -f "$pip_log" "$save_log" 2>/dev/null || true
+      _nok "pip install FAILED (rc=$prc). Full pip log saved to: $save_log"
+      echo "  --- pip output (last 80 lines) ---" >&2
+      tail -n 80 "$pip_log" >&2 || true
+      echo "  --- end pip output ---" >&2
+
+      # ====== CATEGORIZED FAILURE DIAGNOSIS ==========================================
+      # Scans the full pip log for known error signatures and prints ONLY the
+      # relevant remediation bullets (not a generic catch-all that misses pywin32).
+      local log_lower=""
+      log_lower="$(tr '[:upper:]' '[:lower:]' < "$pip_log")"
+      local bullets=""
+      if printf '%s' "$log_lower" | grep -Eq "no matching distribution found.*pywin32|could not find a version.*pywin32|pywin32.*from versions: none"; then
+        bullets="${bullets}|★ WINDOWS-ONLY PACKAGE DETECTED (pywin32==311 / etc): 'pywin32' is Windows-only — it has NO wheels for Linux. The developer who generated requirements.txt did so on their Windows laptop via 'pip freeze' without filtering cross-platform pins. Fix the requirements.txt in your repo by removing the pywin32 / pypiwin32 / pywin32-ctypes lines entirely, or add a platform marker: pywin32==311 ; platform_system == 'Windows'."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "ignored the following versions that require a different python version|requires-python.*is not compatible"; then
+        bullets="${bullets}|★ PYTHON VERSION TOO NEW / TOO OLD (requires-python mismatch). The locked-in venv python is: $($active_py -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null). Many Django deps (numpy 1.26.x, pandas 2.x) still require-python < 3.13 and have no 3.13 wheels. Fix: install python3.11 system-wide (apt install python3.11 python3.11-venv python3.11-pip), then rerun Option 4 — the installer will prefer python3.11/3.12 over 3.13 automatically."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "failed building wheel for psycopg2|fatal error.*libpq-fe\.h|pg_config executable not found|error: command 'x86_64-linux-gnu-gcc'|failed building wheel for psycopg"; then
+        bullets="${bullets}|★ PSYCOPG/PSYCOPG2 BUILD FAILURE. libpq-dev / postgresql-server-dev-* or gcc/build-essential missing from this server. Run: apt install -y build-essential libpq-dev postgresql-server-dev-all. Or in requirements.txt use 'psycopg[binary]' instead of 'psycopg2' to skip compilation."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "fatal error.*python\.h: no such file or directory|python\.h: no such file or directory"; then
+        bullets="${bullets}|★ PYTHON HEADERS MISSING. You are compiling a C extension but the Python '-devel' package is not installed for this exact Python binary. Install: apt install ${PYTHON_BIN##*/}-dev (or equivalent dnf install python3.11-devel / apk add python3-dev)."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "no matching distribution found"; then
+        # Generic "no matching" — only show if more specific bullets didn't fire.
+        if [ -z "$bullets" ]; then
+          bullets="${bullets}|★ UNKNOWN 'No matching distribution found'. Check: (1) private package index misconfigured, (2) package was renamed/removed from PyPI, (3) package is Windows/macOS-only. Run: $active_py -m pip install --verbose -r $REQ_SRC > /tmp/verbose.log 2>&1 then read it."
+        fi
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "killed|out of memory|cannot allocate memory"; then
+        bullets="${bullets}|★ OOM KILLED during compile. This server has too little RAM. Fixes: (a) add swap: dd if=/dev/zero of=/swapfile bs=1M count=2048 && mkswap /swapfile && swapon /swapfile, or (b) install binary wheels — change requirements.txt to use psycopg[binary] instead of psycopg2, numpy binary wheels only (pip install --only-binary=:all: -r requirements.txt)."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "could not fetch url|connection error|timed out|network is unreachable|name or service not known"; then
+        bullets="${bullets}|★ NETWORK FAILURE reaching PyPI. This server cannot reach pypi.org. Fix: verify DNS (resolvectl query pypi.org), check HTTP_PROXY/HTTPS_PROXY env vars, or configure a private PyPI mirror via pip config set global.index-url."
+      fi
+      if [ -z "$bullets" ]; then
+        bullets="|★ NO CATEGORIZATION MATCHED (unknown pip failure). Full verbose pip log saved at: $save_log — paste its content (or search for first 'ERROR:') to diagnose."
+      fi
+      printf "\n  === DIAGNOSIS (categorized fixes based on actual pip log) ===\n" >&2
+      local IFS_SAVE2="$IFS"
+      IFS='|'
+      local -a b_arr=( $bullets )
+      IFS="$IFS_SAVE2"
+      local b
+      for b in "${b_arr[@]}"; do
+        [ -z "$b" ] && continue
+        printf "  %s\n" "$b" >&2
+      done
+      printf "  ===============================================================\n" >&2
+      # Clean up the filtered-temp file we created (or leave it if user wants it)
+      if [ -n "$REQ_FILTERED" ] && [ -f "$REQ_FILTERED" ] && [ "$dropped_count" -gt 0 ]; then
+        _info "Filtered requirements (Windows deps removed) left on disk: $REQ_FILTERED — you can retry pip install on it manually: pip install -r $REQ_FILTERED"
+      fi
+      _die "pip install requirements.txt FAILED. Read diagnosis bullets above carefully, fix the root cause, then rerun Option 4."
+    else
+      _ok "pip install requirements.txt OK"
+      if [ "$dropped_count" -gt 0 ]; then
+        _warn "Remember: we DROPPED ${dropped_count} Windows-only packages before pip install. If your Django code actually imports pywin32 at runtime on Linux it WILL fail at import-time — those packages only exist on Windows."
+      fi
+    fi
   else
     _warn "No $APP_DIR/requirements.txt found — skipping pip install -r (install manually)"
   fi
