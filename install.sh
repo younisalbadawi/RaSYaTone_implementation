@@ -59,6 +59,7 @@ MIN_PYTHON_MINOR=10
 _ok()   { printf "  \033[92m[ OK ]\033[0m %s\n" "$*"; }
 _nok()  { printf "  \033[91m[FAIL]\033[0m %s\n" "$*"; return 1; }
 _warn() { printf "  \033[93m[WARN]\033[0m %s\n" "$*"; }
+_info() { local fmt="$1"; shift; printf "  \033[96m[INFO]\033[0m ${fmt}\n" "$@"; }
 _die()  { printf "\n\033[91mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 _section(){ printf "\n\033[1;97m=== %s ===\033[0m\n" "$*"; }
 
