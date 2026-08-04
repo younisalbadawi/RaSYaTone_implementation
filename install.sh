@@ -254,6 +254,136 @@ prompt_yn() {
   if confirm_yn "$@"; then printf "y"; else printf "n"; fi
 }
 
+# ----- Spinner / progress helpers -------------------------------------------
+# These wrap long-running silent operations so the user sees ACTIVITY instead
+# of a blinking cursor for 60-90 seconds. Works for: apt install / pip install /
+# git clone / manage.py migrate / collectstatic / initdb / psql big scripts.
+#
+# Design rules:
+#   * Cursor is hidden during spin, ALWAYS restored via trap on EXIT/INT/TERM
+#     (Ctrl-C during a spinner would otherwise leave user with invisible cursor).
+#   * TTY detection: when stdout is not a tty (CI, script | tee log), spinner
+#     is disabled entirely, we just print the label + run command in foreground
+#     normally (no CR rewrite, no braille — CI logs stay parseable).
+#   * Command stdout+stderr captured to /tmp/rasyatone_spin_<pid>_<label>.log.
+#     On RC=0 → [OK] label (elapsed). On RC≠0 → [FAIL] label + tail -n30 of log
+#     printed IMMEDIATELY so user can see the error without opening a file.
+#   * NEVER swallows exit code (critical under `set -euo pipefail`): caller's
+#     RC == subprocess RC, exactly as if you ran it without the wrapper.
+_SPINNER_TRAP_SET=0
+_spinner_setup_trap() {
+  if [ "$_SPINNER_TRAP_SET" = "1" ]; then return 0; fi
+  _SPINNER_TRAP_SET=1
+  # cursor_normal — run on EXIT / INT / TERM to re-show cursor + newline on abort.
+  # Save original traps so we don't clobber future EXIT handlers (chain via
+  # explicit list — POSIX shell doesn't stack traps natively, but this is the
+  # only EXIT trap we use besides cleanup, so it's fine).
+  _spinner_cnorm() {
+    printf '\033[?25h' >/dev/tty 2>/dev/null || printf '\r' >&2
+  }
+  trap '_spinner_cnorm' EXIT INT TERM HUP
+}
+
+# Elapsed-seconds → human "0.4s / 15s / 2m 05s / 1h 07m"
+_human_elapsed() {
+  local secs=$1
+  if [ "$secs" -lt 60 ]; then printf "%ds" "$secs"; return 0; fi
+  if [ "$secs" -lt 3600 ]; then printf "%dm %02ds" $((secs/60)) $((secs%60)); return 0; fi
+  printf "%dh %02dm" $((secs/3600)) $(((secs%3600)/60))
+}
+
+# Usage: _run_with_spinner "Label" command [args...]
+#   Label — short single-line description shown next to spinner (no newlines!).
+#   command + args — the actual long-running command. Arguments are passed
+#   VERBATIM (eval-free) via quoted array exec, so pipelines/redirects are NOT
+#   supported inside the command itself; if you need redirection, wrap it in a
+#   small helper function and pass the helper name as the command.
+_run_with_spinner() {
+  local label="$1"; shift
+  local logfile="/tmp/rasyatone_spin_$$_$(printf '%s' "$label" | tr -c 'A-Za-z0-9_' '_' | cut -c1-40).log"
+  : > "$logfile" 2>/dev/null || true
+  _spinner_setup_trap
+  local tty_on=1
+  [ -t 1 ] 2>/dev/null || tty_on=0
+
+  # === NON-TTY MODE (CI / piped logs): no spinner, just run + echo result.
+  if [ "$tty_on" -eq 0 ]; then
+    local st et secs rc
+    st=$(date +%s 2>/dev/null || echo 0)
+    "$@" >"$logfile" 2>&1
+    rc=$?
+    et=$(date +%s 2>/dev/null || echo 0)
+    secs=$((et - st)); [ "$secs" -lt 0 ] && secs=0
+    if [ "$rc" -eq 0 ]; then
+      _ok "${label} (elapsed $(_human_elapsed "$secs"))"
+    else
+      _nok "${label} FAILED (rc=${rc}, elapsed $(_human_elapsed "$secs")). Last 30 lines of ${logfile}:"
+      tail -n 30 "$logfile" 2>/dev/null | sed 's/^/    | /' || true
+    fi
+    return "$rc"
+  fi
+
+  # === TTY MODE (interactive): run command in background, spin in foreground.
+  # UTF-8 braille spinner (modern terminals); fallback ASCII spinner if LANG
+  # doesn't look UTF-8 capable (LC_ALL=C users on minimal containers).
+  local frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  case "${LC_ALL:-${LANG:-C}}" in
+    *UTF*|*utf-8*|*utf8*) ;;
+    *) frames="|/-\\" ;;
+  esac
+  local nframes=${#frames}
+  # Hide cursor at start.
+  printf '\033[?25l' >/dev/tty 2>/dev/null || true
+
+  # Spawn long command in subshell (captured to logfile) in background.
+  ( "$@" ) >"$logfile" 2>&1 &
+  local cmd_pid=$!
+  local st et secs rc idx=0 ch out line
+  st=$(date +%s 2>/dev/null || echo 0)
+
+  # Wait loop: poll every 0.15s, rewrite same line with spinner + label + elapsed.
+  # Use `kill -0 $pid` (POSIX) instead of wait (so we can rewrite line repeatedly).
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    ch="${frames:idx % nframes:1}"
+    # Fallback for shells where substring with arithmetic misbehaves — pick via array-like indexing.
+    [ -z "$ch" ] && ch="$(printf '%s' "$frames" | cut -c$(( (idx % nframes) + 1)) )"
+    et=$(date +%s 2>/dev/null || echo "$st")
+    secs=$((et - st)); [ "$secs" -lt 0 ] && secs=0
+    # Print: '  ⠋ Label ... elapsed Ns'  — then \r to overwrite same line next tick.
+    printf "  \033[96m%s\033[0m %s ... \033[90melapsed %s\033[0m\r" "$ch" "$label" "$(_human_elapsed "$secs")" >&2
+    idx=$((idx + 1))
+    # Sleep portably. `sleep 0.15` works on GNU + busybox sleep from 2017+; fall
+    # back to 1-second sleep if it errors (ultra-minimal containers).
+    sleep 0.15 2>/dev/null || sleep 1
+  done
+
+  wait "$cmd_pid" 2>/dev/null
+  rc=$?
+  et=$(date +%s 2>/dev/null || echo "$st")
+  secs=$((et - st)); [ "$secs" -lt 0 ] && secs=0
+
+  # Clear the spinner line entirely (overwrite with spaces then CR) before
+  # writing the final [OK]/[FAIL] line — avoids residual braille chars left
+  # on-screen when label is shorter than previous (e.g., "apt update" → label).
+  local w
+  w=$(tput cols 2>/dev/null || echo 120)
+  printf "%-${w}s\r" " " >&2
+
+  if [ "$rc" -eq 0 ]; then
+    _ok "${label} (elapsed $(_human_elapsed "$secs"))"
+  else
+    # FAIL: print head banner + tail -n30 of log IMMEDIATELY so user doesn't
+    # have to manually open /tmp/rasyatone_spin_*.log. The `| sed 's/^/    | /'`
+    # prefix makes log lines visually distinct from installer output.
+    _nok "${label} FAILED (rc=${rc}, elapsed $(_human_elapsed "$secs")). Log: ${logfile}. Last 30 lines:"
+    tail -n 30 "$logfile" 2>/dev/null | sed 's/^/    | /' || true
+    printf "    Full log: \033[1m%s\033[0m\n" "$logfile" >&2
+  fi
+  # restore cursor explicitly (trap also fires but belt+braces)
+  printf '\033[?25h' >/dev/tty 2>/dev/null || true
+  return "$rc"
+}
+
 # --- package manager auto-detect --------------------------------------------
 declare -g PM="" PKG_INSTALL="" PKG_UPDATE="" FW_BACKEND="none"
 detect_pm() {
@@ -269,6 +399,16 @@ detect_pm() {
   fi
 }
 
+# --- Package install wrappers (used by _run_with_spinner for multi-word globals)
+# These expand $PKG_UPDATE / $PKG_INSTALL with word-splitting as they were
+# originally designed, so _run_with_spinner (which passes args VERBATIM, no eval)
+# can call a NAME instead of evaluating a big string with embedded word splitting.
+_pkg_update()  { eval "$PKG_UPDATE"; }
+_pkg_install() { if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL $*"; else eval "$PKG_INSTALL $*"; fi; }
+_sudo_pkg_install() { if command -v apt-get >/dev/null 2>&1; then sudo DEBIAN_FRONTEND=noninteractive env DEBIAN_FRONTEND=noninteractive bash -c "eval \$0 \$*" "$PKG_INSTALL" "$@"; else sudo bash -c "eval \$0 \$*" "$PKG_INSTALL" "$@"; fi; }
+_add_deadsnakes_ppa() { sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa; }
+_dnf_enable_py311_module() { sudo dnf module enable -y python3.11; }
+
 # Install Python runtime (>= 3.10 AND <= MAX_ALLOWED_PYTHON_MINOR), plus build
 # essentials (git/libpq-dev/libffi-dev/postgresql-client). Runs from BOTH:
 #   * precheck_app_prereqs() — so "Run prechecks first?" flow won't fail on
@@ -281,50 +421,44 @@ detect_pm() {
 _install_compatible_python_runtime() {
   detect_pm
   load_env_file || true
-  # Run pkg update quietly once (idempotent if mirrors already current)
-  eval "$PKG_UPDATE" >/dev/null 2>&1 || true
+  # Run pkg update once (idempotent) — spinner shows progress during mirror sync.
+  _run_with_spinner "Package manager update (mirror sync)" _pkg_update || true
   case "$PM" in
     apt)
       # apt (Debian/Ubuntu):
-      #   * New: Ubuntu 24.04 may ship python 3.14 if using experimental.
-      #     If deadsnakes is NOT available (e.g. Debian testing) we try standard
-      #     repos first, but must fall back to deadsnakes on older Ubuntu LTS.
-      sudo $PKG_INSTALL software-properties-common ca-certificates >/dev/null 2>&1 || true
-      # If NO acceptable python is present (<3.10 acceptable range OR too new),
-      # explicitly install python3.11 (known-good Django + wheels sweet spot).
+      _run_with_spinner "Install prerequisites (software-properties-common ca-certificates)" _sudo_pkg_install software-properties-common ca-certificates || true
+      # If NO acceptable python is present, explicitly install python3.11.
       if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && { ! _py_version_ok python3.13 || [ "${MAX_ALLOWED_PYTHON_MINOR:-13}" -lt 13 ]; }; then
         if command -v add-apt-repository >/dev/null 2>&1; then
-          sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
-          sudo $PKG_UPDATE >/dev/null 2>&1 || true
+          _run_with_spinner "Add deadsnakes PPA (for python3.11)" _add_deadsnakes_ppa || true
+          _run_with_spinner "Refresh apt index after deadsnakes PPA add" _pkg_update || true
         fi
-        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.11 python3.11-venv python3.11-pip python3.11-dev 2>/dev/null || \
-        sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3.10 python3.10-venv python3.10-pip python3.10-dev 2>/dev/null || true
+        _run_with_spinner "Install python3.11 runtime (venv + pip + dev headers)" _sudo_pkg_install python3.11 python3.11-venv python3.11-pip python3.11-dev || \
+        _run_with_spinner "Fallback: install python3.10 runtime" _sudo_pkg_install python3.10 python3.10-venv python3.10-pip python3.10-dev || true
       fi
-      # Always install the baseline python3 meta-packages (required for symlinks
-      # and distro tooling that expects bare `python3`). NOTE: libffi-dev MUST
-      # be here — cffi / cryptography / bcrypt / PyNaCl ALL require `ffi.h`.
-      sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client
+      # Always install baseline python3 meta-packages + build tools + libpq/libffi-dev + psql client.
+      _run_with_spinner "Install build tools + python3 meta + libpq-dev + libffi-dev + postgresql-client" \
+        _sudo_pkg_install python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client || true
       ;;
     dnf)
       # dnf (RHEL/Fedora/Rocky/Alma):
-      #   * Fedora 40+ ships python 3.14 sometimes. RHEL 8/9 default python3 is
-      #     3.6/3.9 (TOO OLD). Force python3.11 via module / AppStream.
       if ! _py_version_ok python3.11 && ! _py_version_ok python3.10 && ! _py_version_ok python3.12 && { ! _py_version_ok python3.13 || [ "${MAX_ALLOWED_PYTHON_MINOR:-13}" -lt 13 ]; }; then
         if [ -r /etc/redhat-release ] || [ -r /etc/almalinux-release ] || [ -r /etc/rocky-release ] || [ -r /etc/oracle-release ]; then
-          sudo dnf module enable -y python3.11 >/dev/null 2>&1 || true
+          _run_with_spinner "dnf: enable python3.11 module (AppStream)" _dnf_enable_py311_module || true
         fi
-        sudo $PKG_INSTALL python3.11 python3.11-devel python3.11-pip 2>/dev/null || \
-        sudo $PKG_INSTALL python3.10 python3.10-devel python3.10-pip 2>/dev/null || true
+        _run_with_spinner "dnf: install python3.11 runtime (devel + pip)" _sudo_pkg_install python3.11 python3.11-devel python3.11-pip || \
+        _run_with_spinner "Fallback: dnf install python3.10" _sudo_pkg_install python3.10 python3.10-devel python3.10-pip || true
       fi
-      # Baseline: python + build tools + postgresql server/client meta-pkg.
-      # libffi-devel needed for cffi / cryptography / bcrypt builds (ffi.h header).
-      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib 2>/dev/null || \
-      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql
+      # Baseline + build tools. Try with postgresql-contrib first; fall back if not available.
+      _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql + postgresql-contrib" \
+        _sudo_pkg_install python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib || \
+      _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql" \
+        _sudo_pkg_install python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql || true
       ;;
     apk)
-      # Alpine: python3 is kept very current (3.11/3.12) in edge + stable branches.
-      # libffi-dev: ffi.h header for cffi / cryptography / bcrypt sdists.
-      sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client
+      # Alpine: python3 + build tools + dev headers.
+      _run_with_spinner "apk: install python3 + build tools + postgresql-dev + libffi-dev" \
+        _sudo_pkg_install python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client || true
       ;;
   esac
   # Final post-install check: is there now a compatible python?
@@ -649,7 +783,7 @@ precheck_app_prereqs() {
   else _nok "git binary not installed" || ((fail++)); fi
   if [ -z "${GIT_URL:-}" ]; then printf "\n"; GIT_URL=$(prompt_def "Git repository URL (to verify reachability)" "") || true; fi
   if [ -n "$GIT_URL" ] && command -v git >/dev/null 2>&1; then
-    if GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$GIT_URL" >/dev/null 2>&1; then
+    if _run_with_spinner "Git ls-remote reachability probe (${GIT_URL:0:60}${GIT_URL:60:+...})" bash -c 'GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$1" >/dev/null 2>&1' _ "$GIT_URL"; then
       _ok "Git URL reachable (ls-remote returned heads)"
     else _nok "Git URL '$GIT_URL' not reachable (bad URL? need SSH key? private repo auth?)" || ((fail++)); fi
   else _warn "Skipping git URL probe (no URL / no git)"; fi
@@ -685,14 +819,16 @@ precheck_app_prereqs() {
 
   # 10. DB host:port TCP reachable
   if [ "$vars_ok" = "1" ] && command -v nc >/dev/null 2>&1; then
-    if nc -z -w3 "$DB_HOST" "$DB_PORT" 2>/dev/null; then _ok "DB host $DB_HOST:$DB_PORT TCP reachable (nc -z)"
+    if _run_with_spinner "nc TCP probe $DB_HOST:$DB_PORT (timeout 3s)" nc -z -w3 "$DB_HOST" "$DB_PORT" 2>/dev/null; then _ok "DB host $DB_HOST:$DB_PORT TCP reachable (nc -z)"
     else _nok "DB host $DB_HOST:$DB_PORT NOT reachable via nc -z -w3 — wrong host? firewall?" || ((fail++)); fi
   elif [ "$vars_ok" = "1" ]; then _warn "nc missing; skipping DB host:port TCP probe"; fi
 
   # 11. full psql SELECT 1
-  local row
+  local row psql_out="/tmp/rasyatone_prechk_psql_$$.out"
   if [ "$vars_ok" = "1" ] && command -v psql >/dev/null 2>&1; then
-    row=$(PGPASSWORD="$DB_PASSWORD" timeout 8 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>/dev/null || true)
+    _run_with_spinner "psql SELECT 1 credential test (${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME})" bash -c 'PGPASSWORD="$1" timeout 8 psql -h "$2" -p "$3" -U "$4" -d "$5" -tAc "SELECT 1" >"$6" 2>&1' _ "$DB_PASSWORD" "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_NAME" "$psql_out"
+    row=$(cat "$psql_out" 2>/dev/null | tr -d '[:space:]' || true)
+    rm -f "$psql_out" 2>/dev/null || true
     if [ "$row" = "1" ]; then _ok "psql SELECT 1 via DB_USER=$DB_USER succeeded"
     else _warn "psql SELECT 1 failed (wrong DB_PASSWORD? DB/user not created yet? try Option 3 first)"; fi
   elif [ "$vars_ok" = "1" ]; then _warn "psql client not installed; skipping full DB credential SELECT 1 validation (will fail at manage.py migrate)"; fi
@@ -781,26 +917,32 @@ install_db() {
   _ok "ALLOW_PG_DBS resolved = ${ALLOW_PG_DBS}  [DEFAULT: ALL; your GUI clients connecting with database='postgres' will work]"
 
   _section "Installing PostgreSQL packages via $PM"
-  eval "$PKG_UPDATE" >/dev/null 2>&1 || true
+  _run_with_spinner "Package manager mirror sync ($PM)" _pkg_update || true
   case "$PM" in
-    apt) sudo $PKG_INSTALL postgresql postgresql-client postgresql-contrib locales ;;
-    dnf) sudo $PKG_INSTALL postgresql-server postgresql-contrib ;;
-    apk) sudo $PKG_INSTALL postgresql postgresql-client postgresql-contrib ;;
+    apt) _run_with_spinner "apt: install postgresql + client + contrib + locales" \
+           _sudo_pkg_install postgresql postgresql-client postgresql-contrib locales ;;
+    dnf) _run_with_spinner "dnf: install postgresql-server + postgresql-contrib" \
+           _sudo_pkg_install postgresql-server postgresql-contrib ;;
+    apk) _run_with_spinner "apk: install postgresql + client + contrib" \
+           _sudo_pkg_install postgresql postgresql-client postgresql-contrib ;;
   esac
+  _ok "PostgreSQL packages installed via $PM"
 
-  # initdb on first install (RHEL-based / Alpine)
+  # initdb on first install (RHEL-based / Alpine) — spinner shown so user sees
+  # activity (initdb can take a few seconds on slow IO / first-boot entropy low)
   if command -v postgresql-setup >/dev/null 2>&1; then
-    sudo postgresql-setup --initdb --unit postgresql 2>/dev/null || true
+    _run_with_spinner "postgresql-setup --initdb (RHEL/Alma/Rocky first-boot init)" bash -c "sudo postgresql-setup --initdb --unit postgresql 2>/dev/null || true" || true
   elif [ "$PM" = "apk" ] && ls -d /var/lib/postgresql/*/data >/dev/null 2>&1; then
     local ddir
     for ddir in /var/lib/postgresql/*/data; do
       if [ -z "$(ls -A "$ddir" 2>/dev/null | head -n1)" ]; then
-        sudo su - postgres -c "initdb -D $ddir" 2>/dev/null || true
+        _run_with_spinner "initdb -D $ddir (Alpine PostgreSQL first-boot data init)" \
+          bash -c "sudo su - postgres -c 'initdb -D \"$ddir\"' 2>/dev/null || true" || true
       fi
     done
   fi
   service_control enable postgresql
-  service_control start postgresql
+  _run_with_spinner "Start PostgreSQL service (postgresql)" service_control start postgresql || true
 
   _section "Creating database + user"
   local esc_pw db_locale="" db_create_flags="" db_exists="" role_exists=""
@@ -843,13 +985,13 @@ install_db() {
     printf "\033[1;93m[DB-STEP 1/6] role does NOT exist -> writing %s (CREATE ROLE standalone, attrs=%s NO DO block)\033[0m\n" "$SQL_ROLE_CREATE" "$ROLE_ATTRS"
     printf 'CREATE ROLE %s %s LOGIN PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$ROLE_ATTRS" "$esc_pw" > "$SQL_ROLE_CREATE"
     printf "  contents of %s:\n" "$SQL_ROLE_CREATE"; sed 's/^/    | /' "$SQL_ROLE_CREATE"
-    sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_CREATE"
+    _run_with_spinner "psql: CREATE ROLE ${DB_USER} (via -f ${SQL_ROLE_CREATE##*/})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_CREATE"
     _ok "Role ${DB_USER} created (attrs=${ROLE_ATTRS:-NONE}, via -f $SQL_ROLE_CREATE)"
   else
     printf "\033[1;93m[DB-STEP 1/6] role exists -> writing %s (ALTER ROLE standalone, attrs=%s NO DO block)\033[0m\n" "$SQL_ROLE_ALTER" "$ROLE_ATTRS"
     printf 'ALTER ROLE %s WITH %s PASSWORD '"'"'%s'"'"';\n' "$DB_USER" "$ROLE_ATTRS" "$esc_pw" > "$SQL_ROLE_ALTER"
     printf "  contents of %s:\n" "$SQL_ROLE_ALTER"; sed 's/^/    | /' "$SQL_ROLE_ALTER"
-    sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_ALTER"
+    _run_with_spinner "psql: ALTER ROLE ${DB_USER} password+attrs (via -f ${SQL_ROLE_ALTER##*/})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_ROLE_ALTER"
     _ok "Role ${DB_USER} existed -> password updated + attrs=${ROLE_ATTRS:-NONE} applied (via -f $SQL_ROLE_ALTER)"
   fi
   # (A2) POST-VERIFY role attributes. Ensure CREATEDB is actually set (if user requested YES) before continuing.
@@ -879,7 +1021,7 @@ install_db() {
     if grep -Eiq 'DO[[:space:]]*\$|BEGIN' "$SQL_DB_CREATE" 2>/dev/null; then
       _die "Refusing to run $SQL_DB_CREATE — grep found DO/BEGIN inside. This MUST never happen for a CREATE DATABASE standalone statement."
     fi
-    sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_DB_CREATE"
+    _run_with_spinner "psql: CREATE DATABASE ${DB_NAME} owner=${DB_USER} (via -f ${SQL_DB_CREATE##*/})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_DB_CREATE"
     _ok "Database ${DB_NAME} created (owner=${DB_USER}, locale=${db_locale:-template0 default}) via -f $SQL_DB_CREATE"
   else
     printf "\033[1;93m[DB-STEP 2/6] DB exists -> skip CREATE DATABASE\033[0m\n"
@@ -893,7 +1035,7 @@ install_db() {
     printf 'ALTER DATABASE %s OWNER TO %s;\n' "$DB_NAME" "$DB_USER"
   } > "$SQL_DB_GRANT"
   printf "  contents of %s:\n" "$SQL_DB_GRANT"; sed 's/^/    | /' "$SQL_DB_GRANT"
-  sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_DB_GRANT"
+  _run_with_spinner "psql: GRANT ALL on ${DB_NAME} to ${DB_USER} + set owner (via -f ${SQL_DB_GRANT##*/})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$SQL_DB_GRANT"
   _ok "Granted ALL on ${DB_NAME} to ${DB_USER}; owner set (via -f $SQL_DB_GRANT)"
   printf "\033[1;93m[DB-STEP 3/6 done] All DB create SQL scripts located in /tmp/rasyatone_*.sql (cat them after run if ever suspicious)\033[0m\n"
 
@@ -999,7 +1141,7 @@ install_db() {
     _ok "pg_hba.conf updated (marker=RASyatone, DB list=${db_list}, CIDRs=${PG_ALLOW_IPS}, auth=scram-sha-256, ssl=${ssl_on})"
     printf "  %s last 30 lines:\n" "$pg_hba"; sudo tail -n 30 "$pg_hba" 2>/dev/null | sed 's/^/    | /' || true
   else _warn "Could not locate pg_hba.conf"; fi
-  service_control restart postgresql
+  _run_with_spinner "Restart PostgreSQL service (apply listen_addresses + pg_hba changes)" service_control restart postgresql
 
   _section "Verify connection with new user"
   local row row2 row_any=0
@@ -1500,17 +1642,19 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   # Step C: Verify PYTHON_BIN really does have venv + pip modules (distros ship
   # these as separate packages; a broken `apt-get install` can leave PYTHON_BIN
   # functional but `pythonX -m venv` missing).
-  "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || _die "PYTHON_BIN=${PYTHON_BIN} has no 'venv' module. Install the matching -venv / -devel package for this Python (e.g. apt install ${PYTHON_BIN##*/}-venv)."
-  "$PYTHON_BIN" -m pip  --version  >/dev/null 2>&1 || _die "PYTHON_BIN=${PYTHON_BIN} has no 'pip' module. Install the matching -pip package for this Python (e.g. apt install ${PYTHON_BIN##*/}-pip)."
+  _run_with_spinner "Verify ${PYTHON_BIN##*/} has 'venv' module" bash -c "$PYTHON_BIN -m venv --help >/dev/null 2>&1" || \
+    _die "PYTHON_BIN=${PYTHON_BIN} has no 'venv' module. Install the matching -venv / -devel package for this Python (e.g. apt install ${PYTHON_BIN##*/}-venv)."
+  _run_with_spinner "Verify ${PYTHON_BIN##*/} has 'pip' module" bash -c "$PYTHON_BIN -m pip --version >/dev/null 2>&1" || \
+    _die "PYTHON_BIN=${PYTHON_BIN} has no 'pip' module. Install the matching -pip package for this Python (e.g. apt install ${PYTHON_BIN##*/}-pip)."
   _ok "Python runtime locked: ${PYTHON_BIN} $("$PYTHON_BIN" --version 2>&1 | head -n1) — venv+pip modules verified"
 
   _section "Validate DB connectivity (DB_PASSWORD from $ENV_FILE)"
   set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
   if command -v psql >/dev/null 2>&1; then
-    local row
-    row=$(PGPASSWORD="$DB_PASSWORD" timeout 10 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>/dev/null || true)
-    if [ "$row" = "1" ]; then _ok "psql SELECT 1 OK (DB credentials validate)"
-    else _warn "psql SELECT 1 probe FAILED — manage.py migrate will likely fail too. Continuing..."; fi
+    _run_with_spinner "psql SELECT 1 (credential pre-check)" bash -c "set -e; row=\$(PGPASSWORD='$DB_PASSWORD' timeout 10 psql -h '$DB_HOST' -p '$DB_PORT' -U '$DB_USER' -d '$DB_NAME' -tAc 'SELECT 1' 2>/dev/null || true); [ \"\$row\" = \"1\" ]" || {
+      _warn "psql SELECT 1 probe FAILED — manage.py migrate will likely fail too. Continuing...";
+    }
+    _ok "psql SELECT 1 OK (DB credentials validate)"
   else _warn "psql client not installed — skipping DB credential SELECT 1 pre-validate"; fi
 
   _section "Prepare app directory: $APP_DIR"
@@ -1530,12 +1674,14 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
     if [ -n "$(ls -A "$APP_DIR" 2>/dev/null | head -n1)" ]; then
       _die "$APP_DIR is still not empty after wipe attempt. Remove contents manually and try again."
     fi
-    _ok "Running git clone with final URL (private-repo auth probe already passed). For security, token/PAT display in terminal redacted."
-    git clone -b "$GIT_BRANCH" --depth 1 "$GIT_URL" "$APP_DIR"
+    _info "Running git clone (branch=$GIT_BRANCH, depth=1) — spinner shows activity during clone; token redacted from final stdout."
+    _run_with_spinner "git clone branch=$GIT_BRANCH depth=1 into $APP_DIR" bash -c "git clone -b '$GIT_BRANCH' --depth 1 '$GIT_URL' '$APP_DIR'" || \
+      _die "git clone FAILED (rc=$?). See /tmp/rasyatone_spin_*.log for the exact git error. Common causes: (1) private repo PAT expired — rerun, wizard will get a NEW token; (2) branch '$GIT_BRANCH' does not exist — re-check; (3) DNS/network to github.com down."
   else
     _ok "App dir already has .git — fetching latest origin/$GIT_BRANCH instead of fresh clone"
-    git -C "$APP_DIR" fetch --depth 1 origin "$GIT_BRANCH" || true
-    git -C "$APP_DIR" reset --hard "origin/$GIT_BRANCH"
+    _run_with_spinner "git fetch depth=1 origin/$GIT_BRANCH" bash -c "git -C '$APP_DIR' fetch --depth 1 origin '$GIT_BRANCH' || true" || true
+    _run_with_spinner "git reset --hard origin/$GIT_BRANCH" bash -c "git -C '$APP_DIR' reset --hard 'origin/$GIT_BRANCH'" || \
+      _die "git reset --hard origin/$GIT_BRANCH FAILED. Manual intervention: cd $APP_DIR ; git status ; git stash ; git reset --hard HEAD"
   fi
   [ -d "$APP_DIR" ] || _die "App dir $APP_DIR missing after clone"
   # Post-clone safety: a successful clone MUST produce a .git subdir. If it's not there, clone silently failed.
@@ -1544,8 +1690,8 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
 
   _section "Create virtualenv at $APP_DIR/.venv + install dependencies"
   if [ ! -d "$APP_DIR/.venv" ]; then
-    _info "Creating venv with PYTHON_BIN=${PYTHON_BIN} (this ensures Django 5 gets a Python >= 3.10 regardless of system python3 default)"
-    "$PYTHON_BIN" -m venv "$APP_DIR/.venv" || _die "venv creation FAILED with PYTHON_BIN=${PYTHON_BIN}. Check disk free space in $APP_DIR (>= 1 GB) and that ${PYTHON_BIN##*/}-venv / ensurepip is installed."
+    _run_with_spinner "Create venv with PYTHON_BIN=${PYTHON_BIN##*/} -> $APP_DIR/.venv" bash -c "'$PYTHON_BIN' -m venv '$APP_DIR/.venv'" || \
+      _die "venv creation FAILED with PYTHON_BIN=${PYTHON_BIN}. Check disk free space in $APP_DIR (>= 1 GB) and that ${PYTHON_BIN##*/}-venv / ensurepip is installed."
   fi
   # shellcheck disable=SC1091
   # NOTE: `set -u` (nounset) from top of script causes activate scripts to crash
@@ -1559,7 +1705,8 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   active_py="$(command -v python 2>/dev/null || echo "")"
   [ -n "$active_py" ] || _die "After sourcing .venv/bin/activate, 'python' command is not on PATH — venv is broken. Wipe $APP_DIR/.venv and rerun."
   _py_version_ok "$active_py" || _die "Activated venv python ($active_py, version=$($active_py -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null)) is TOO OLD for Django 5 (< ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}). This means venv was created with the WRONG python binary earlier. Wipe $APP_DIR/.venv and rerun Option 4 — this time it will use PYTHON_BIN=${PYTHON_BIN}."
-  python -m pip install --quiet --upgrade pip setuptools wheel 2>&1 | tail -n 3 || _die "pip upgrade failed — venv Python is broken or no internet. Try: $active_py -m ensurepip --upgrade"
+  _run_with_spinner "pip upgrade (pip+setuptools+wheel in venv)" bash -c "python -m pip install --quiet --upgrade pip setuptools wheel" || \
+    _die "pip upgrade failed — venv Python is broken or no internet. Try: $active_py -m ensurepip --upgrade"
   if [ -f "$APP_DIR/requirements.txt" ]; then
     # Helper: list of Windows-only PyPI package names (platform_system == "Windows"
     # wheels only — they simply don't exist on Linux so 'pip install' aborts with
@@ -1630,10 +1777,16 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
     local pip_log="/tmp/rasyatone_pip_$$.log"
     : >"$pip_log"
     set +e
+    # The bash -c block writes pip output DIRECTLY into pip_log (for categorized
+    # diagnosis), while _run_with_spinner still animates spinner. rc returned by
+    # spinner == pip subprocess rc.
+    local req_label=""
     if [ "$dropped_count" -gt 0 ]; then
-      python -m pip install -r "$REQ_FILTERED" >"$pip_log" 2>&1
+      req_label="pip install -r requirements.linux-filtered.txt (${dropped_count} Windows deps removed)"
+      _run_with_spinner "$req_label" bash -c "python -m pip install -r '$REQ_FILTERED' >'$pip_log' 2>&1"
     else
-      python -m pip install -r "$REQ_SRC"    >"$pip_log" 2>&1
+      req_label="pip install -r requirements.txt"
+      _run_with_spinner "$req_label" bash -c "python -m pip install -r '$REQ_SRC' >'$pip_log' 2>&1"
     fi
     local prc=$?
     set -e
@@ -1719,7 +1872,13 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   else
     _warn "No $APP_DIR/requirements.txt found — skipping pip install -r (install manually)"
   fi
-  python -m pip install --quiet gunicorn 2>/dev/null || python -m pip install gunicorn || _die "Failed to install gunicorn into venv — cannot create systemd unit / start app."
+  # gunicorn install: first quiet install; if that fails, retry noisily and show
+  # output via spinner so user sees what's wrong. spinner always captures output.
+  set +e
+  _run_with_spinner "pip install gunicorn (systemd unit needs this binary)" bash -c "python -m pip install --quiet gunicorn 2>/dev/null || python -m pip install gunicorn"
+  local gunrc=$?
+  set -e
+  [ "$gunrc" -eq 0 ] || _die "Failed to install gunicorn into venv — cannot create systemd unit / start app. See spinner log: /tmp/rasyatone_spin_*.log"
   _ok "venv ready; python=$(command -v python) ($(python --version 2>&1 | head -n1)); gunicorn: $(gunicorn --version 2>&1 | head -n1)"
 
   _section "Run Django collectstatic + migrate"
@@ -1732,14 +1891,22 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
     # shellcheck disable=SC1091
     . "./.venv/bin/activate" 2>/dev/null || true
     set -u
-    if python manage.py collectstatic --noinput >/dev/null 2>&1; then _ok "collectstatic ok"
-    else
-      # Re-run noisily so user sees WHY it failed (STATIC_ROOT / permission errors)
-      _warn "collectstatic exited non-zero — re-running with output for debugging:"
+    set +e
+    # collectstatic: first quiet attempt with spinner; if that fails re-run
+    # noisily so user sees WHY it failed (STATIC_ROOT / permissions)
+    _run_with_spinner "manage.py collectstatic --noinput (scan static files)" bash -c "python manage.py collectstatic --noinput >/dev/null 2>&1"
+    local csrc=$?
+    set -e
+    if [ "$csrc" -ne 0 ]; then
+      # Re-run noisily with a secondary spinner so progress still shown during long re-run
+      _warn "collectstatic exited non-zero — re-running with full output for debugging:"
       python manage.py collectstatic --noinput 2>&1 | tail -n 20 || true
       _warn "Continuing anyway — if STATIC_ROOT was unset or wrong path this is expected."
+    else
+      _ok "collectstatic ok"
     fi
-    python manage.py migrate || _die "manage.py migrate failed — most common causes: (1) DB credentials in $ENV_FILE wrong? (2) DB_USER missing CREATEDB / CONNECT on DB=$DB_NAME? (3) Wrong Python version in venv ($(python --version 2>&1) when Django 5 needs >= 3.10?)"
+    _run_with_spinner "manage.py migrate (apply DB migrations)" bash -c "python manage.py migrate" || \
+      _die "manage.py migrate failed — most common causes: (1) DB credentials in $ENV_FILE wrong? (2) DB_USER missing CREATEDB / CONNECT on DB=$DB_NAME? (3) Wrong Python version in venv ($(python --version 2>&1) when Django 5 needs >= 3.10?)"
   )
   _ok "Django migrate OK"
 
@@ -1768,8 +1935,9 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
       "[Install]" \
       "WantedBy=multi-user.target" \
       | sudo tee "$unit_file" >/dev/null
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$SERVICE_NAME"
+    _run_with_spinner "systemd daemon-reload (re-read unit files)" sudo systemctl daemon-reload || true
+    _run_with_spinner "systemctl enable --now $SERVICE_NAME (start app)" sudo systemctl enable --now "$SERVICE_NAME" || \
+      _warn "systemctl enable --now returned non-zero — app may still be starting (RestartSec=3). Run: systemctl status '$SERVICE_NAME' in 10s to verify."
     _ok "systemd unit written and started: $unit_file"
   else
     _warn "systemd not present — skipped service install (run gunicorn manually)"
