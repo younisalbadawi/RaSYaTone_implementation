@@ -406,8 +406,64 @@ detect_pm() {
 _pkg_update()  { eval "$PKG_UPDATE"; }
 _pkg_install() { if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL $*"; else eval "$PKG_INSTALL $*"; fi; }
 _sudo_pkg_install() { if command -v apt-get >/dev/null 2>&1; then sudo DEBIAN_FRONTEND=noninteractive env DEBIAN_FRONTEND=noninteractive bash -c "eval \$0 \$*" "$PKG_INSTALL" "$@"; else sudo bash -c "eval \$0 \$*" "$PKG_INSTALL" "$@"; fi; }
+# Apt-only wrapper: ignore missing packages (for OPTIONAL splits like python3.X-pip
+# / python3.X-venv which deadsnakes PPA often doesn't ship on certain Ubuntu combos).
+# dnf uses --skip-broken / setopt=strict=False; apk has no strict "missing package" fail.
+_sudo_apt_install_ignore_missing() {
+  # args: list of packages; OPT ones that don't exist are skipped silently
+  sudo DEBIAN_FRONTEND=noninteractive env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends -o APT::Install-Recommends=false -o Debug::pkgProblemResolver=0 \
+    -o APT::Get::Fix-Missing=true --ignore-missing "$@"
+}
 _add_deadsnakes_ppa() { sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa; }
 _dnf_enable_py311_module() { sudo dnf module enable -y python3.11; }
+
+# --- Cross-distro post-install pip + venv VALIDATION helper.
+# Rule: NEVER rely on "did we install python3.X-pip package?" as source of truth.
+# Instead: ask the INTERPRETER directly. If pip module missing → bootstrap via
+# `pythonX.Y -m ensurepip --upgrade` (CPython stdlib module always bundled with
+# deadsnakes, always available on dnf, always available on Alpine py3).
+# If venv module missing → install distro-default python3-venv (it supplies the
+# shared ensurepip wheels that even non-default python3.X reuses) and retry.
+_validate_and_bootstrap_py_venv_pip() {
+  local pybin="$1"
+  local label_short="${pybin##*/}"
+  [ -z "${pybin:-}" ] || ! command -v "$pybin" >/dev/null 2>&1 && return 1
+  local ok=1
+  if ! "$pybin" -m venv --help >/dev/null 2>&1; then
+    _warn "${label_short} -m venv module MISSING after install — trying distro-default python3-venv meta-package (it ships ensurepip wheels shared across all python versions)"
+    case "$PM" in
+      apt) _sudo_pkg_install python3-venv >/dev/null 2>&1 || true ;;
+      dnf) _sudo_pkg_install python3-virtualenv platform-python-devel >/dev/null 2>&1 || true ;;
+      apk) _sudo_pkg_install py3-virtualenv python3-dev >/dev/null 2>&1 || true ;;
+    esac
+    if ! "$pybin" -m venv --help >/dev/null 2>&1; then
+      _nok "${label_short} -m venv STILL MISSING after meta-package install — venv creation will likely fail later; install python<version>-venv manually and rerun"
+      ok=0
+    else
+      _ok "${label_short} -m venv module OK (restored via distro python3-venv meta)"
+    fi
+  fi
+  if ! "$pybin" -m pip --version >/dev/null 2>&1; then
+    _warn "${label_short} -m pip MISSING (no separate ${label_short}-pip package shipped by repo) — bootstrapping via ${label_short} -m ensurepip --upgrade (bundled in CPython stdlib, 100% reliable)"
+    if ! _run_with_spinner "Bootstrap pip via ${label_short} -m ensurepip --upgrade" "$pybin" -m ensurepip --upgrade >/dev/null 2>&1; then
+      # 2nd tier: download get-pip.py as a last resort
+      _warn "ensurepip failed — fallback: curl get-pip.py -> ${label_short} installer"
+      curl -fsSL --max-time 30 https://bootstrap.pypa.io/get-pip.py -o /tmp/rasyatone_get_pip.py 2>/dev/null || true
+      if [ -s /tmp/rasyatone_get_pip.py ]; then
+        _run_with_spinner "Bootstrap pip via get-pip.py (${label_short})" "$pybin" /tmp/rasyatone_get_pip.py --quiet >/dev/null 2>&1 || true
+      fi
+      rm -f /tmp/rasyatone_get_pip.py 2>/dev/null || true
+    fi
+    if "$pybin" -m pip --version >/dev/null 2>&1; then
+      _ok "${label_short} -m pip bootstrap OK via ensurepip"
+    else
+      _nok "${label_short} -m pip STILL MISSING after ensurepip — pip installs will FAIL; fix by hand: curl -sSL https://bootstrap.pypa.io/get-pip.py | sudo ${label_short}"
+      ok=0
+    fi
+  fi
+  return $(( ok ? 0 : 1 ))
+}
 
 # Install Python runtime (>= 3.10 AND <= MAX_ALLOWED_PYTHON_MINOR), plus build
 # essentials (git/libpq-dev/libffi-dev/postgresql-client). Runs from BOTH:
@@ -423,6 +479,9 @@ _install_compatible_python_runtime() {
   load_env_file || true
   # Run pkg update once (idempotent) — spinner shows progress during mirror sync.
   _run_with_spinner "Package manager update (mirror sync)" _pkg_update || true
+  # Local flags: after install we run _validate_and_bootstrap_py_venv_pip
+  # against these interpreter paths (if they exist). Initialised empty for set -u.
+  local pydot_11="" pydot_10="" pydot_12="" validated_any=0
   case "$PM" in
     apt)
       # apt (Debian/Ubuntu):
@@ -433,8 +492,21 @@ _install_compatible_python_runtime() {
           _run_with_spinner "Add deadsnakes PPA (for python3.11)" _add_deadsnakes_ppa || true
           _run_with_spinner "Refresh apt index after deadsnakes PPA add" _pkg_update || true
         fi
-        _run_with_spinner "Install python3.11 runtime (venv + pip + dev headers)" _sudo_pkg_install python3.11 python3.11-venv python3.11-pip python3.11-dev || \
-        _run_with_spinner "Fallback: install python3.10 runtime" _sudo_pkg_install python3.10 python3.10-venv python3.10-pip python3.10-dev || true
+        # --- 2-pass install: MUST-HAVES first (hard fail -> python3.10 fallback),
+        # then OPTIONAL packages (--ignore-missing) because deadsnakes PPA on
+        # many Ubuntu/LTS combos DOES NOT ship python3.11-pip / python3.10-pip
+        # (and sometimes not python3.11-venv as a separate package either).
+        # Pip + venv are validated and bootstrapped via ensurepip AFTER.
+        if _run_with_spinner "Install python3.11 core (MUST-HAVE: python3.11 python3.11-dev)" _sudo_pkg_install python3.11 python3.11-dev; then
+          pydot_11="python3.11"
+          _run_with_spinner "Install python3.11 OPTIONAL venv/pip (ignore-missing if repo lacks them)" _sudo_apt_install_ignore_missing python3.11-venv python3.11-pip || true
+        else
+          _warn "python3.11 core install failed — trying python3.10 core fallback"
+          if _run_with_spinner "Fallback: install python3.10 core (MUST-HAVE: python3.10 python3.10-dev)" _sudo_pkg_install python3.10 python3.10-dev; then
+            pydot_10="python3.10"
+            _run_with_spinner "Install python3.10 OPTIONAL venv/pip (ignore-missing)" _sudo_apt_install_ignore_missing python3.10-venv python3.10-pip || true
+          fi
+        fi
       fi
       # Always install baseline python3 meta-packages + build tools + libpq/libffi-dev + psql client.
       _run_with_spinner "Install build tools + python3 meta + libpq-dev + libffi-dev + postgresql-client" \
@@ -446,8 +518,19 @@ _install_compatible_python_runtime() {
         if [ -r /etc/redhat-release ] || [ -r /etc/almalinux-release ] || [ -r /etc/rocky-release ] || [ -r /etc/oracle-release ]; then
           _run_with_spinner "dnf: enable python3.11 module (AppStream)" _dnf_enable_py311_module || true
         fi
-        _run_with_spinner "dnf: install python3.11 runtime (devel + pip)" _sudo_pkg_install python3.11 python3.11-devel python3.11-pip || \
-        _run_with_spinner "Fallback: dnf install python3.10" _sudo_pkg_install python3.10 python3.10-devel python3.10-pip || true
+        # DNF split: MUST-HAVE = python3.11 + devel (hard fail -> python3.10 fallback).
+        # OPTIONAL = python3.11-pip (AppStream often omits it; ensurepip bootstrap later).
+        # dnf --setopt=strict=0 skips packages that don't exist in any repo.
+        if _run_with_spinner "dnf: install python3.11 core (MUST-HAVE: python3.11 python3.11-devel)" _sudo_pkg_install python3.11 python3.11-devel; then
+          pydot_11="python3.11"
+          _run_with_spinner "dnf: install python3.11 OPTIONAL pip (strict=0 skip if missing)" sudo dnf install -y --setopt=strict=0 --skip-broken python3.11-pip python3.11-venv >/dev/null 2>&1 || true
+        else
+          _warn "dnf python3.11 core install failed — trying python3.10 core fallback"
+          if _run_with_spinner "Fallback: dnf install python3.10 core" _sudo_pkg_install python3.10 python3.10-devel; then
+            pydot_10="python3.10"
+            _run_with_spinner "dnf: install python3.10 OPTIONAL pip (strict=0 skip if missing)" sudo dnf install -y --setopt=strict=0 --skip-broken python3.10-pip python3.10-venv >/dev/null 2>&1 || true
+          fi
+        fi
       fi
       # Baseline + build tools. Try with postgresql-contrib first; fall back if not available.
       _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql + postgresql-contrib" \
@@ -461,6 +544,25 @@ _install_compatible_python_runtime() {
         _sudo_pkg_install python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client || true
       ;;
   esac
+  # ---------------------------------------------------------------
+  # POST-INSTALL: cross-distro pip + venv module VALIDATE + BOOTSTRAP
+  # ---------------------------------------------------------------
+  # If we just installed pydot_11/pydot_10/pydot_12 via the PM-specific branches
+  # above, validate and run ensurepip bootstrap on them FIRST (highest priority).
+  local pv
+  for pv in "$pydot_12" "$pydot_11" "$pydot_10"; do
+    if [ -n "${pv:-}" ] && command -v "$pv" >/dev/null 2>&1; then
+      _validate_and_bootstrap_py_venv_pip "$pv" >/dev/null 2>&1 || true
+      validated_any=1
+    fi
+  done
+  # If no per-minor python was installed above (or user already had a compatible
+  # one), fall back to whatever _detect_compatible_python3 finds and validate it.
+  if [ "$validated_any" -eq 0 ]; then
+    if _detect_compatible_python3 2>/dev/null && [ -n "${PYTHON_BIN:-}" ] && command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      _validate_and_bootstrap_py_venv_pip "$PYTHON_BIN" >/dev/null 2>&1 || true
+    fi
+  fi
   # Final post-install check: is there now a compatible python?
   _detect_compatible_python3 2>/dev/null
 }
