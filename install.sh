@@ -65,14 +65,30 @@ _section(){ printf "\n\033[1;97m=== %s ===\033[0m\n" "$*"; }
 
 # Canonicalize ANY GitHub HTTPS URL (with or without x-access-token auth) so it has exactly ONE trailing .git,
 # no doubled .git.git, and no trailing slashes. Works as an output safety net on ANY GitHub URL form.
-# sed: strip trailing slashes; then label loop strips ALL trailing .git (optionally with trailing / after each);
-#      then strip trailing slashes again; then append exactly ONE .git at the very end.
+# Three-layer defense:
+#   1. sed ERE label loop strips all trailing .git occurrences (portable across all sed builds)
+#   2. bash while-loop parameter expansion BACKUP strips any remaining .git (catches weird sed builds)
+#   3. Final assertion: abort if output still contains ".git.git" anywhere (canary failsafe)
 _normalize_github_url() {
-  printf '%s' "${1:-}" | sed -E \
+  local s=""
+  s="$(printf '%s' "${1:-}" | sed -E \
     -e 's|[/]*$||' \
     -e ':gitloop' -e 's|(\.git)[/]*$||' -e 't gitloop' \
-    -e 's|[/]*$||' \
-    -e 's|$|.git|'
+    -e 's|[/]*$||')"
+  # Layer 2 (bash backup): parameter expansion strip
+  while [ "${s%/}" != "$s" ]; do s="${s%/}"; done
+  local prev=""
+  while [ "$prev" != "$s" ]; do
+    prev="$s"
+    while [ "${s%.git}" != "$s" ]; do s="${s%.git}"; done
+    while [ "${s%/}" != "$s" ]; do s="${s%/}"; done
+  done
+  s="${s}.git"
+  # Layer 3 (canary assertion): NO output of this function is allowed to contain .git.git
+  case "$s" in
+    *".git.git"*) _die "BUG: _normalize_github_url leaked '.git.git'! Input='${1:-}' Output='${s}' — refusing to continue to avoid a broken git clone." ;;
+  esac
+  printf '%s' "$s"
 }
 
 prompt_def() {
@@ -112,7 +128,7 @@ prompt_yn() {
 }
 
 # --- package manager auto-detect --------------------------------------------
-declare -g PM="" PKG_INSTALL="" PKG_UPDATE=""
+declare -g PM="" PKG_INSTALL="" PKG_UPDATE="" FW_BACKEND="none"
 detect_pm() {
   if [ -n "$PM" ]; then return 0; fi
   if command -v apt-get >/dev/null 2>&1; then
@@ -131,9 +147,19 @@ service_control() {
   if command -v systemctl >/dev/null 2>&1; then
     sudo systemctl "$action" "$name" 2>/dev/null || sudo systemctl "$action" "postgresql" 2>/dev/null || true
   elif command -v rc-service >/dev/null 2>&1; then
-    sudo rc-service "$name" "$action" 2>/dev/null || sudo rc-service postgresql "$action" 2>/dev/null || true
+    # OpenRC: start/stop/restart/status go to rc-service; enable/disable go to rc-update add/del
+    case "$action" in
+      enable)  sudo rc-update add "$name" default 2>/dev/null || sudo rc-update add postgresql default 2>/dev/null || true ;;
+      disable) sudo rc-update del "$name" default 2>/dev/null || sudo rc-update del postgresql default 2>/dev/null || true ;;
+      *)       sudo rc-service "$name" "$action" 2>/dev/null || sudo rc-service postgresql "$action" 2>/dev/null || true ;;
+    esac
   elif command -v rc-update >/dev/null 2>&1; then
-    sudo rc-service "$name" "$action" 2>/dev/null || true
+    # Only rc-update exists but no rc-service (rare corner case): enable/disable work via rc-update
+    case "$action" in
+      enable)  sudo rc-update add "$name" default 2>/dev/null || true ;;
+      disable) sudo rc-update del "$name" default 2>/dev/null || true ;;
+      *)       _warn "rc-update present but rc-service missing; cannot run '$action $name' — run manually via OpenRC init scripts" ;;
+    esac
   else
     _warn "No systemctl/rc-service; service '$action $name' must be run manually"
   fi
@@ -1080,6 +1106,30 @@ install_app() {
   printf "\n"
   github_auth_private_repo   # rewrites GIT_URL in-place if GitHub private repo
 
+  # ============================================================
+  # FINAL CANONICALIZATION GUARD (outer defense perimeter)
+  #   - github_auth_private_repo applies _normalize_github_url
+  #     internally at 3 construction sites + inside its saved-
+  #     token fast-path. This block is the FINAL safety net:
+  #     no matter what happened above, GIT_URL will be stripped
+  #     of any trailing slash / stacked .git and re-suffixed
+  #     with exactly one .git before we write the env file.
+  #   - Hard assertion: if GIT_URL *still* contains .git.git
+  #     after this, something catastrophic happened and the
+  #     installer aborts instead of wasting time on a clone
+  #     that is guaranteed to fail.
+  # ============================================================
+  case "$GIT_URL" in
+    *"github.com"*|*"@github.com"*)
+      GIT_URL="$(_normalize_github_url "$GIT_URL")"
+      ;;
+  esac
+  case "$GIT_URL" in
+    *".git.git"*)
+      _die "FATAL SANITY FAIL: GIT_URL still contains '.git.git' after final canonicalization pass. Value='${GIT_URL}'. Report this bug."
+      ;;
+  esac
+
   _section "Writing $ENV_FILE"
   sudo mkdir -p "$ENV_DIR"
   printf '%s\n' \
@@ -1127,18 +1177,24 @@ install_app() {
       do_over=$(prompt_def "App dir $APP_DIR is not empty — remove contents before git clone? [y/N]" "n")
       if [ "$do_over" = "y" ] || [ "$do_over" = "Y" ]; then
         sudo rm -rf "${APP_DIR:?}/"* "${APP_DIR:?}/".[!.]* 2>/dev/null || true
+      else
+        _die "Cannot proceed with git clone into non-empty $APP_DIR without wiping it first. Answer 'y' to wipe, or clear $APP_DIR manually then rerun Option 4."
       fi
     fi
-    if [ -z "$(ls -A "$APP_DIR" 2>/dev/null | head -n1)" ]; then
-      _ok "Running git clone with final URL (private-repo auth probe already passed). For security, token/PAT display in terminal redacted."
-      git clone -b "$GIT_BRANCH" --depth 1 "$GIT_URL" "$APP_DIR"
+    # Safety: dir MUST be empty before fresh clone. (If user answered Y above but rm -rf left stubborn dotfiles somehow, fail loudly.)
+    if [ -n "$(ls -A "$APP_DIR" 2>/dev/null | head -n1)" ]; then
+      _die "$APP_DIR is still not empty after wipe attempt. Remove contents manually and try again."
     fi
+    _ok "Running git clone with final URL (private-repo auth probe already passed). For security, token/PAT display in terminal redacted."
+    git clone -b "$GIT_BRANCH" --depth 1 "$GIT_URL" "$APP_DIR"
   else
     _ok "App dir already has .git — fetching latest origin/$GIT_BRANCH instead of fresh clone"
     git -C "$APP_DIR" fetch --depth 1 origin "$GIT_BRANCH" || true
     git -C "$APP_DIR" reset --hard "origin/$GIT_BRANCH"
   fi
   [ -d "$APP_DIR" ] || _die "App dir $APP_DIR missing after clone"
+  # Post-clone safety: a successful clone MUST produce a .git subdir. If it's not there, clone silently failed.
+  [ -d "${APP_DIR}/.git" ] || _die "git clone reported exit 0 but ${APP_DIR}/.git does NOT exist — likely empty-branch / repo-initialization race / shallow clone failure. Rerun with a different branch or check repo contents on GitHub."
   _ok "App dir populated (branch=$GIT_BRANCH)"
 
   _section "Create virtualenv at $APP_DIR/.venv + install dependencies"
