@@ -857,18 +857,21 @@ install_db() {
   # Auth = scram-sha-256 for every rule.
   if [ -n "$pg_hba" ]; then
     local marker="## RASyatone installer rules"
-    # (A) DELETE LEGACY OLD RULES from pre-marker installer versions (lines containing our DB_USER + scram-sha-256
-    #     that are NOT inside the current marker block, plus the old 3-rule pattern without a marker header).
-    #     This is CRITICAL: if the user previously ran an OLD installer build (no markers), those rules
-    #     sit above the new marker block and never get cleaned up by the marker range delete — re-running
-    #     the script would silently add duplicates (worse: old rules only covered DB_NAME, not postgres).
-    sudo sed -i -E "/^[[:space:]]*#.*R[Aa][Ss][Yy].*marker|^${marker}/,/^## END RASyatone/! {
-                      /^[[:space:]]*(local|host|hostssl|hostnossl)[[:space:]]+.*[[:space:]]${DB_USER}[[:space:]]+.*scram-sha-256[[:space:]]*$/d
-                    }" "$pg_hba" 2>/dev/null || true
-    # (B) Delete the current marker block (if exists) — idempotent on reruns.
+    # ====== IDENTIFIABLE RULE CLEANUP (two passes = NEVER removes admin custom rules) ======
+    # PASS A FIRST (strongest): delete the installer marker block if present on rerun.
+    #   Since we are about to write a NEW marker block, the old one MUST be deleted first.
+    #   Marker block = "## RASyatone installer rules ..." header line  →  "## END RASyatone" line.
     if grep -Fq "$marker" "$pg_hba" 2>/dev/null; then
       sudo sed -i "/^${marker}/,/^## END RASyatone/d" "$pg_hba" 2>/dev/null || true
     fi
+    # PASS B SECOND (legacy): delete UNMARKED DB_USER+scram-sha-256 rules written by OLD builds of
+    #   this installer that had NO marker block (pre-rewrite versions). CRITICAL safety property:
+    #   because PASS A already removed the CURRENT marker block, EVERY line matching the pattern
+    #   below is NECESSARILY a pre-marker ghost rule (not a marker-block rule, not admin custom).
+    #   We do NOT touch rules using md5, ident, peer, or auth-methods other than scram-sha-256,
+    #   and we do NOT touch rules for users != DB_USER — admin custom rules are safe.
+    sudo sed -i -E "/^[[:space:]]*(local|host|hostssl|hostnossl)[[:space:]]+[^[:space:]]+[[:space:]]+${DB_USER}[[:space:]]+(samenet|samehost|local|[0-9]{1,3}(\.[0-9]{1,3}){3}(\/[0-9]+)?|::1?\/?[0-9]*)[[:space:]]+scram-sha-256[[:space:]]*$/d" \
+      "$pg_hba" 2>/dev/null || true
 
     local IFS_save="$IFS" cidr db_list db
     printf '%s\n' "$marker  (build=$SCRIPT_VERSION_BUILD  user=$DB_USER  CIDRs=$PG_ALLOW_IPS  DBs=$PG_HBA_DBS  auth=scram-sha-256  ssl_on=${ssl_on})" | sudo tee -a "$pg_hba" >/dev/null
@@ -979,13 +982,17 @@ install_db() {
   fi
   # 3) User action checklist for remote clients (prevent common pg_hba confusion)
   printf "\n\033[1;33mRemote client troubleshooting checklist (if login still prompts for password / pg_hba reject):\033[0m\n"
-  printf "   (a) Connect to database='%s', NOT database='postgres'  (you selected ALLOW_PG_DBS=%s)\n" "$DB_NAME" "$ALLOW_PG_DBS"
-  printf "   (b) Remote client IP must appear in PG_ALLOW_IPS = %s  (rerun Option 3 to add it if missing)\n" "$PG_ALLOW_IPS"
-  printf "   (c) User/password must be exactly: user='%s' password='<the value you typed>'\n" "$DB_USER"
-  if [ "$ssl_on" -eq 1 ]; then
-    printf "   (d) Server SSL is ON → client can connect with sslmode=require/prefer for TLS (pg_hba has both hostssl + host rules)\n"
+  if [ "$ALLOW_PG_DBS" = "ALL" ]; then
+    printf "   (a) \033[92mALLOW_PG_DBS=ALL — ANY database name works!\033[0m The pg_hba rules match: DB_NAME='%s', postgres, template1, and every other DB. pgAdmin/DBeaver Test Connection button with database='postgres' (their default) WORKS. User/password: user='%s' password='<the value you typed>'\n" "$DB_NAME" "$DB_USER"
   else
-    printf "   (d) Server SSL is OFF → pg_hba 'host' rule matches plain TCP; if your client insists on SSL rerun Option 3 or install ssl-cert package before running it.\n"
+    printf "   (a) \033[93mALLOW_PG_DBS=SELF — ONLY database='%s' works!\033[0m Do NOT use database='postgres' (pgAdmin/DBeaver default) with SELF mode — it will FAIL. Connect specifically to database='%s' in your client connection settings. User/password: user='%s' password='<the value you typed>'\n" "$DB_NAME" "$DB_NAME" "$DB_USER"
+  fi
+  printf "   (b) Remote CLIENT IP (the machine running pgAdmin, NOT this server!) must be inside PG_ALLOW_IPS = %s\n       If it's missing: rerun Option 3 and ADD the client's public CIDR (e.g. if client has public IP 203.0.113.14 → enter 203.0.113.14/32 in the PG_ALLOW_IPS prompt)\n" "$PG_ALLOW_IPS"
+  printf "   (c) Server firewall must pass PostgreSQL %s/tcp — the firewall step (Option 3) enabled it and printed a summary. Re-check with: sudo ufw status numbered  |  sudo firewall-cmd --list-ports  |  sudo iptables -S\n" "$DB_PORT"
+  if [ "$ssl_on" -eq 1 ]; then
+    printf "   (d) Server SSL is ON → client can connect with sslmode=require/prefer for TLS (pg_hba has both hostssl + host rules; SSL clients match hostssl first)\n"
+  else
+    printf "   (d) Server SSL is OFF → pg_hba 'host' rule matches plain TCP only. If your GUI client INSISTS on sslmode=require and fails, change it to sslmode=prefer/disable in the connection settings.\n"
   fi
   printf "\n"
 
