@@ -114,13 +114,21 @@ _py_version_ok() {
 # spot: every Django/numpy/psycopg wheel is built, PEP 668 is honored, stable.
 MAX_PREFERRED_PYTHON_MINOR=12
 
+# ABSOLUTE upper cap on Python we will EVER select. Python 3.14 has removed many
+# deprecated C-API symbols that OLD pinned sdists still use. For example
+# psycopg2-binary 2.9.9 and older call PyWeakref_GetObject which is
+# Py_DEPRECATED(3.13) and gone in 3.14+ — their sdist builds immediately fail.
+# Never select >= 3.14 automatically; instead DIE with instructions to install
+# 3.11/3.12 from repos.
+MAX_ALLOWED_PYTHON_MINOR=13
+
 # Scans for ANY python3* binary on PATH with version >= 3.10 (Django 5 floor).
 # PREFERENCE ORDER: pick highest minor <= MAX_PREFERRED_PYTHON_MINOR (3.12 by
-# default) first; if only 3.13+ are available fall back to newest reluctantly
-# with a warning (user may need to relax constraints or build packages from sdist).
+# default) first; if only 3.13 is available fall back to newest reluctantly with
+# a warning; if ONLY >= 3.14 (too new, broken sdists) exist DIE with guidance.
 _detect_compatible_python3() {
   PYTHON_BIN=""
-  local cand best_bin="" best_maj=0 best_min=0 py_ver py_maj py_min
+  local cand best_bin="" best_maj=0 best_min=0 py_ver py_maj py_min too_new_bin="" too_new_maj=0 too_new_min=0
   # Pass 1: only python3.12, python3.11, python3.10 (sweet spot, no wheel problems)
   for cand in python3.12 python3.11 python3.10; do
     command -v "$cand" >/dev/null 2>&1 || continue
@@ -134,9 +142,9 @@ _detect_compatible_python3() {
       fi
     fi
   done
-  # Pass 2: if no preferred-range Python found (only 3.13+ on the box), reluctantly accept it.
+  # Pass 2: if no preferred-range Python found (only 3.13 on the box), reluctantly accept it.
   if [ -z "$best_bin" ]; then
-    for cand in python3.13 python3.14 python3; do
+    for cand in python3.13; do
       command -v "$cand" >/dev/null 2>&1 || continue
       if _py_version_ok "$(command -v "$cand")"; then
         py_ver=$("$cand" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
@@ -151,6 +159,54 @@ _detect_compatible_python3() {
     if [ -n "$best_bin" ]; then
       _warn "No Python 3.10/3.11/3.12 found — falling back to python ${best_maj}.${best_min}. WARNING: many common Django deps (numpy 1.26.x, pandas 2.x) still require-python < 3.13. pip install -r requirements.txt may fail with 'Ignored the following versions that require a different python version'. If that happens: apt install python3.11 python3.11-venv python3.11-pip then rerun Option 4."
     fi
+  fi
+  # Pass 3: Python 3.14 / 3.15+ / uncapped python3 default scan to detect "only 3.14 on the box".
+  # We NEVER use these but we need to know they exist so we can fail WITH useful guidance
+  # (instead of failing with a generic "no python found" error).
+  if [ -z "$best_bin" ]; then
+    for cand in python3.15 python3.14 python3; do
+      command -v "$cand" >/dev/null 2>&1 || continue
+      py_ver=$("$cand" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
+      read -r py_maj py_min <<<"$py_ver"
+      if [ "$py_maj" -eq 3 ] && [ "$py_min" -gt "$MAX_ALLOWED_PYTHON_MINOR" ]; then
+        if [ "$py_min" -gt "$too_new_min" ]; then
+          too_new_bin="$(command -v "$cand")"
+          too_new_maj="$py_maj"
+          too_new_min="$py_min"
+        fi
+      elif [ "$py_maj" -eq 3 ] && [ "$py_min" -ge "$MIN_PYTHON_MINOR" ] && [ "$py_min" -le "$MAX_ALLOWED_PYTHON_MINOR" ]; then
+        # Found a Python 3.13/3.12/3.11/3.10 via the `python3` symlink (last resort)
+        best_bin="$(command -v "$cand")"
+        best_maj="$py_maj"
+        best_min="$py_min"
+      fi
+    done
+  fi
+  # Final: if only 3.14+ existed, DIE with specific guidance, don't use it.
+  if [ -z "$best_bin" ] && [ -n "$too_new_bin" ]; then
+    PYTHON_BIN="$too_new_bin"
+    _die "\
+Only Python ${too_new_maj}.${too_new_min} was found on this server
+(MAX_ALLOWED_PYTHON_MINOR=3.${MAX_ALLOWED_PYTHON_MINOR}).
+
+Python >= 3.14 REMOVES many deprecated CPython C-API symbols that commonly
+pinned old sdists still use (e.g. psycopg2-binary 2.9.9 calls PyWeakref_GetObject
+which was Py_DEPRECATED(3.13) and removed in 3.14+). Building from sdist on
+3.14 will fail with 'fatal error: compile failure — no matching wheel found'
+for at least 50% of real-world requirements.txt files.
+
+Fix (pick ONE):
+  * Debian / Ubuntu   : apt install python3.11 python3.11-venv python3.11-pip python3.11-dev
+                        (add-apt-repository ppa:deadsnakes/ppa first if needed)
+  * RHEL 9 / Rocky 9  : dnf install -y python3.11 python3.11-devel python3.11-pip
+  * RHEL 8 / CentOS 8 : dnf module enable -y python3.11 ; dnf install -y python3.11 python3.11-devel python3.11-pip
+  * Any Linux         : Compile Python 3.11 or 3.12 from source with --enable-optimizations
+
+Once 3.11/3.12 is on PATH, rerun Option 4 — it will be preferred automatically.
+
+If you INSIST on using python ${too_new_maj}.${too_new_min} despite known
+sdist breakage (NOT supported), edit MAX_ALLOWED_PYTHON_MINOR in install.sh to
+${too_new_min} and rerun — but expect many packages to fail in pip."
   fi
   if [ -n "$best_bin" ]; then
     PYTHON_BIN="$best_bin"
@@ -1338,7 +1394,10 @@ install_app() {
       fi
       # Always install the baseline python3 meta-packages (required for symlinks
       # and distro tooling that expects bare `python3`).
-      sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev curl gettext-base postgresql-client
+      # NOTE: libffi-dev MUST be here — cffi / cryptography / bcrypt / PyNaCl
+      # ALL require ffi.h at build time. Without it you get:
+      #   "src/c/_cffi_backend.c:15:10: fatal error: ffi.h: No such file or directory"
+      sudo DEBIAN_FRONTEND=noninteractive $PKG_INSTALL python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client
       ;;
     dnf)
       # dnf (RHEL/Fedora/Rocky/Alma):
@@ -1353,12 +1412,14 @@ install_app() {
         sudo $PKG_INSTALL python3.10 python3.10-devel python3.10-pip 2>/dev/null || true
       fi
       # Baseline: install python3 base + build tools + postgresql server/client meta-pkg.
-      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel curl postgresql postgresql-contrib 2>/dev/null || \
-      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel curl postgresql
+      # libffi-devel needed for cffi / cryptography / bcrypt builds (ffi.h header).
+      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib 2>/dev/null || \
+      sudo $PKG_INSTALL python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql
       ;;
     apk)
       # Alpine: python3 is kept very current (3.11/3.12) in edge + stable branches.
-      sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev curl postgresql-client
+      # libffi-dev: ffi.h header for cffi / cryptography / bcrypt sdists.
+      sudo $PKG_INSTALL python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client
       ;;
   esac
 
@@ -1538,6 +1599,21 @@ Django 5 (in your repo) REFUSES to install on Python < 3.10. What to do:
       fi
       if printf '%s' "$log_lower" | grep -Eq "fatal error.*python\.h: no such file or directory|python\.h: no such file or directory"; then
         bullets="${bullets}|★ PYTHON HEADERS MISSING. You are compiling a C extension but the Python '-devel' package is not installed for this exact Python binary. Install: apt install ${PYTHON_BIN##*/}-dev (or equivalent dnf install python3.11-devel / apk add python3-dev)."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "fatal error.*ffi\.h: no such file or directory|ffi\.h: no such file or directory"; then
+        bullets="${bullets}|★ LIBFFI HEADERS MISSING (ffi.h). 'cffi' package cannot build because libffi-dev/libffi-devel was NOT installed by the system package manager. This is REQUIRED for cryptography / bcrypt / PyNaCl / paramiko builds. Fix: apt install libffi-dev, or dnf install libffi-devel, or apk add libffi-dev — then rerun Option 4."
+      fi
+      if printf '%s' "$log_lower" | grep -Eq "pyweakref_getobject|py_dePRECATED\(3\.13\)|error: command '.*gcc' failed with exit code 1.*psycopg|building '_cffi_backend' extension failed"; then
+        # Combination of PyWeakref deprecation + C compile failure usually = Python too new
+        # for the pinned old package versions. Check actual venv Python major/minor.
+        local actual_py_ver=""
+        actual_py_ver="$($active_py -c 'import sys;print("%s.%s" % (sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "?")"
+        if [ "$actual_py_ver" != "?" ]; then
+          local amj="${actual_py_ver%%.*}" amin="${actual_py_ver#*.}"
+          if [ "$amj" -eq 3 ] && [ "$amin" -ge 14 ] 2>/dev/null; then
+            bullets="${bullets}|★ PYTHON TOO NEW FOR PINNED SDISTS (locked=${actual_py_ver}). Python 3.14+ removes many deprecated CPython C-API symbols that old pinned sdist versions still use (psycopg2-binary 2.9.9 calls PyWeakref_GetObject which was removed in 3.14). The installer should have REFUSED 3.14+ automatically — if it didn't, no Python 3.10/3.11/3.12/3.13 was on PATH at install time. Fix: INSTALL Python 3.11/3.12 from repos: apt install python3.11 python3.11-venv python3.11-pip python3.11-dev, then rerun Option 4."
+          fi
+        fi
       fi
       if printf '%s' "$log_lower" | grep -Eq "no matching distribution found"; then
         # Generic "no matching" — only show if more specific bullets didn't fire.
