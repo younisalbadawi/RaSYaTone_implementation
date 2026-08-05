@@ -458,6 +458,251 @@ prompt_yn() {
   if confirm_yn "$@"; then printf "y"; else printf "n"; fi
 }
 
+# ── _autodetect_django_settings_module: detect + pick DJANGO_SETTINGS_MODULE from a cloned repo ──
+# Called RIGHT AFTER git clone succeeds (APP_DIR/.git exists, repo is populated). Never before.
+# Detection priority order (highest → lowest):
+#   (1) Parse $APP_DIR/manage.py for the canonical line:
+#           os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pkg.settings")
+#       This is what django-admin startproject writes and what Django itself falls back to.
+#   (2) Filesystem scan under $APP_DIR: find Django "settings.py" files (or settings/ packages).
+#       Rank by production-desirability so production.py beats dev.py.
+#
+# After building the sorted candidate list, ALWAYS shows a confirmation pick list (per user choice)
+# — never silently picks. If 0 candidates found → fall back to prompt_w_retry with dotted-syntax validator.
+#
+# SIDE EFFECTS:
+#   * Sets the global shell variable DJANGO_SETTINGS_MODULE to the chosen value (exported so children inherit)
+#   * OVERWRITES the DJANGO_SETTINGS_MODULE= line in $ENV_FILE via sed-inplace, OR appends if missing.
+#   * Reloads ENV_FILE with `set -a; . "$ENV_FILE"; set +a` so every later step uses the new value.
+#
+# Globals read: APP_DIR, ENV_FILE, DEF_DJANGO_SETTINGS_MODULE
+# Globals written: DJANGO_SETTINGS_MODULE (exported)
+_autodetect_django_settings_module() {
+  [ -d "${APP_DIR:-}" ] || { _warn "_autodetect_django_settings_module: APP_DIR=$APP_DIR missing or empty — skipping detection"; return 2; }
+  local detect_python=""
+  if [ -n "${PYTHON_BIN:-}" ] && [ -x "$PYTHON_BIN" ]; then detect_python="$PYTHON_BIN"
+  elif command -v python3 >/dev/null 2>&1; then detect_python="$(command -v python3)"
+  elif command -v python  >/dev/null 2>&1; then detect_python="$(command -v python)"
+  else detect_python=""; fi
+
+  # ── Stage 1: use Python to build a SORTED candidate list (score desc). Python handles regex + path joins cleanly. ──
+  local cand_raw="" cand_rc=0
+  if [ -n "$detect_python" ]; then
+    cand_rc=0
+    cand_raw=$( APP_DIR_ROOT="$APP_DIR" DEF_MOD="$DEF_DJANGO_SETTINGS_MODULE" "$detect_python" - <<'PY' 2>&1 || cand_rc=$?
+import os, re, sys, glob
+app_root = os.environ["APP_DIR_ROOT"]
+def_mod   = os.environ.get("DEF_MOD", "")
+
+cands = []  # list of (score:int, dotted:str, source:str, rel_path:str)
+
+# ── (a) Parse manage.py ──
+manage_py = os.path.join(app_root, "manage.py")
+if os.path.isfile(manage_py):
+    try:
+        with open(manage_py, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except Exception:
+        content = ""
+    # Match: os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pkg.settings")  OR
+    #        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'pkg.settings')
+    m = re.search(
+        r"""DJANGO_SETTINGS_MODULE\s*["']?\s*,\s*["']([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)["']""",
+        content,
+    )
+    if m:
+        dotted = m.group(1)
+        parts = dotted.split(".")
+        rel_path = os.path.join(*parts) + ".py"
+        cands.append((100, dotted, "manage.py DJANGO_SETTINGS_MODULE", rel_path))
+
+# ── (b) Filesystem scan for settings.py / settings/*.py ──
+# First find all top-level package dirs (D under app_root that contain __init__.py), then look inside.
+for entry in sorted(os.listdir(app_root)):
+    pkg_dir = os.path.join(app_root, entry)
+    if not os.path.isdir(pkg_dir):
+        continue
+    if not (os.path.isfile(os.path.join(pkg_dir, "__init__.py")) or os.path.isfile(os.path.join(pkg_dir, "__init__.pyi"))):
+        # Not a strict Python package — could still be the settings dir if user has no __init__.py.
+        # Skip anyway because Django project layout convention ALWAYS puts settings.py INSIDE a package with __init__.py.
+        pass
+    # entry is a plausible top-level package. Look for settings files.
+    entry_score_bump = 0
+    # Top-level entry that matches "project name" heuristics: contains 'app'/'proj'/'config'/'core'/'main' or matches DEF_MOD prefix → bonus.
+    def_mod_prefix = def_mod.split(".")[0] if def_mod else ""
+    if def_mod_prefix and entry == def_mod_prefix: entry_score_bump += 5
+    # Plain D/settings.py (startproject default)
+    settings_py = os.path.join(pkg_dir, "settings.py")
+    if os.path.isfile(settings_py):
+        dotted = f"{entry}.settings"
+        cands.append((80 + entry_score_bump, dotted, f"filesystem {entry}/settings.py", os.path.join(entry, "settings.py")))
+    # D/settings/ subpackage
+    settings_dir = os.path.join(pkg_dir, "settings")
+    if os.path.isdir(settings_dir):
+        base_dotted = f"{entry}.settings"
+        init_py = os.path.join(settings_dir, "__init__.py")
+        if os.path.isfile(init_py):
+            cands.append((75 + entry_score_bump, base_dotted, f"filesystem {entry}/settings/__init__.py (package default)", os.path.join(entry, "settings", "__init__.py")))
+        # Scan individual .py files inside settings/: production > prod > staging > base > dev (dev filtered unless last resort)
+        file_rank = {
+            "production": 90,
+            "prod":       85,
+            "staging":    80,
+            "stage":      78,
+            "base":       60,
+            "common":     58,
+            "dev":        20,
+            "development":18,
+            "local":      15,
+            "test":       10,
+            "tests":       8,
+        }
+        for pyfile in sorted(glob.glob(os.path.join(settings_dir, "*.py"))):
+            basename = os.path.splitext(os.path.basename(pyfile))[0]
+            if basename.startswith("_"):
+                continue
+            score = file_rank.get(basename, 50)
+            dotted = f"{base_dotted}.{basename}"
+            cands.append((score + entry_score_bump, dotted, f"filesystem {entry}/settings/{basename}.py", os.path.join(entry, "settings", basename + ".py")))
+
+# De-duplicate by dotted path (keep highest score). Seen as dict: dotted -> (score, source, rel_path)
+seen = {}
+for score, dotted, source, rel_path in cands:
+    prev = seen.get(dotted)
+    if prev is None or score > prev[0]:
+        seen[dotted] = (score, source, rel_path)
+
+final = sorted(
+    ((score, dotted, source, rel_path) for dotted, (score, source, rel_path) in seen.items()),
+    key=lambda t: (-t[0], t[1])
+)
+
+# Emit to stdout in TSV: score\tdotted\tsource\trel_path
+for (score, dotted, source, rel_path) in final:
+    print(f"{score}\t{dotted}\t{source}\t{rel_path}")
+PY
+)
+  else
+    cand_rc=99; cand_raw=""
+  fi
+
+  # ── Parse TSV output into bash arrays ──
+  local -a cand_scores=() cand_dotted=() cand_sources=() cand_paths=()
+  local num_cands=0
+  if [ "$cand_rc" -eq 0 ] && [ -n "$cand_raw" ]; then
+    while IFS=$'\t' read -r score dotted source rel_path; do
+      [ -z "${dotted:-}" ] && continue
+      cand_scores+=("$score")
+      cand_dotted+=("$dotted")
+      cand_sources+=("$source")
+      cand_paths+=("$rel_path")
+      num_cands=$(( num_cands + 1 ))
+    done <<<"$cand_raw"
+  fi
+
+  # ── Filter candidates that are actually resolvable on disk (score ≥ 60 = production / settings.py / base at minimum) ──
+  local -a good_dotted=() good_source=() good_score=() good_rel=()
+  local num_good=0 i=0
+  for i in "${!cand_dotted[@]}"; do
+    local s="${cand_scores[$i]}" d="${cand_dotted[$i]}" src="${cand_sources[$i]}" rp="${cand_paths[$i]}"
+    local actual_file="${APP_DIR}/${rp}"
+    # If actual resolve failed (e.g. manage.py said pkg.settings but file is missing) → skip.
+    if [ ! -f "$actual_file" ]; then
+      # Try settings/ package without .py (package dir form): if rp ends with __init__.py the dir itself is the package.
+      local dir_equiv="${actual_file%/__init__.py}"
+      if [ ! -d "$dir_equiv" ]; then continue; fi
+    fi
+    if [ "$s" -ge 60 ]; then
+      good_dotted+=("$d"); good_source+=("$src"); good_score+=("$s"); good_rel+=("$rp"); num_good=$(( num_good + 1 ))
+    fi
+  done
+
+  # ── If 0 "good" candidates, use the raw manage.py candidate even if file missing (faithful to repo) or fall back. ──
+  if [ "$num_good" -eq 0 ]; then
+    for i in "${!cand_dotted[@]}"; do
+      good_dotted+=("${cand_dotted[$i]}"); good_source+=("${cand_sources[$i]}")
+      good_score+=("${cand_scores[$i]}"); good_rel+=("${cand_paths[$i]}"); num_good=$(( num_good + 1 ))
+      [ "$num_good" -ge 3 ] && break
+    done
+  fi
+
+  local chosen=""
+  _section "Auto-detect DJANGO_SETTINGS_MODULE (from cloned repo at $APP_DIR)"
+
+  if [ "$num_good" -eq 0 ]; then
+    _warn "Auto-detect found ZERO settings-module candidates under APP_DIR=$APP_DIR (manage.py missing? no *.settings.*.py files?). Falling back to manual input."
+    chosen=$(prompt_w_retry "Django settings module (Python dotted path; env var DJANGO_SETTINGS_MODULE)" \
+      "${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}" 3 _validator_dotted_python_module_syntax \
+      "Syntax error: expected Python dotted identifier like 'myproject.settings' or 'myproject.settings.production' — start with letter/underscore, parts separated by dots, no spaces or leading/trailing dots.")
+  else
+    printf "  \033[1;36mFound %d candidate(s)\033[0m (production-like first). Per your choice, ALWAYS confirming before use:\n" "$num_good" >&2
+    i=0
+    for i in "${!good_dotted[@]}"; do
+      local n=$(( i + 1 ))
+      local score_label=""
+      case "${good_score[$i]}" in
+        100) score_label="\033[0;32mEXACT manage.py line (authoritative)\033[0m" ;;
+        9[0-9]) score_label="\033[0;32mproduction-like (recommended)\033[0m" ;;
+        8[0-9]) score_label="\033[0;32mstartproject default or production-ish\033[0m" ;;
+        7[0-9]) score_label="\033[0;33msettings package default (__init__.py)\033[0m" ;;
+        6[0-9]) score_label="\033[0;33mbase.py (shared; usually OK if no production.py)\033[0m" ;;
+        *)     score_label="\033[0;31mlow-confidence; verify before using\033[0m" ;;
+      esac
+      printf "    \033[1;37m[%d]\033[0m \033[1;36m%s\033[0m\n" "$n" "${good_dotted[$i]}" >&2
+      printf "         source: %s\n         score:  %s\n" "${good_source[$i]}" "$score_label" >&2
+    done
+    local max_n="$num_good"
+    printf "    \033[1;37m[M]\033[0m Enter dotted path manually (override detection)\n" >&2
+    local default_choice="1"
+    local pick=""
+    while [ -z "$chosen" ]; do
+      pick=$(prompt_def "Pick a number [1-$max_n] or M=manual. Default=$default_choice (top=best production match)" "$default_choice")
+      if [ -z "${pick:-}" ]; then pick="$default_choice"; fi
+      case "${pick^^}" in
+        M)
+          chosen=$(prompt_w_retry "Django settings module (Python dotted path; env var DJANGO_SETTINGS_MODULE)" \
+            "${DJANGO_SETTINGS_MODULE:-${good_dotted[0]:-$DEF_DJANGO_SETTINGS_MODULE}}" 3 _validator_dotted_python_module_syntax \
+            "Syntax error: expected Python dotted identifier like 'myproject.settings' or 'myproject.settings.production'. Start with letter/underscore, parts separated by single dots, no spaces or leading/trailing dots.")
+          ;;
+        *)
+          if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "$max_n" ]; then
+            chosen="${good_dotted[$((pick - 1))]}"
+            _ok "Using DJANGO_SETTINGS_MODULE='$chosen' (pick #$pick from list; source=${good_source[$((pick-1))]})."
+          else
+            _warn "Unrecognized pick '$pick' — expected 1..$max_n or M. Try again."
+          fi
+          ;;
+      esac
+    done
+  fi
+
+  # ── FINAL: sanitize + assign to shell var + persist to ENV_FILE + reload ──
+  if ! _validator_dotted_python_module_syntax "$chosen"; then
+    _warn "Final chosen value '$chosen' still failed dotted-syntax sanity check. Forcing DEF_DJANGO_SETTINGS_MODULE='$DEF_DJANGO_SETTINGS_MODULE' (will fail STAGE 1 validation if wrong, with retry prompt)."
+    chosen="$DEF_DJANGO_SETTINGS_MODULE"
+  fi
+  DJANGO_SETTINGS_MODULE="$chosen"
+  export DJANGO_SETTINGS_MODULE
+
+  # Persist to ENV_FILE (replace-or-append same pattern as post-clone probe uses)
+  if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
+    local new_line="DJANGO_SETTINGS_MODULE='${chosen}'" sed_bin="sed"
+    if grep -Eq '^DJANGO_SETTINGS_MODULE=' "$ENV_FILE" 2>/dev/null; then
+      command -v gsed >/dev/null 2>&1 && sed_bin="gsed"
+      sudo "$sed_bin" -i~ -E "s|^DJANGO_SETTINGS_MODULE=.*|${new_line}|" "$ENV_FILE" 2>/dev/null || true
+      sudo rm -f "${ENV_FILE}~" 2>/dev/null || true
+    else
+      printf '%s\n' "$new_line" | sudo tee -a "$ENV_FILE" >/dev/null 2>/dev/null || true
+    fi
+    _ok "Wrote DJANGO_SETTINGS_MODULE='${chosen}' into ENV_FILE=$ENV_FILE (replace-or-append)."
+    set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+    _ok "ENV reloaded from $ENV_FILE. DJANGO_SETTINGS_MODULE now=${DJANGO_SETTINGS_MODULE} (shell + subprocess env)."
+  else
+    _warn "ENV_FILE=$ENV_FILE missing or unreadable — could not persist DJANGO_SETTINGS_MODULE value. Shell variable still set; if later steps fail, write it to env file manually."
+  fi
+  return 0
+}
+
 # ----- Spinner / progress helpers -------------------------------------------
 # These wrap long-running silent operations so the user sees ACTIVITY instead
 # of a blinking cursor for 60-90 seconds. Works for: apt install / pip install /
@@ -1903,8 +2148,8 @@ install_app() {
   GIT_URL=$(prompt_def "Git repository URL (https://... or git@...) (REQUIRED). PRIVATE REPO on your account: URL alone will NOT auth; installer offers METHOD1/METHOD2 wizard next." "${GIT_URL:-}")
   [ -z "$GIT_URL" ] && _die "Git URL is required — cannot clone application without a repo URL"
   GIT_BRANCH=$(prompt_w_retry "Git branch"          "${GIT_BRANCH:-$DEF_GIT_BRANCH}" 3 _validator_nonempty "Git branch CANNOT be empty. Examples: main, master, develop.")
-  DJANGO_SETTINGS_MODULE=$(prompt_w_retry "Django settings module (Python dotted path — written to env var DJANGO_SETTINGS_MODULE per Django convention)" "${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}" 3 _validator_dotted_python_module_syntax \
-    "DJANGO_SETTINGS_MODULE syntax error: expected Python dotted identifier e.g. 'rasyatone.settings' or 'myapp.settings.production'. Rules: (1) start with letter/underscore, (2) parts separated by single dots, (3) no spaces, (4) no leading/trailing dots. HINTS: (a) if settings live at APP_DIR/myapp/settings/prod.py → type 'myapp.settings.prod'. (b) If APP_DIR has rasyaterp/settings.py (default DEF_DJANGO_SETTINGS_MODULE=$DEF_DJANGO_SETTINGS_MODULE above) → type 'rasyaterp.settings'.")
+  # NOTE: DJANGO_SETTINGS_MODULE is now AUTO-DETECTED AFTER git clone (see _autodetect_django_settings_module called right after clone block).
+  #       This is why there is no Step 1 prompt for it: we cannot detect it from an empty APP_DIR; detection uses the cloned manage.py + filesystem.
   GUNICORN_BIND=$(prompt_w_retry "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}" 3 _validator_nonempty "Gunicorn bind CANNOT be empty. Formats: '0.0.0.0:8000' (all), '127.0.0.1:8000' (local only), 'unix:/tmp/rasyatone.sock' (nginx upstream).")
   SERVICE_NAME=$(prompt_w_retry "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}" 3 _validator_nonempty "systemd service name CANNOT be empty. Example: rasyatone (becomes systemctl status rasyatone.service).")
 
@@ -1937,6 +2182,9 @@ install_app() {
 
   _section "Writing $ENV_FILE"
   sudo mkdir -p "$ENV_DIR"
+  # At this point DJANGO_SETTINGS_MODULE may be unset (Step 1 prompt was removed). Write a placeholder; the auto-detection
+  # block right after git clone will OVERWRITE this line with the detected/confirmed value via sed-inplace.
+  : "${DJANGO_SETTINGS_MODULE:=$DEF_DJANGO_SETTINGS_MODULE}"
   printf '%s\n' \
     "# RaSYaTone environment (written by install.sh Option 4. Edit freely; re-running installer overwrites)." \
     "# Database (required for manage.py migrate + app startup)" \
@@ -1954,7 +2202,7 @@ install_app() {
     "SERVICE_NAME='${SERVICE_NAME}'" \
     | sudo tee "$ENV_FILE" >/dev/null
   sudo chmod 0640 "$ENV_FILE" 2>/dev/null || true
-  _ok "$ENV_FILE written (0640). Edit manually if desired."
+  _ok "$ENV_FILE written (0640). DJANGO_SETTINGS_MODULE written as placeholder='${DJANGO_SETTINGS_MODULE}' — will be overwritten by auto-detection right after git clone. Edit manually if desired."
 
   _section "Installing system packages (python >= 3.10 enforced, venv/pip/git/build tools + psql client) via $PM"
   # NOTE: _install_compatible_python_runtime is the SINGLE SOURCE OF TRUTH for
@@ -2082,6 +2330,12 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   # Post-clone safety: a successful clone MUST produce a .git subdir. If it's not there, clone silently failed.
   [ -d "${APP_DIR}/.git" ] || _die "git clone reported exit 0 but ${APP_DIR}/.git does NOT exist — likely empty-branch / repo-initialization race / shallow clone failure. Rerun with a different branch or check repo contents on GitHub."
   _ok "App dir populated (branch=$GIT_BRANCH)"
+  # ── AUTO-DETECT DJANGO_SETTINGS_MODULE from the cloned repo ──
+  # Per user request: we no longer ask for this at Step 1 wizard (APP_DIR was empty — impossible to detect).
+  # Now APP_DIR is populated; this function parses manage.py + scans settings files, shows a confirmation pick
+  # list every time (per user's Show pick list every time choice), persists chosen value to ENV_FILE + reloads env.
+  # If detection fails entirely → falls back to dotted-path manual prompt with syntax validator.
+  _autodetect_django_settings_module
   # ── EARLY POST-CLONE VALIDATION: does DJANGO_SETTINGS_MODULE dotted path MATCH what we actually cloned? ──
   # This is the #1 root cause of the user's `ModuleNotFoundError: No module named 'rasyaterp'` crash at collectstatic/migrate time.
   # We JUST cloned the repo — BEFORE we waste 5-15 minutes creating venv + running pip install (gcc compiles psycopg2,
