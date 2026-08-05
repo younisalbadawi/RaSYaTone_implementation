@@ -1834,6 +1834,47 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   _ok "App dir populated (branch=$GIT_BRANCH)"
 
   _section "Create virtualenv at $APP_DIR/.venv + install dependencies"
+  # ---------------------------------------------------------------------
+  # PRE-CHECK AUTO-HEAL: does a pre-existing $APP_DIR/.venv already exist?
+  # If yes, probe its $venv_python BEFORE we reuse it. The #1 cause of
+  # psycopg2-binary cpython-314 _PyInterpreterState_Get compile crashes is
+  # cause #1 from the DIE message: a STALE .venv created during an earlier
+  # installer run when this server only had python 3.14. We used to just
+  # skip venv creation when dir existed and blindly activate it → wrong
+  # headers. Fix: probe both MIN floor and MAX cap; FAIL either check →
+  # AUTO-WIPE the stale venv so the code below re-creates it cleanly with
+  # the current $PYTHON_BIN (which detection confirmed is 3.10..3.13).
+  # ---------------------------------------------------------------------
+  local venv_py="${APP_DIR:?APP_DIR_EMPTY_GUARD}/.venv/bin/python"
+  if [ -d "${APP_DIR:?}/.venv" ] && [ -x "$venv_py" ]; then
+    local old_ok=0 old_cap_ok=0 old_mm="" old_maj="" old_min=""
+    _py_version_ok "$venv_py" >/dev/null 2>&1 && old_ok=1 || old_ok=0
+    _py_version_within_max_cap "$venv_py" >/dev/null 2>&1 && old_cap_ok=1 || old_cap_ok=0
+    if [ -n "$(command -v "$venv_py" 2>/dev/null || true)" ] || [ -x "$venv_py" ]; then
+      old_mm=$("$venv_py" -c 'import sys;print("%s.%s"%(sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "?")
+    fi
+    if [ "$old_ok" -ne 1 ] || [ "$old_cap_ok" -ne 1 ]; then
+      local old_reason=""
+      if [ "$old_ok" -ne 1 ]; then old_reason="too old (< 3.${MIN_PYTHON_MINOR} Django 5 floor)"; fi
+      if [ "$old_cap_ok" -ne 1 ]; then
+        if [ -n "$old_reason" ]; then old_reason="${old_reason} AND "; fi
+        old_reason="${old_reason}too new (> 3.${MAX_ALLOWED_PYTHON_MINOR} MAX_ALLOWED cap — psycopg2 sdist compile crash)"
+      fi
+      _warn "Pre-existing .venv DETECTED but INCOMPATIBLE — AUTO-FIXING: detected python=${old_mm:-UNKNOWN} which is ${old_reason}. Removing stale venv so installer can re-create it cleanly with PYTHON_BIN=${PYTHON_BIN} (detected compatible)."
+      # Belt-and-braces: refuse to rm ANYTHING that isn't explicitly under $APP_DIR/.venv
+      # (with APP_DIR non-empty via bash :? guard above). Also check the directory has
+      # either bin/activate or bin/python (i.e. really a venv, not random user data).
+      if [ ! -f "${APP_DIR:?}/.venv/bin/activate" ] && [ ! -x "${APP_DIR:?}/.venv/bin/python" ]; then
+        _die "REFUSING to auto-remove ${APP_DIR}/.venv — it has no bin/activate or bin/python, so it is NOT a Python venv directory (user data there?). Remove it manually and rerun Option 4 if you are SURE it's safe."
+      fi
+      _run_with_spinner "Auto-remove stale INCOMPATIBLE .venv (python=${old_mm}, reason=${old_reason// /_})" bash -c "sudo rm -rf '${APP_DIR}/.venv'" || \
+        _die "Auto-remove stale venv FAILED (rc=$?). Try manually: sudo rm -rf '${APP_DIR}/.venv' then rerun Option 4."
+      _ok "Auto-FIX applied: stale ${old_mm} .venv removed cleanly. Will now create a FRESH venv with PYTHON_BIN=${PYTHON_BIN##*/}."
+    else
+      _ok "Reusing pre-existing .venv at ${APP_DIR}/.venv — probed python=${old_mm} which is compatible (>= 3.${MIN_PYTHON_MINOR}, <= 3.${MAX_ALLOWED_PYTHON_MINOR})."
+    fi
+  fi
+  # Now the regular create-flow (if directory already exists, it's compatible).
   if [ ! -d "$APP_DIR/.venv" ]; then
     _run_with_spinner "Create venv with PYTHON_BIN=${PYTHON_BIN##*/} -> $APP_DIR/.venv" bash -c "'$PYTHON_BIN' -m venv '$APP_DIR/.venv'" || \
       _die "venv creation FAILED with PYTHON_BIN=${PYTHON_BIN}. Check disk free space in $APP_DIR (>= 1 GB) and that ${PYTHON_BIN##*/}-venv / ensurepip is installed."
@@ -1854,38 +1895,57 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   # _py_version_ok (above) only checks MIN floor and accepts 3.14+ silently,
   # which causes psycopg2-binary 2.9.9 sdist build to compile against /usr/include/python3.14
   # headers and fail with: _PyInterpreterState_Get implicit declaration (symbol removed in 3.14).
-  # If this fails → loud die with exact instructions BEFORE any gcc runs.
+  #
+  # AUTO-HEAL (belt+braces): if somehow the PRE-CHECK auto-wipe above missed this case
+  # (e.g. venv was created by a concurrent process RIGHT AFTER pre-check probe),
+  # try ONE single auto-recreate with the current $PYTHON_BIN. Only DIE if the 2nd
+  # attempt ALSO produces incompatible python.
   local active_mm="" active_maj="" active_min=""
   active_mm=$("$active_py" -c 'import sys;print("%s.%s" % (sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "0.0")
   active_maj="${active_mm%%.*}"; active_min="${active_mm#*.}"
   if ! _py_version_within_max_cap "$active_py" 2>/dev/null; then
-    _die "\
-Venv Python ${active_mm} is ABOVE MAX_ALLOWED_PYTHON_MINOR=3.${MAX_ALLOWED_PYTHON_MINOR}.
-This is the EXACT failure that produces: error: implicit declaration of function '_PyInterpreterState_Get'
-when psycopg2-binary 2.9.9 (old pinned sdist) compiles against python3.14+ headers.
+    _warn "Post-activate gate: venv python=${active_mm} IS STILL INCOMPATIBLE (> MAX=3.${MAX_ALLOWED_PYTHON_MINOR}) even after pre-check auto-wipe pass. Running FINAL single auto-recreate attempt with PYTHON_BIN=${PYTHON_BIN}…"
+    # Safety guard: only remove real venv (bin/activate OR bin/python exists here)
+    if [ ! -f "${APP_DIR:?}/.venv/bin/activate" ] && [ ! -x "${APP_DIR:?}/.venv/bin/python" ]; then
+      _die "Post-activate auto-fix REFUSING to remove ${APP_DIR}/.venv — it doesn't look like a real venv (no bin/activate or bin/python). Remove manually if safe."
+    fi
+    _run_with_spinner "Post-activate auto-fix: remove incompatible ${active_mm} .venv" bash -c "sudo rm -rf '${APP_DIR:?}/.venv'" || \
+      _die "Post-activate: auto-remove of incompatible venv FAILED. Manual fix: sudo rm -rf '${APP_DIR:?}/.venv' ; rerun Option 4."
+    _run_with_spinner "Post-activate auto-fix: recreate venv with ${PYTHON_BIN##*/}" bash -c "'${PYTHON_BIN}' -m venv '${APP_DIR:?}/.venv'" || \
+      _die "Post-activate: recreate venv with PYTHON_BIN=${PYTHON_BIN} FAILED. Fix the underlying system package issue (${PYTHON_BIN##*/}-venv missing? disk full?) then rerun Option 4."
+    # Re-activate with our new fixed venv
+    set +u
+    . "$APP_DIR/.venv/bin/activate" 2>/dev/null || true
+    set -u
+    active_py="$(command -v python 2>/dev/null || echo "")"
+    [ -n "$active_py" ] || _die "Post-activate auto-recreate: reactivate FAILED. Venv at ${APP_DIR}/.venv is broken. Try: sudo rm -rf '${APP_DIR:?}/.venv' ; rerun Option 4."
+    active_mm=$("$active_py" -c 'import sys;print("%s.%s" % (sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "0.0")
+    _py_version_ok "$active_py" || _die "Post-activate auto-recreate: regenerated venv python (${active_mm}) TOO OLD (< 3.${MIN_PYTHON_MINOR}). PYTHON_BIN=${PYTHON_BIN} is wrong or broken. Try: install python3.11 (deadsnakes PPA), then rerun Option 4."
+    if ! _py_version_within_max_cap "$active_py" 2>/dev/null; then
+      _die "\
+Post-activate AUTO-FIX FAIL (2nd attempt also produced incompatible venv).
 
-Why did this happen: the installer picked PYTHON_BIN=${PYTHON_BIN} during
-detection but the actual venv python at $(command -v python 2>/dev/null) ended up
-being a different (newer) binary. Most common causes:
-  (1) pre-existing .venv from a previous run (created when this server only had
-      python 3.14) was reused because we skip venv creation if dir exists.
-  (2) shell PATH order / update-alternatives swapped /usr/bin/python3 between
-      detection and venv creation.
-  (3) you manually created the venv with system python3=3.14.
+Venv Python ${active_mm} is STILL ABOVE MAX_ALLOWED_PYTHON_MINOR=3.${MAX_ALLOWED_PYTHON_MINOR}
+EVEN AFTER two auto-wipe+recreate cycles with PYTHON_BIN=${PYTHON_BIN}.
 
-Remedy (exact, copy-paste commands — run as root on server):
-  rm -rf '${APP_DIR}/.venv'
+This means PYTHON_BIN=${PYTHON_BIN} itself IS ABOVE the cap. Something went wrong
+earlier in detection: what should happen is _detect_compatible_python3() should
+have DIED loud before we ever got to venv creation with exact instructions.
+
+Run THESE commands as root now and rerun Option 4:
+  sudo rm -rf '${APP_DIR:?}/.venv'
   apt install -y software-properties-common ca-certificates
   DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv python3.11-dev python3-pip
-  command -v python3.11 && python3.11 --version   # expect Python 3.11.x
+  command -v python3.11 && python3.11 --version   # expect 3.11.x
 
-Then re-run Option 4. It will wipe any leftover stale .venv automatically when
-you confirm dir overwrite in the git clone step, and recreate it with python3.11.
-MAX_ALLOWED_PYTHON_MINOR=${MAX_ALLOWED_PYTHON_MINOR} is intentional; do NOT raise to 14 or above —
-old pinned sdists (psycopg2-binary 2.9.9, etc.) break on cpython-314+ and there
-are no prebuilt wheels for them either."
+Then re-run the installer — detection will now prefer python3.11 over python 3.14.
+MAX_ALLOWED_PYTHON_MINOR=3.${MAX_ALLOWED_PYTHON_MINOR} is INTENTIONAL: do NOT
+raise it or psycopg2-binary 2.9.9 and 10+ other pinned sdists will still fail
+with _PyInterpreterState_Get / PyWeakref_GetObject compile errors."
+    fi
+    _ok "Post-activate AUTO-HEAL SUCCESS (2nd pass OK). Venv rebuilt cleanly with PYTHON_BIN=${PYTHON_BIN##*/} -> python=${active_mm}. Installer continues normally."
   fi
   _ok "Venv Python OK: ${active_py} -> Python ${active_mm} (>=3.${MIN_PYTHON_MINOR}, <= 3.${MAX_ALLOWED_PYTHON_MINOR}) — pip install will compile against correct headers"
   _run_with_spinner "pip upgrade (pip+setuptools+wheel in venv)" bash -c "python -m pip install --quiet --upgrade pip setuptools wheel" || \
