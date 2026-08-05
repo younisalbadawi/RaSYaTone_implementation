@@ -3072,7 +3072,7 @@ PY
     _ok "Weasyprint PDF preflight OK (import weasyprint + HTML class resolves — libpango/cairo system libs present)."
     printf "%s\n" "$wp_pf_out" | sed 's#^#    #' >&2 || true
   else
-    _warn "Weasyprint PDF preflight FAILED all $wp_pf_max attempts. The migrate command WILL LIKELY FAIL NEXT with EXACT same OSError if your views/__init__.py still does `from weasyprint import HTML` at top level. Migrate banner has a new Cause (F) section with copy-paste install lines to recover."
+    _warn "Weasyprint PDF preflight FAILED all $wp_pf_max attempts. The migrate command WILL LIKELY FAIL NEXT with EXACT same OSError if your views/__init__.py still does 'from weasyprint import HTML' at top level. Migrate banner has a new Cause (F) section with copy-paste install lines to recover."
   fi
   set -e
 
@@ -3327,8 +3327,8 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
 
   (E) PYTHON version mismatch. Venv python: $venv_pv. Must be >= 3.10 AND <= 3.$MAX_ALLOWED_PYTHON_MINOR (3.13 — intentionally capped to avoid psycopg2 cpython-314 _PyInterpreterState_Get compile crash).
 
-  (F) **FFSHARED LIBRARY / WEASYPRINT PDF FAILURE — THE EXACT CRASH YOU JUST HIT (see FRESH DIRECT traceback above: "OSError: cannot load library 'libpango-1.0-0' / 'libcairo.so.2' / 'libgdk_pixbuf'"). ROOT CAUSE:**
-      Django migrate -> run_checks() -> imports ROOT_URLCONF (`rasya_terp/urls.py`) -> includes `core/accounts/urls.py` -> imports views.__init__ at module top-level -> imports `core/accounts/views/reports.py` -> top-level `from weasyprint import HTML` -> weasyprint tries to dlopen() its C libraries via cffi. These are NOT pip packages; they are system shared libraries that were missing from the baseline install on this server.
+  (F) **FFI / SHARED LIBRARY / WEASYPRINT PDF FAILURE — THE EXACT CRASH YOU JUST HIT (see FRESH DIRECT traceback above for: OSError: cannot load library libpango-1.0-0 / libcairo.so.2 / libgdk_pixbuf). ROOT CAUSE:**
+      Django migrate -> run_checks() -> imports ROOT_URLCONF (= rasya_terp.urls per settings) -> includes 'core.accounts.urls' -> imports views.__init__ at module top-level -> imports core/accounts/views/reports.py -> top-level 'from weasyprint import HTML' -> weasyprint tries to dlopen() its C libraries via python cffi. These are NOT pip packages; they are system shared libraries that were missing from the baseline install on this server.
       **django.setup() Cause (A) probe PASSED because django.setup() does NOT import URLconfs. migrate's check() DOES import URLconfs. That's why Cause (A) OK but migrate FAIL.**
       COPY-PASTE SINGLE-COMMAND FIX (run as root; pick the one for your distro):
         [Debian/Ubuntu apt]:   apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 shared-mime-info fonts-liberation2 fontconfig-config fontconfig
@@ -3336,7 +3336,7 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
         [Alpine apk]:          apk add --no-cache pango cairo gdk-pixbuf fontconfig ttf-liberation
       After install:  sudo ldconfig   (clears dlopen() cache so new libs visible)
                       then re-run Option 4 or run migrate manually: $mig_cmd_fresh
-      PREVENTION: Installer now runs a "Weasyprint PDF PREFLIGHT" 2-attempt probe RIGHT AFTER pip install (before collectstatic/migrate block). It offers an AUTO-INSTALL of these libs via prompt_edit_multiple so you never hit this error inside the migrate retry banner again.
+      PREVENTION: Installer now runs a 'Weasyprint PDF PREFLIGHT' 2-attempt probe RIGHT AFTER pip install (before collectstatic/migrate block). It offers an AUTO-INSTALL of these libs via prompt_edit_multiple so you never hit this error inside the migrate retry banner again.
 
 COPY-PASTE REPRODUCE (SINGLE LINE):
   $mig_cmd_fresh
