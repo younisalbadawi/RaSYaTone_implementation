@@ -1875,9 +1875,56 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
     fi
   fi
   # Now the regular create-flow (if directory already exists, it's compatible).
+  # AUTO-RETRY LADDER for the exact common failure mode you pasted:
+  #   [FAIL] Create venv with PYTHON_BIN=python3.11 … FAILED …
+  #   Error: Command '['/opt/rasyatone/.venv/bin/python3.11','-m','ensurepip','--upgrade','--default-pip']' \
+  #          returned non-zero exit status 1.
+  # Two causes → two fixes in order:
+  #   ATTEMPT 1: plain "$PYTHON_BIN -m venv path" (default path, ensurepip runs inside venv — standard).
+  #   On FAIL → _warn + ATTEMPT 2 PREP: run _validate_and_bootstrap_py_venv_pip (installs distro
+  #              python3-venv meta-package which ships shared ensurepip wheels for *all* interpreters,
+  #              then runs ensurepip on the HOST python so it has wheels cached) → re-run plain create.
+  #   On FAIL → ATTEMPT 3: "$PYTHON_BIN -m venv --without-pip path" (skips ensurepip inside venv;
+  #              we bootstrap pip manually AFTER venv activate using the host's pip cache). This
+  #              will succeed if "$PYTHON_BIN -m venv --help" works (i.e. only the inside-venv ensurepip
+  #              step is broken). We then run pip bootstrap inside the active venv post-create.
+  # Only die AFTER ATTEMPT 3 ALSO fails (real issue: disk full, permissions, broken python install).
   if [ ! -d "$APP_DIR/.venv" ]; then
-    _run_with_spinner "Create venv with PYTHON_BIN=${PYTHON_BIN##*/} -> $APP_DIR/.venv" bash -c "'$PYTHON_BIN' -m venv '$APP_DIR/.venv'" || \
-      _die "venv creation FAILED with PYTHON_BIN=${PYTHON_BIN}. Check disk free space in $APP_DIR (>= 1 GB) and that ${PYTHON_BIN##*/}-venv / ensurepip is installed."
+    local vcreate_attempt=0 vcreate_done=0
+    while [ $vcreate_attempt -lt 3 ] && [ $vcreate_done -ne 1 ]; do
+      vcreate_attempt=$(( vcreate_attempt + 1 ))
+      case $vcreate_attempt in
+        1)
+          _info "venv create ATTEMPT 1/3: default mode (with ensurepip inside venv) using PYTHON_BIN=${PYTHON_BIN##*/}"
+          if _run_with_spinner "Create venv [1/3]: PYTHON_BIN=${PYTHON_BIN##*/} $APP_DIR/.venv" bash -c "'$PYTHON_BIN' -m venv '$APP_DIR/.venv'"; then
+            vcreate_done=1
+          fi
+          ;;
+        2)
+          _warn "venv create ATTEMPT 1 FAILED — root cause is almost always: deadsnakes shipped python3.11 but the distro-wide python3-venv META-PACKAGE (which provides the SHARED ensurepip wheels that ALL interpreters reuse) was NOT installed on this server. Running AUTO-FIX: _validate_and_bootstrap_py_venv_pip $PYTHON_BIN (this installs python3-venv via apt/dnf/apk + runs host ensurepip to cache wheels) then retrying create once more…"
+          _validate_and_bootstrap_py_venv_pip "$PYTHON_BIN" || true
+          if _run_with_spinner "Create venv [2/3]: (after bootstrap) PYTHON_BIN=${PYTHON_BIN##*/} $APP_DIR/.venv" bash -c "'$PYTHON_BIN' -m venv '$APP_DIR/.venv'"; then
+            vcreate_done=1
+          fi
+          ;;
+        3)
+          _warn "venv create ATTEMPT 2 FAILED (inside-venv ensurepip STILL crashing). Running FINAL ATTEMPT 3: create venv with --without-pip (skips the broken ensurepip step inside venv). We will bootstrap pip MANUALLY inside the activated venv immediately after create, so install continues normally."
+          if _run_with_spinner "Create venv [3/3]: --without-pip then manual bootstrap later" bash -c "'$PYTHON_BIN' -m venv --without-pip '$APP_DIR/.venv'"; then
+            vcreate_done=1
+          fi
+          ;;
+      esac
+    done
+    if [ $vcreate_done -ne 1 ]; then
+      _die "venv creation FAILED after 3 ATTEMPTS with PYTHON_BIN=${PYTHON_BIN}. ATTEMPT 1 = default mode, ATTEMPT 2 = after bootstrap install python3-venv meta, ATTEMPT 3 = --without-pip bypass. ALL 3 failed — this is NOT a standard deadsnakes issue. Check: (1) disk free space in $APP_DIR >= 1 GB? (2) mkdir permissions on $APP_DIR/.venv for the user running this script? (3) is ${PYTHON_BIN} actually working? Run: ${PYTHON_BIN} -c 'import venv,sys; print(sys.version)' If that crashes, reinstall python3.11 via deadsnakes completely: sudo apt purge -y python3.11 python3.11-dev python3.11-minimal ; sudo apt autoremove -y ; sudo apt install -y python3.11 python3.11-dev python3.11-venv ; rerun Option 4."
+    fi
+    local created_py_mm=""
+    if [ -x "${APP_DIR:?}/.venv/bin/python" ]; then
+      created_py_mm=$("${APP_DIR}/.venv/bin/python" -c 'import sys;print("%s.%s"%(sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "?")
+    else
+      created_py_mm="unknown (venv_broken"
+    fi
+    _ok "venv CREATE SUCCESS (attempt ${vcreate_attempt}/3). Location: ${APP_DIR}/.venv, detected-python=${created_py_mm}"
   fi
   # shellcheck disable=SC1091
   # NOTE: `set -u` (nounset) from top of script causes activate scripts to crash
@@ -1948,6 +1995,35 @@ with _PyInterpreterState_Get / PyWeakref_GetObject compile errors."
     _ok "Post-activate AUTO-HEAL SUCCESS (2nd pass OK). Venv rebuilt cleanly with PYTHON_BIN=${PYTHON_BIN##*/} -> python=${active_mm}. Installer continues normally."
   fi
   _ok "Venv Python OK: ${active_py} -> Python ${active_mm} (>=3.${MIN_PYTHON_MINOR}, <= 3.${MAX_ALLOWED_PYTHON_MINOR}) — pip install will compile against correct headers"
+  # ---------------------------------------------------------------------------
+  # POST-ACTIVATE PIP BOOTSTRAP GUARANTEE (required for --without-pip ATTEMPT 3).
+  # If we created venv with ATTEMPT 3 fallback (--without-pip flag) to bypass
+  # the crashed ensurepip inside venv → venv/bin/python exists but NO `pip`
+  # module is present. The next line `python -m pip install --upgrade …` will
+  # immediately crash with ImportError: No module named pip. Fix: run a 2-step
+  # bootstrap inside the ACTIVATED venv FIRST:
+  #   (1) try `python -m ensurepip --upgrade` (uses host wheels cached by the
+  #       _validate_and_bootstrap_py_venv_pip call in ATTEMPT 2)
+  #   (2) if ensurepip fails → curl get-pip.py → pipe into activated python
+  # Only die if BOTH fail AND python -m pip STILL isn't present.
+  # ---------------------------------------------------------------------------
+  if ! python -m pip --version >/dev/null 2>&1; then
+    _warn "Activated venv has NO pip module (venv was created with --without-pip bypass, or inside-venv ensurepip failed silently). Running ACTIVATED venv pip bootstrap now."
+    if ! _run_with_spinner "Bootstrap pip (inside venv): python -m ensurepip --upgrade" python -m ensurepip --upgrade; then
+      _warn "ensurepip inside activated venv FAILED — last resort: curl get-pip.py -> activated python"
+      curl -fsSL --max-time 60 https://bootstrap.pypa.io/get-pip.py -o /tmp/rasyatone_venv_get_pip.py 2>/dev/null || true
+      if [ -s /tmp/rasyatone_venv_get_pip.py ]; then
+        _run_with_spinner "Bootstrap pip (inside venv): pipe get-pip.py" python /tmp/rasyatone_venv_get_pip.py --quiet || true
+      else
+        _nok "get-pip.py download FAILED (60s timeout / no internet). Pip cannot be installed; pip install line below will crash."
+      fi
+      rm -f /tmp/rasyatone_venv_get_pip.py 2>/dev/null || true
+    fi
+    if ! python -m pip --version >/dev/null 2>&1; then
+      _die "Post-activate pip bootstrap FAILED completely. Could NOT produce a working `python -m pip` inside the activated venv via ensurepip or get-pip.py download. Root causes in order: (1) no internet from this server to pypi.org + bootstrap.pypa.io; (2) activated venv python itself is broken. Try: curl -fsSL -I https://pypi.org/simple/pip/ ; if that fails → fix server network/DNS/firewall first. If network OK → reinstall python3.11: sudo apt purge -y python3.11 python3.11-dev python3.11-minimal ; sudo apt autoremove -y ; sudo apt install -y python3.11 python3.11-dev python3.11-venv ; rerun Option 4."
+    fi
+    _ok "Post-activate pip bootstrap SUCCESS: pip is present inside activated venv (version: $(python -m pip --version 2>/dev/null || echo unknown))."
+  fi
   _run_with_spinner "pip upgrade (pip+setuptools+wheel in venv)" bash -c "python -m pip install --quiet --upgrade pip setuptools wheel" || \
     _die "pip upgrade failed — venv Python is broken or no internet. Try: $active_py -m ensurepip --upgrade"
   if [ -f "$APP_DIR/requirements.txt" ]; then
