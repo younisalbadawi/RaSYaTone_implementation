@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-03T2015-fix-default-ALL-pg-hba"
+SCRIPT_VERSION_BUILD="2026-08-05T2300-fix-multiline-awk-parse-error-auth-app-undefinedtable"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -3579,15 +3579,10 @@ PY
       local undef_rel="" undef_app_guess=""
       undef_rel=$( printf '%s\n' "$fresh_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
       if [ -n "${undef_rel}" ]; then
-        # Relation name pattern: "auth_app_user" = app_label "auth_app" OR "app_modelname". Guess first two non-underscore segments joined, or first segment.
-        undef_app_guess=$(printf '%s' "$undef_rel" | awk -F'_' '{
-          if (NF >= 2) {
-            # Try: common pattern {app}_{model} → app_label = first segment. But custom multi-word app labels like
-            # "core_accounts_user" have app_label = "core_accounts" (first 2 segments joined by _). We can't know
-            # for sure, so emit both guesses separated by /, caller will offer both.
-            if (NF > 2) { print $1"_"$2"/"$1 } else { print $1 }
-          } else { print $0 }
-        }' 2>/dev/null || true)
+        # Relation name pattern: "auth_app_user" = app_label "auth_app". "core_accounts_user" = app_label could be
+        # "core_accounts" (seg1_seg2) or just "core" (seg1). Emit both separated by "/". Run awk on SINGLE LINE only
+        # (avoid multi-line awk inside $() — triggers bash 5.0/5.1 parser bug "while looking for matching )").
+        undef_app_guess=$(printf '%s' "$undef_rel" | awk -F'_' '{if(NF>2)print $1"_"$2"/"$1; else if(NF==2)print $1; else print $0}' 2>/dev/null || true)
       fi
       # Part D: list EXACT env that was used for migrate bash -c (for env leak debugging: APP_DIR empty? DJANGO_SETTINGS_MODULE defaulted?).
       local venv_pv=""
