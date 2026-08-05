@@ -974,8 +974,12 @@ _install_compatible_python_runtime() {
         fi
       fi
       # Always install baseline python3 meta-packages + build tools + libpq/libffi-dev + psql client.
-      _run_with_spinner "Install build tools + python3 meta + libpq-dev + libffi-dev + postgresql-client" \
-        _sudo_pkg_install python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client || true
+      # + WEASYPRINT DEPENDENCIES (CRITICAL for PDF reports): libpango* is what weasyprint's text/ffi.py tries to dlopen().
+      #   Without these, migrate fails with OSError: cannot load library 'libpango-1.0-0' — which the user hit exactly.
+      #   WeasyPrint install docs list these exact runtime libs + fontconfig + shared MIME + liberation fonts (PDF glyphs).
+      _run_with_spinner "Install build tools + python3 meta + libpq-dev + libffi-dev + postgresql-client + weasyprint deps (pango/cairo/fontconfig)" \
+        _sudo_pkg_install python3 python3-venv python3-pip python3-dev git build-essential libpq-dev libffi-dev curl gettext-base postgresql-client \
+          libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 shared-mime-info fonts-liberation2 fontconfig-config fontconfig || true
       ;;
     dnf)
       # dnf (RHEL/Fedora/Rocky/Alma):
@@ -998,15 +1002,20 @@ _install_compatible_python_runtime() {
         fi
       fi
       # Baseline + build tools. Try with postgresql-contrib first; fall back if not available.
-      _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql + postgresql-contrib" \
-        _sudo_pkg_install python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib || \
-      _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql" \
-        _sudo_pkg_install python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql || true
+      # + WEASYPRINT DEPENDENCIES (CRITICAL for PDF reports): pango/cairo/gdk-pixbuf/fontconfig — missing these = OSError during migrate.
+      _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql + postgresql-contrib + weasyprint deps (pango/cairo)" \
+        _sudo_pkg_install python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql postgresql-contrib \
+          pango cairo cairo-gobject gdk-pixbuf2 fontconfig liberation-fonts || \
+      _run_with_spinner "dnf: install python3 meta + gcc + libpq/libffi-devel + postgresql + weasyprint deps (fallback no contrib)" \
+        _sudo_pkg_install python3 python3-devel python3-pip git gcc gcc-c++ make libpq-devel libffi-devel curl postgresql \
+          pango cairo cairo-gobject gdk-pixbuf2 fontconfig liberation-fonts || true
       ;;
     apk)
       # Alpine: python3 + build tools + dev headers.
-      _run_with_spinner "apk: install python3 + build tools + postgresql-dev + libffi-dev" \
-        _sudo_pkg_install python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client || true
+      # + WEASYPRINT DEPENDENCIES (CRITICAL for PDF reports): pango/cairo/gdk-pixbuf/fontconfig/ttf-liberation
+      _run_with_spinner "apk: install python3 + build tools + postgresql-dev + libffi-dev + weasyprint deps (pango/cairo)" \
+        _sudo_pkg_install python3 py3-virtualenv py3-pip python3-dev git build-base postgresql-dev libffi-dev curl postgresql-client \
+          pango cairo gdk-pixbuf fontconfig ttf-liberation || true
       ;;
   esac
   # ---------------------------------------------------------------
@@ -2955,6 +2964,118 @@ the previous 'Only Python 3.14 was found MAX_ALLOWED=3.13' hard die before this 
   [ "$gunrc" -eq 0 ] || _die "Failed to install gunicorn into venv — cannot create systemd unit / start app. See spinner log: /tmp/rasyatone_spin_*.log"
   _ok "venv ready; python=$(command -v python) ($(python --version 2>&1 | head -n1)); gunicorn: $(gunicorn --version 2>&1 | head -n1)"
 
+  # ── WEASYPRINT PREFLIGHT: catch missing system libraries (libpango/cairo/fontconfig) BEFORE migrate ──
+  # The user's EXACT migrate failure was:
+  #     from weasyprint import HTML -> OSError: cannot load library 'libpango-1.0-0'
+  # This happens because: (a) weasyprint pip wheel installs fine without system libs; (b) Django's manage.py migrate
+  # runs run_checks() -> import urlconf -> imports views at module top-level -> `from weasyprint import HTML` triggers
+  # dlopen() inside a CPython FFI (not a Python ImportError). It ONLY surfaces during migrate's urlconf import check,
+  # NOT during `import django; django.setup()` (django.setup doesn't import URLconfs — that's why banner Cause (A) probe PASSes
+  # but migrate FAIL, which confused the user).
+  #
+  # This preflight runs a standalone `import weasyprint` INSIDE the venv with PYTHONPATH set. If it fails with
+  # "cannot load library" OSError -> shows a prompt_edit_multiple menu offering (1) AUTO-INSTALL pango/cairo system libs
+  # via _sudo_pkg_install right here, (2) continue anyway, (3) edit settings. This catches the exact failure 10 minutes
+  # earlier than migrate, before the 3-attempt migrate banner.
+  set +e
+  local wp_pf_attempt=0 wp_pf_max=2 wp_pf_ok=0 wp_pf_out="" wp_pf_rc=0
+  while [ "$wp_pf_attempt" -lt "$wp_pf_max" ] && [ "$wp_pf_ok" -ne 1 ]; do
+    wp_pf_attempt=$(( wp_pf_attempt + 1 ))
+    wp_pf_rc=0
+    wp_pf_out=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || wp_pf_rc=$?
+import sys
+try:
+    import importlib
+    mod = importlib.import_module("weasyprint")
+    html_cls = getattr(mod, "HTML", None)
+    if html_cls is None:
+        print("weasyprint IMPORT OK BUT HTML class MISSING from weasyprint.__init__", file=sys.stderr)
+        sys.exit(3)
+    print("OK: weasyprint=%s; HTML class loaded" % getattr(mod, "__version__", "unknown"))
+    sys.exit(0)
+except ModuleNotFoundError as e:
+    # weasyprint not in requirements.txt — fine, don't force install system libs for an app that doesn't use it.
+    print("SKIP: module not found (weasyprint not in requirements.txt for this app).")
+    sys.exit(0)
+except OSError as e:
+    # FFI dlopen() failure — missing pango/cairo libs — this is the exact user crash.
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+except Exception:
+    import traceback
+    traceback.print_exc()
+    sys.exit(2)
+PY
+)
+    case "$wp_pf_rc" in
+      0) wp_pf_ok=1; break ;;
+      *) # rc>0: we have a problem. Print banner, offer AUTO-INSTALL of system libs via prompt_edit_multiple.
+        local wp_cat=""
+        case "$wp_pf_rc" in
+          1) wp_cat="MISSING SYSTEM LIBRARIES (weasyprint text/ffi.py dlopen() failed on libpango/cairo/fontconfig)." ;;
+          2) wp_cat="weasyprint import INTERNAL ERROR (not FFI/lib missing — traceback above)." ;;
+          3) wp_cat="weasyprint __init__.py loaded but HTML symbol missing — wheel corrupted or partial pip install." ;;
+        esac
+        printf "\n\033[1;33m=== Weasyprint PDF PREFLIGHT FAILED (attempt %d/%d, rc=%d) — %s ===\033[0m\n" "$wp_pf_attempt" "$wp_pf_max" "$wp_pf_rc" "$wp_cat" >&2
+        printf "\033[1;36mPREFLIGHT TRACEBACK (exact lines weasyprint threw):\033[0m\n" >&2
+        printf '%s\n' "$wp_pf_out" | sed 's#^#    #' >&2
+        printf "\n\033[1;36mRecommended fix (Option 1 in menu below): install Pango/Cairo/fontconfig system libs RIGHT NOW (no installer rerun needed).\033[0m\n" >&2
+        if [ "$wp_pf_attempt" -lt "$wp_pf_max" ]; then
+          # prompt_edit_multiple fields that control this failure: we let user choose (1) install libs via AUTO field, (2) confirm skip.
+          # We use a SENTINEL FIELD `WP_AUTOINSTALL_SYSTEM_DEPS` (set to "y") — after prompt_edit_multiple returns and it's "y",
+          # we run _sudo_pkg_install on the system libraries list.
+          WP_AUTOINSTALL_SYSTEM_DEPS="${WP_AUTOINSTALL_SYSTEM_DEPS:-y}"
+          prompt_edit_multiple \
+            "Weasyprint PDF preflight FAILED (attempt $wp_pf_attempt/$wp_pf_max) — missing system libs for pango/cairo/fontconfig. Fix choices (edit WP_AUTOINSTALL_SYSTEM_DEPS='y' then press Enter to AUTO-INSTALL now):" \
+            "WP_AUTOINSTALL_SYSTEM_DEPS DJANGO_SETTINGS_MODULE APP_DIR" \
+            "Retry weasyprint import after making the change(s)? (Enter=yes — autoinstalls libs if WP_AUTOINSTALL_SYSTEM_DEPS=y)" \
+            "y"
+          # If user left WP_AUTOINSTALL_SYSTEM_DEPS=y or set it to y/yes: install the system libs.
+          case "${WP_AUTOINSTALL_SYSTEM_DEPS^^}" in
+            Y|YES|1|TRUE|ON)
+              detect_pm
+              _section "AUTO-INSTALL Weasyprint system deps (pango/cairo/fontconfig, package manager=$PM)"
+              local wp_installed=0
+              case "$PM" in
+                apt)
+                  _run_with_spinner "apt: install weasyprint runtime deps (libpango/libcairo/fontconfig + fonts)" \
+                    _sudo_pkg_install libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 shared-mime-info fonts-liberation2 fontconfig-config fontconfig && wp_installed=1
+                  ;;
+                dnf)
+                  _run_with_spinner "dnf: install weasyprint runtime deps (pango/cairo/gdk-pixbuf + liberation fonts)" \
+                    _sudo_pkg_install pango cairo cairo-gobject gdk-pixbuf2 fontconfig liberation-fonts && wp_installed=1
+                  ;;
+                apk)
+                  _run_with_spinner "apk: install weasyprint runtime deps (pango/cairo/fontconfig + ttf-liberation)" \
+                    _sudo_pkg_install pango cairo gdk-pixbuf fontconfig ttf-liberation && wp_installed=1
+                  ;;
+                *)
+                  _warn "Unknown package manager PM=$PM — cannot AUTO-INSTALL. Please run: (apt/dnf/apk) install pango cairo fontconfig (and font packages), then retry."
+                  ;;
+              esac
+              if [ "$wp_installed" -eq 1 ]; then
+                _ok "Weasyprint system deps installed via $PM. Next iteration will retry import."
+                # Clear any ld.so cache so dlopen() can see the new libs
+                command -v ldconfig >/dev/null 2>&1 && sudo ldconfig 2>/dev/null || true
+              fi
+              ;;
+            *)
+              _warn "WP_AUTOINSTALL_SYSTEM_DEPS set to non-yes value '${WP_AUTOINSTALL_SYSTEM_DEPS}' — skipping AUTO-INSTALL. Will retry the import as-is (likely will fail again unless you installed libs manually outside)."
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+  if [ "$wp_pf_ok" -eq 1 ]; then
+    _ok "Weasyprint PDF preflight OK (import weasyprint + HTML class resolves — libpango/cairo system libs present)."
+    printf "%s\n" "$wp_pf_out" | sed 's#^#    #' >&2 || true
+  else
+    _warn "Weasyprint PDF preflight FAILED all $wp_pf_max attempts. The migrate command WILL LIKELY FAIL NEXT with EXACT same OSError if your views/__init__.py still does `from weasyprint import HTML` at top level. Migrate banner has a new Cause (F) section with copy-paste install lines to recover."
+  fi
+  set -e
+
   _section "Run Django collectstatic + migrate"
   (
     cd "$APP_DIR"
@@ -3205,6 +3326,17 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
         cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations
 
   (E) PYTHON version mismatch. Venv python: $venv_pv. Must be >= 3.10 AND <= 3.$MAX_ALLOWED_PYTHON_MINOR (3.13 — intentionally capped to avoid psycopg2 cpython-314 _PyInterpreterState_Get compile crash).
+
+  (F) **FFSHARED LIBRARY / WEASYPRINT PDF FAILURE — THE EXACT CRASH YOU JUST HIT (see FRESH DIRECT traceback above: "OSError: cannot load library 'libpango-1.0-0' / 'libcairo.so.2' / 'libgdk_pixbuf'"). ROOT CAUSE:**
+      Django migrate -> run_checks() -> imports ROOT_URLCONF (`rasya_terp/urls.py`) -> includes `core/accounts/urls.py` -> imports views.__init__ at module top-level -> imports `core/accounts/views/reports.py` -> top-level `from weasyprint import HTML` -> weasyprint tries to dlopen() its C libraries via cffi. These are NOT pip packages; they are system shared libraries that were missing from the baseline install on this server.
+      **django.setup() Cause (A) probe PASSED because django.setup() does NOT import URLconfs. migrate's check() DOES import URLconfs. That's why Cause (A) OK but migrate FAIL.**
+      COPY-PASTE SINGLE-COMMAND FIX (run as root; pick the one for your distro):
+        [Debian/Ubuntu apt]:   apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 shared-mime-info fonts-liberation2 fontconfig-config fontconfig
+        [RHEL/Fedora dnf]:     dnf install -y pango cairo cairo-gobject gdk-pixbuf2 fontconfig liberation-fonts
+        [Alpine apk]:          apk add --no-cache pango cairo gdk-pixbuf fontconfig ttf-liberation
+      After install:  sudo ldconfig   (clears dlopen() cache so new libs visible)
+                      then re-run Option 4 or run migrate manually: $mig_cmd_fresh
+      PREVENTION: Installer now runs a "Weasyprint PDF PREFLIGHT" 2-attempt probe RIGHT AFTER pip install (before collectstatic/migrate block). It offers an AUTO-INSTALL of these libs via prompt_edit_multiple so you never hit this error inside the migrate retry banner again.
 
 COPY-PASTE REPRODUCE (SINGLE LINE):
   $mig_cmd_fresh
