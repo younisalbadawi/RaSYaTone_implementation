@@ -3212,6 +3212,148 @@ EOBANNER
     else
       _ok "collectstatic ok"
     fi
+    # ── makemigrations: ALWAYS run BEFORE migrate, per user request ──
+    # Flow:
+    #   (1) PROBE: manage.py makemigrations --check --dry-run --verbosity 1
+    #         rc=0 → nothing pending; skip silently.
+    #         rc=1 → model changes detected but no migration files exist → run step (2).
+    #   (2) REAL: manage.py makemigrations (no --check) in a spinner, 3 attempts with prompt_edit_multiple retries
+    #         Fields: DJANGO_SETTINGS_MODULE APP_DIR (same fields as migrate/probes).
+    #         On FAIL: print FRESH traceback outside spinner + 6-block evidence banner.
+    #   (3) MERGE: If there are conflicting migrations (git branches created same migration number)
+    #         automatically run makemigrations --merge --no-input; warn if user interaction required.
+    # Reasoning: Django's manage.py migrate will SILENTLY NO-OP if there are model changes
+    # without corresponding migration files (INSTALLED_APPS models not reflected in migrations
+    # → migrate prints "No migrations to apply" even though tables are missing. Running
+    # makemigrations FIRST guarantees that migrate actually has migration files to apply.
+    local mmk_attempt=0 mmk_max=3 mmk_ok=0 mmk_rc=0 mmk_pending=0
+    local mmk_spin_log="" mmk_fresh_tmp="/tmp/rasyatone_mmk_fresh_$$.tmp"
+    local mmk_cmd_check="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --check --dry-run --verbosity 1"
+    local mmk_cmd_real="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput --verbosity 1"
+    # ── Step (1): PROBE --check --dry-run (cheap, 1 attempt, decides if we need real run) ──
+    set +e
+    local mmk_check_out="" mmk_check_rc=0
+    mmk_check_out=$( bash -c "$mmk_cmd_check" 2>&1 || mmk_check_rc=$? )
+    case "$mmk_check_rc" in
+      0)
+        mmk_pending=0
+        _ok "makemigrations PROBE ok — NO model changes pending; all apps have current migration files."
+        ;;
+      1)
+        mmk_pending=1
+        _section "makemigrations PROBE detected pending model changes (makemigrations --check rc=1). Creating migration files NOW BEFORE migrate (per user request)."
+        printf "%s\n" "$mmk_check_out" | sed 's#^#    #' >&2 || true
+        ;;
+      *)
+        # rc>1 is an actual error (import failure, DB unreachable). Treat like the real step failure → offer retries.
+        mmk_pending=1
+        _warn "makemigrations PROBE returned rc=$mmk_check_rc (not 0/1). Will fall through to 3-attempt real makemigrations retry loop so we can diagnose."
+        printf "%s\n" "$mmk_check_out" | sed 's#^#    #' >&2 || true
+        ;;
+    esac
+    if [ "$mmk_pending" -eq 1 ]; then
+      while [ "$mmk_attempt" -lt "$mmk_max" ] && [ "$mmk_ok" -ne 1 ]; do
+        mmk_attempt=$(( mmk_attempt + 1 ))
+        mmk_spin_log=""
+        mmk_rc=0
+        _run_with_spinner "manage.py makemigrations (attempt $mmk_attempt/$mmk_max) — create migration files for pending model changes" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput --verbosity 1" || mmk_rc=$?
+        local _gl
+        for _gl in $(ls -1t /tmp/rasyatone_spin_*_*makemigrations* 2>/dev/null | head -n 3); do
+          [ -f "$_gl" ] || continue
+          if [ -s "$_gl" ]; then mmk_spin_log="$_gl"; break; fi
+          [ -z "${mmk_spin_log}" ] && mmk_spin_log="$_gl"
+        done
+        if [ "$mmk_rc" -eq 0 ]; then
+          mmk_ok=1
+          # ── Step (3): MERGE conflicts — run AFTER successful makemigrations (rc=0) ──
+          #   Even if rc=0 above, conflicting migration file names (e.g. two 0001_initial.py
+          #   in same app from different git branches) can still cause migrate to fail later.
+          #   makemigrations --merge fixes these; run it with --noinput. rc=1 = "nothing to merge" (ok).
+          set +e
+          local mmk_merge_rc=0 mmk_merge_out=""
+          mmk_merge_out=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --merge --noinput --verbosity 1" 2>&1 || mmk_merge_rc=$? )
+          case "$mmk_merge_rc" in
+            0)   _ok "makemigrations merged conflicting migration files automatically."
+                 printf "%s\n" "$mmk_merge_out" | sed 's#^#    #' >&2 || true ;;
+            1)   : ;;  # "No merge needed" — standard case, silent ;;
+            *)   _warn "makemigrations --merge returned rc=$mmk_merge_rc (may need manual --merge with --no-interactive=false). migrate will likely show conflicting migration names error and offer --merge suggestion." ;
+                 printf "%s\n" "$mmk_merge_out" | sed 's#^#    #' >&2 || true ;;
+          esac
+          set -e
+          break
+        fi
+        # ── makemigrations FAILED this attempt: build detailed evidence banner ──
+        local mmk_fresh_tb=""
+        mmk_fresh_tb=$( bash -c "$mmk_cmd_real" 2>&1 | tail -n 80 || true )
+        printf '%s\n' "$mmk_fresh_tb" > "$mmk_fresh_tmp" 2>/dev/null || true
+        local mmk_dsetup_out="" mmk_dsetup_rc=0
+        mmk_dsetup_out=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || mmk_dsetup_rc=$?
+import os, sys, traceback
+try:
+    import django
+    django.setup()
+    from django.conf import settings
+    print("django.setup() OK; ROOT_URLCONF=%s; INSTALLED_APPS_n=%d; DATABASES.default.HOST=%s" % (settings.ROOT_URLCONF, len(settings.INSTALLED_APPS), settings.DATABASES["default"].get("HOST", "<UNSET>")))
+    sys.exit(0)
+except Exception:
+    traceback.print_exc()
+    sys.exit(2)
+PY
+)
+        local venv_pv=""
+        venv_pv=$("$APP_DIR/.venv/bin/python" -c 'import sys;print(sys.version)' 2>/dev/null || echo "UNKNOWN")
+        printf "\n\033[1;31m=== manage.py makemigrations FAILED attempt %d/%d (rc=%s) — FULL EVIDENCE BELOW ===\033[0m\n" "$mmk_attempt" "$mmk_max" "$mmk_rc" >&2
+        printf "  \033[1;33m[EXACT makemigrations CMD (COPY-PASTE REPRODUCE LINE):]\033[0m\n    %s\n" "$mmk_cmd_real" >&2
+        printf "  \033[1;33m[ENV makemigrations ran with:]\033[0m\n    PYTHONPATH=%s\n    DJANGO_SETTINGS_MODULE=%s\n    VENV_BIN=%s\n    VENV_PY_VERSION=%s\n" \
+          "$APP_DIR" "${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" "$venv_pv" >&2
+        printf "  \033[1;33m[makemigrations SPINNER LOG contents:]\033[0m" >&2
+        if [ -n "${mmk_spin_log}" ] && [ -f "${mmk_spin_log}" ]; then
+          printf " (file=%s, size=$(wc -c <"$mmk_spin_log" 2>/dev/null || echo 0) bytes)\n" "$mmk_spin_log" >&2
+          tail -n 60 "$mmk_spin_log" 2>/dev/null | sed 's#^#    #' >&2 || true
+        else
+          printf "\n    [NO SPINNER LOG FOUND — _run_with_spinner may not have written one]\n" >&2
+        fi
+        printf "  \033[1;33m[FRESH DIRECT traceback (makemigrations rerun OUTSIDE spinner, no redirection):]\033[0m\n" >&2
+        printf '%s\n' "$mmk_fresh_tb" | sed 's#^#    #' >&2
+        printf "  \033[1;33m[django.setup() standalone probe rc=%d]:\033[0m\n" "$mmk_dsetup_rc" >&2
+        printf '%s\n' "$mmk_dsetup_out" | sed 's#^#    #' >&2
+        rm -f "$mmk_fresh_tmp" 2>/dev/null || true
+        if [ "$mmk_attempt" -lt "$mmk_max" ]; then
+          prompt_edit_multiple \
+            "manage.py makemigrations FAILED attempt $mmk_attempt/$mmk_max — edit a field to fix it before we retry:" \
+            "DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+            "Retry makemigrations with (possibly edited) values NOW?" \
+            "y"
+          set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+          export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
+          mmk_cmd_check="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --check --dry-run --verbosity 1"
+          mmk_cmd_real="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput --verbosity 1"
+        else
+          _die "\
+manage.py makemigrations FAILED all $mmk_max attempts (last rc=$mmk_rc).
+
+Categorized causes (most common first):
+
+  (A) DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE is invalid or INSTALLED_APPS contains typos → verify against Cause (A) django.setup probe above. COPY-PASTE:
+        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.apps import apps; [print(a.name) for a in apps.get_app_configs()]'
+
+  (B) DB connection failure (makemigrations introspects DB for swappable AUTH_USER_MODEL / RunPython dependencies). SMOKE TEST:
+        PGPASSWORD='$DB_PASSWORD' psql -h '$DB_HOST' -p '$DB_PORT' -U '$DB_USER' -d '$DB_NAME' -c 'SELECT 1;'
+
+  (C) Migration model integrity error: one of your models has an invalid field definition (e.g. ForeignKey to a model not in INSTALLED_APPS, broken choices). The FRESH traceback above lists the exact line of models.py.
+
+  (D) Python / venv mismatch. Venv python = $venv_pv. If >= 3.14 psycopg2/weasyprint C extensions compile fails earlier at pip step, but makemigrations can still fail to import them.
+
+FULL makemigrations reproduce (SINGLE LINE):
+  $mmk_cmd_real
+"
+        fi
+      done
+      if [ "$mmk_ok" -eq 1 ]; then
+        _ok "manage.py makemigrations SUCCESS (attempt $mmk_attempt/$mmk_max). New migration files written to app/migrations/ subdirectories."
+      fi
+    fi
+    set -e
     # ── migrate: wrapped in 3-attempt retry loop with prompt_edit_multiple + banner shows FRESH traceback on every fail ──
     # The user's EXACT issue: spinner failed with `ModuleNotFoundError: No module named 'rasyaterp'` but the old
     # banner only had static text causes list. This loop:
@@ -3337,6 +3479,18 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
       After install:  sudo ldconfig   (clears dlopen() cache so new libs visible)
                       then re-run Option 4 or run migrate manually: $mig_cmd_fresh
       PREVENTION: Installer now runs a 'Weasyprint PDF PREFLIGHT' 2-attempt probe RIGHT AFTER pip install (before collectstatic/migrate block). It offers an AUTO-INSTALL of these libs via prompt_edit_multiple so you never hit this error inside the migrate retry banner again.
+
+  (G) **makemigrations was never run (migrate will SILENTLY NO-OP on missing migration files).**
+      This is the #1 silent-death bug in Django deploys WITHOUT the preflight probe we added. ROOT CAUSE: A developer pushed model changes (added/renamed a model/field) but forgot to commit the corresponding app/migrations/00XX_*.py files. Django's migrate command does NOT fail here — it prints 'No migrations to apply' and exits 0, even though the tables literally do not exist and will crash at first HTTP request.
+      PROOF this happened: run the probe manually and compare rc:
+        rc=0 = migrations up-to-date (correct)
+        rc=1 = MODEL CHANGES DETECTED BUT NO MIGRATION FILES (THE BUG):
+        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --check --dry-run --verbosity 1 ; echo "rc=$?"
+      AUTOMATIC PROTECTION: this installer now runs makemigrations --check RIGHT BEFORE migrate (between collectstatic and migrate). If rc=1 it automatically runs makemigrations, auto-merges any conflicts, and only then proceeds to migrate.
+      If migrate still fails here AFTER the automatic makemigrations step ran:
+        (1) The git-pushed migration files themselves have syntax errors / Raise / RunPython bugs → run makemigrations standalone debug command.
+        (2) Conflicting migration names (two 0001_initial.py from different branches) → auto --merge ran but may need manual intervention: cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --merge
+        (3) Custom app_config.ready() in INSTALLED_APPS that modifies ORM state at import-time before migrations loader can read migrations dirs → inspect traceback above for app.ready.
 
 COPY-PASTE REPRODUCE (SINGLE LINE):
   $mig_cmd_fresh
