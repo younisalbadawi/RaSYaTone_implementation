@@ -49,7 +49,7 @@ DEF_DB_PORT="5432"
 DEF_LISTEN_ADDRESSES="*"
 DEF_APP_DIR="/opt/rasyatone"
 DEF_GIT_BRANCH="main"
-DEF_DJANGO_SETTINGS="rasyatone.settings"
+DEF_DJANGO_SETTINGS_MODULE="rasyatone.settings"
 DEF_GUNICORN_BIND="0.0.0.0:8000"
 DEF_SERVICE="rasyatone"
 MIN_PYTHON_MAJOR=3
@@ -959,14 +959,14 @@ load_env_file() {
   DB_NAME="$DEF_DB_NAME"; DB_USER="$DEF_DB_USER"; DB_PASSWORD=""
   DB_HOST="$DEF_DB_HOST"; DB_PORT="$DEF_DB_PORT"; LISTEN_ADDRESSES="$DEF_LISTEN_ADDRESSES"
   APP_DIR="$DEF_APP_DIR"; GIT_URL=""; GIT_BRANCH="$DEF_GIT_BRANCH"
-  DJANGO_SETTINGS="$DEF_DJANGO_SETTINGS"; GUNICORN_BIND="$DEF_GUNICORN_BIND"; SERVICE_NAME="$DEF_SERVICE"
+  DJANGO_SETTINGS_MODULE="$DEF_DJANGO_SETTINGS_MODULE"; GUNICORN_BIND="$DEF_GUNICORN_BIND"; SERVICE_NAME="$DEF_SERVICE"
   if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
     set -a; . "$ENV_FILE" || true; set +a
     DB_NAME="${DB_NAME:-$DEF_DB_NAME}"; DB_USER="${DB_USER:-$DEF_DB_USER}"
     DB_HOST="${DB_HOST:-$DEF_DB_HOST}"; DB_PORT="${DB_PORT:-$DEF_DB_PORT}"
     LISTEN_ADDRESSES="${LISTEN_ADDRESSES:-$DEF_LISTEN_ADDRESSES}"
     APP_DIR="${APP_DIR:-$DEF_APP_DIR}"; GIT_BRANCH="${GIT_BRANCH:-$DEF_GIT_BRANCH}"
-    DJANGO_SETTINGS="${DJANGO_SETTINGS_MODULE:-${DJANGO_SETTINGS:-$DEF_DJANGO_SETTINGS}}"
+    DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
     GUNICORN_BIND="${GUNICORN_BIND:-$DEF_GUNICORN_BIND}"; SERVICE_NAME="${SERVICE_NAME:-$DEF_SERVICE}"
     return 0
   fi
@@ -1903,8 +1903,8 @@ install_app() {
   GIT_URL=$(prompt_def "Git repository URL (https://... or git@...) (REQUIRED). PRIVATE REPO on your account: URL alone will NOT auth; installer offers METHOD1/METHOD2 wizard next." "${GIT_URL:-}")
   [ -z "$GIT_URL" ] && _die "Git URL is required — cannot clone application without a repo URL"
   GIT_BRANCH=$(prompt_w_retry "Git branch"          "${GIT_BRANCH:-$DEF_GIT_BRANCH}" 3 _validator_nonempty "Git branch CANNOT be empty. Examples: main, master, develop.")
-  DJANGO_SETTINGS=$(prompt_w_retry "Django settings module (Python dotted path)" "${DJANGO_SETTINGS:-$DEF_DJANGO_SETTINGS}" 3 _validator_dotted_python_module_syntax \
-    "DJANGO_SETTINGS_MODULE syntax error: expected Python dotted identifier e.g. 'rasyatone.settings' or 'myapp.settings.production'. Rules: (1) start with letter/underscore, (2) parts separated by single dots, (3) no spaces, (4) no leading/trailing dots. HINTS: (a) if settings live at APP_DIR/myapp/settings/prod.py → type 'myapp.settings.prod'. (b) If APP_DIR has rasyaterp/settings.py (the default from DEF_DJANGO_SETTINGS above) → type 'rasyaterp.settings'.")
+  DJANGO_SETTINGS_MODULE=$(prompt_w_retry "Django settings module (Python dotted path — written to env var DJANGO_SETTINGS_MODULE per Django convention)" "${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}" 3 _validator_dotted_python_module_syntax \
+    "DJANGO_SETTINGS_MODULE syntax error: expected Python dotted identifier e.g. 'rasyatone.settings' or 'myapp.settings.production'. Rules: (1) start with letter/underscore, (2) parts separated by single dots, (3) no spaces, (4) no leading/trailing dots. HINTS: (a) if settings live at APP_DIR/myapp/settings/prod.py → type 'myapp.settings.prod'. (b) If APP_DIR has rasyaterp/settings.py (default DEF_DJANGO_SETTINGS_MODULE=$DEF_DJANGO_SETTINGS_MODULE above) → type 'rasyaterp.settings'.")
   GUNICORN_BIND=$(prompt_w_retry "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}" 3 _validator_nonempty "Gunicorn bind CANNOT be empty. Formats: '0.0.0.0:8000' (all), '127.0.0.1:8000' (local only), 'unix:/tmp/rasyatone.sock' (nginx upstream).")
   SERVICE_NAME=$(prompt_w_retry "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}" 3 _validator_nonempty "systemd service name CANNOT be empty. Example: rasyatone (becomes systemctl status rasyatone.service).")
 
@@ -1949,7 +1949,7 @@ install_app() {
     "APP_DIR='${APP_DIR}'" \
     "GIT_URL='${GIT_URL}'" \
     "GIT_BRANCH='${GIT_BRANCH}'" \
-    "DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS}'" \
+    "DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}'" \
     "GUNICORN_BIND='${GUNICORN_BIND}'" \
     "SERVICE_NAME='${SERVICE_NAME}'" \
     | sudo tee "$ENV_FILE" >/dev/null
@@ -2093,7 +2093,7 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   _section "Post-clone: validate DJANGO_SETTINGS_MODULE layout matches cloned repo"
   local dsm="" dsm_pkg_dir="" dsm_py_file="" probe_attempt=0 dsm_ok=0 max_dsm_probes=3
   local diag_lines=""   # MUST be declared before stage 2 block so appends work consistently
-  dsm="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS}"
+  dsm="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
   while [ "$probe_attempt" -lt "$max_dsm_probes" ] && [ "$dsm_ok" -ne 1 ]; do
     probe_attempt=$(( probe_attempt + 1 ))
     # Convert dotted path to filesystem path:
@@ -2239,11 +2239,11 @@ $(printf '%s\n' "$repo_top_level" | sed 's#^#      #')
     if [ "$probe_attempt" -lt "$max_dsm_probes" ]; then
       prompt_edit_multiple \
         "Post-clone DJANGO_SETTINGS_MODULE failed early validation (save time before venv/pip install)" \
-        "DJANGO_SETTINGS GIT_URL GIT_BRANCH APP_DIR" \
+        "DJANGO_SETTINGS_MODULE GIT_URL GIT_BRANCH APP_DIR" \
         "Retry layout validation with (possibly edited) values?" \
         "y"
-      # User may have edited DJANGO_SETTINGS → re-sync dsm for next iteration.
-      dsm="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+      # User may have edited DJANGO_SETTINGS_MODULE → re-sync dsm for next iteration.
+      dsm="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
       # Also if user changed GIT_URL/GIT_BRANCH we can't re-clone inside this probe loop — just continue so validation can fail
       # again cleanly.
     fi
@@ -2251,14 +2251,13 @@ $(printf '%s\n' "$repo_top_level" | sed 's#^#      #')
   if [ "$dsm_ok" -ne 1 ]; then
     _warn "Post-clone DJANGO_SETTINGS_MODULE validation FAILED all $max_dsm_probes attempts. Installer will continue (you may have a nonstandard layout the probe can't detect, e.g. dynamic settings package). HOWEVER: if later collectstatic/migrate fails with 'ModuleNotFoundError: No module named …' → THIS is the root cause — recheck: DJANGO_SETTINGS_MODULE=$dsm against APP_DIR=$APP_DIR actual files."
   else
-    # DURING PROBE we may have rewritten DJANGO_SETTINGS via prompt_edit_multiple. WRITE THE CORRECTED VALUE BACK TO ENV_FILE
+    # DURING PROBE we may have rewritten DJANGO_SETTINGS_MODULE via prompt_edit_multiple. WRITE THE CORRECTED VALUE BACK TO ENV_FILE
     # so later pip-install/collectstatic/migrate blocks pick up the correct module path (no more 10-minutes-later ModuleNotFound crash).
-    # We detect change via: current DJANGO_SETTINGS != original DEF_DJANGO_SETTINGS or ENV_FILE value.
     # Only rewrite if we detect a difference (no thrashing). Keep the rest of ENV_FILE intact via a sed-inplace edit that
     # targets the DJANGO_SETTINGS_MODULE= line alone, OR appends if no line.
     if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
       local new_dsm_value="" new_line=""
-      new_dsm_value="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+      new_dsm_value="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
       new_line="DJANGO_SETTINGS_MODULE='${new_dsm_value}'"
       if grep -Eq '^DJANGO_SETTINGS_MODULE=' "$ENV_FILE" 2>/dev/null; then
         if command -v gsed >/dev/null 2>&1; then sed_bin="gsed"; else sed_bin="sed"; fi
@@ -2706,7 +2705,7 @@ the previous 'Only Python 3.14 was found MAX_ALLOWED=3.13' hard die before this 
   (
     cd "$APP_DIR"
     set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
-    export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+    export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
     # Same set -u safety for nested activate inside subshell
     set +u
     # shellcheck disable=SC1091
@@ -2813,27 +2812,27 @@ EOBANNER
         printf "\n\033[1;31m%s\033[0m\n" "$diag_banner" >&2
         prompt_edit_multiple \
           "Django settings import precheck failed (attempt $dpm_attempt/$dpm_max). Edit a field to fix it before we continue:" \
-          "DJANGO_SETTINGS DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+          "DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
           "Retry django.setup() precheck with (possibly edited) values?" \
           "y"
         # If user re-edited DB_* / DJANGO_SETTINGS_MODULE → must reload ENV into THIS subshell
         set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
-        export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+        export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
       else
         _die "$diag_banner"
       fi
     done
-    _ok "Django settings PRECHECK OK (attempt $dpm_attempt/$dpm_max; PYTHONPATH=$APP_DIR; DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}; traceback clean)"
+    _ok "Django settings PRECHECK OK (attempt $dpm_attempt/$dpm_max; PYTHONPATH=$APP_DIR; DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}; traceback clean)"
     set +e
     # collectstatic: first quiet attempt with spinner; if that fails re-run
     # noisily so user sees WHY it failed (STATIC_ROOT / permissions)
-    _run_with_spinner "manage.py collectstatic --noinput (scan static files)" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py collectstatic --noinput >/dev/null 2>&1"
+    _run_with_spinner "manage.py collectstatic --noinput (scan static files)" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py collectstatic --noinput >/dev/null 2>&1"
     local csrc=$?
     set -e
     if [ "$csrc" -ne 0 ]; then
       # Re-run noisily with a secondary spinner so progress still shown during long re-run
       _warn "collectstatic exited non-zero — re-running with full output for debugging:"
-      (cd "$APP_DIR" && PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}" "$APP_DIR/.venv/bin/python" manage.py collectstatic --noinput 2>&1 | tail -n 20 || true)
+      (cd "$APP_DIR" && PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py collectstatic --noinput 2>&1 | tail -n 20 || true)
       _warn "Continuing anyway — if STATIC_ROOT was unset or wrong path this is expected."
     else
       _ok "collectstatic ok"
@@ -2846,16 +2845,16 @@ EOBANNER
     #       a temp file, then dumps: that FRESH traceback + the spinner's own redirected log file (from _run_with_spinner)
     #       + auto-runs cause (A)'s django.setup probe + dumps ENV used so user sees root cause masked by CPython.
     #   (3) BEFORE DIE: offers prompt_edit_multiple menu for all the vars migrate actually uses
-    #       (DJANGO_SETTINGS DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR) so the user
+    #       (DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR) so the user
     #       can fix typoed password / wrong settings module / wrong DB host RIGHT HERE without rerunning the entire installer.
     local mig_attempt=0 mig_max=3 mig_ok=0 mig_rc=0
     local mig_spin_log="" mig_fresh_tmp="/tmp/rasyatone_mig_fresh_$$.tmp"
-    local mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate"
+    local mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate"
     while [ "$mig_attempt" -lt "$mig_max" ] && [ "$mig_ok" -ne 1 ]; do
       mig_attempt=$(( mig_attempt + 1 ))
       mig_spin_log=""
       mig_rc=0
-      _run_with_spinner "manage.py migrate (attempt $mig_attempt/$mig_max) — apply DB migrations" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate" || mig_rc=$?
+      _run_with_spinner "manage.py migrate (attempt $mig_attempt/$mig_max) — apply DB migrations" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate" || mig_rc=$?
       # Locate most recent _run_with_spinner migrate log file (newest by mtime matching label pattern).
       # _run_with_spinner writes to /tmp/rasyatone_spin_<pid>_<label>.log with <label> sanitized — glob newest matching migrate file.
       local _gl
@@ -2876,7 +2875,7 @@ EOBANNER
       printf '%s\n' "$fresh_tb" > "$mig_fresh_tmp" 2>/dev/null || true
       # Part B: auto-run cause (A)'s django.setup probe — this is the #1 cause.
       local dsetup_out="" dsetup_rc=0
-      dsetup_out=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || dsetup_rc=$?
+      dsetup_out=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || dsetup_rc=$?
 import os, sys, traceback
 try:
     import django
@@ -2891,14 +2890,14 @@ PY
 )
       # Part C: auto-run cause (D)'s manage.py showmigrations so user sees missing migration files.
       local show_out=""
-      show_out=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py showmigrations" 2>&1 | tail -n 50 || true )
+      show_out=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py showmigrations" 2>&1 | tail -n 50 || true )
       # Part D: list EXACT env that was used for migrate bash -c (for env leak debugging: APP_DIR empty? DJANGO_SETTINGS_MODULE defaulted?).
       local venv_pv=""
       venv_pv=$("$APP_DIR/.venv/bin/python" -c 'import sys;print(sys.version)' 2>/dev/null || echo "UNKNOWN")
       printf "\n\033[1;31m=== manage.py migrate FAILED attempt %d/%d (rc=%s) — FULL EVIDENCE BELOW ===\033[0m\n" "$mig_attempt" "$mig_max" "$mig_rc" >&2
       printf "  \033[1;33m[EXACT CMD used for migrate bash -c (COPY-PASTE REPRODUCE LINE):]\033[0m\n    %s\n" "$mig_cmd_fresh" >&2
       printf "  \033[1;33m[ENV VARS migrate ran with:]\033[0m\n    PYTHONPATH=%s\n    DJANGO_SETTINGS_MODULE=%s\n    VENV_BIN=%s\n    VENV_PY_VERSION=%s\n" \
-        "$APP_DIR" "${DJANGO_SETTINGS_MODULE:-<UNSET (using $DJANGO_SETTINGS=$DJANGO_SETTINGS)>}" "$APP_DIR/.venv/bin/python" "$venv_pv" >&2
+        "$APP_DIR" "${DJANGO_SETTINGS_MODULE:-<UNSET>}" "$APP_DIR/.venv/bin/python" "$venv_pv" >&2
       printf "  \033[1;33m[SPINNER LOG FILE contents (migrate stderr/stdout captured inside _run_with_spinner):]\033[0m" >&2
       if [ -n "${mig_spin_log}" ] && [ -f "${mig_spin_log}" ]; then
         printf " (file=%s, size=$(wc -c <"$mig_spin_log" 2>/dev/null || echo 0) bytes)\n" "$mig_spin_log" >&2
@@ -2915,16 +2914,16 @@ PY
       # Cleanup temp before next iteration / before retry prompt.
       rm -f "$mig_fresh_tmp" 2>/dev/null || true
       if [ "$mig_attempt" -lt "$mig_max" ]; then
-        # Retry menu: user can fix DB creds / DJANGO_SETTINGS right here!
+        # Retry menu: user can fix DB creds / DJANGO_SETTINGS_MODULE right here!
         prompt_edit_multiple \
           "manage.py migrate FAILED attempt $mig_attempt/$mig_max — edit a field to fix it before we retry:" \
-          "DJANGO_SETTINGS DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+          "DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
           "Retry manage.py migrate with (possibly edited) values NOW?" \
           "y"
         # Re-sync migrate command string + subshell env after edit menu wrote new values.
         set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
-        export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
-        mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate"
+        export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
+        mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate"
       else
         # 3rd and final fail: hard die with the categorized list + evidence summary so user has it for copy-paste.
         _die "\
@@ -2937,7 +2936,7 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
         • ModuleNotFoundError: No module named 'rasyaterp' → TOP-LEVEL PACKAGE NAME in DJANGO_SETTINGS_MODULE does not match actual cloned repo (typo like 'rasyaterp' vs 'rasyatone'), OR rasyaterp/__init__.py has a broken internal import that CPython masks.
         • ModuleNotFoundError: No module named 'rest_framework'/'storages'/etc. → pip install -r requirements.txt PARTIALLY FAILED during venv setup (see earlier terminal line: pip install rc).
       COPY-PASTE DEBUG:
-        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.conf import settings; print(settings.ROOT_URLCONF)'
+        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.conf import settings; print(settings.ROOT_URLCONF)'
 
   (B) DB CONNECTION FAILURE (2nd most common — see DATABASES.default.HOST printed in django.setup() probe above).
       Loaded env file: $ENV_FILE. Verify DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD values match the ones install_db (Option 3) created.
@@ -2949,7 +2948,7 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
       CONNECT missing?  sudo -u postgres psql -c \"REVOKE CONNECT ON DATABASE $DB_NAME FROM PUBLIC; GRANT CONNECT ON DATABASE $DB_NAME TO $DB_USER;\"
 
   (D) MIGRATION FILES MISSING / BROKEN — see showmigrations probe above. If NO apps are listed, your INSTALLED_APPS in settings.py is empty or points to non-existent apps (typo). COPY-PASTE:
-        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py makemigrations
+        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations
 
   (E) PYTHON version mismatch. Venv python: $venv_pv. Must be >= 3.10 AND <= 3.$MAX_ALLOWED_PYTHON_MINOR (3.13 — intentionally capped to avoid psycopg2 cpython-314 _PyInterpreterState_Get compile crash).
 
@@ -2973,7 +2972,7 @@ FULL migrate bash -c env (for debugging leaks):
     _section "Install systemd service: $SERVICE_NAME"
     local unit_file="/etc/systemd/system/${SERVICE_NAME}.service"
     local workers="${GUNICORN_WORKERS:-2}"
-    local wsgi_module="${DJANGO_SETTINGS%.*}.wsgi:application"
+    local wsgi_module="${DJANGO_SETTINGS_MODULE%.*}.wsgi:application"
     printf '%s\n' \
       "[Unit]" \
       "Description=RaSYaTone application server (gunicorn)" \
@@ -2985,7 +2984,7 @@ FULL migrate bash -c env (for debugging leaks):
       "Group=root" \
       "WorkingDirectory=$APP_DIR" \
       "EnvironmentFile=-$ENV_FILE" \
-      "Environment=\"DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS\"" \
+      "Environment=\"DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE\"" \
       "ExecStart=$APP_DIR/.venv/bin/gunicorn --workers $workers --bind $GUNICORN_BIND --chdir $APP_DIR $wsgi_module" \
       "ExecReload=/bin/kill -s HUP \$MAINPID" \
       "Restart=always" \
@@ -3037,7 +3036,7 @@ FULL migrate bash -c env (for debugging leaks):
   if [ -x "$APP_DIR/.venv/bin/python" ]; then
     printf "  VENV_PYTHON_VERSION=%s\n" "$("$APP_DIR/.venv/bin/python" --version 2>&1 | head -n1)"
   fi
-  printf "  DJANGO_SETTINGS=%s\n" "$DJANGO_SETTINGS"
+  printf "  DJANGO_SETTINGS_MODULE=%s\n" "$DJANGO_SETTINGS_MODULE"
   printf "  ENV_FILE=%s\n" "$ENV_FILE"
   if command -v systemctl >/dev/null 2>&1; then
     printf "  SERVICE=%s state=" "$SERVICE_NAME"
