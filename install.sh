@@ -260,6 +260,191 @@ prompt_secret() {
   else printf "%s" "$val"; fi
 }
 
+# ── prompt_w_retry: generic retry wrapper for wizard inputs that have validators ──
+# Usage in Option 4 prompt section (EXAMPLE):
+#   DB_HOST=$(prompt_w_retry \
+#     "Database host" "$DEF_DB_HOST" "3" \
+#     "host_reachable_or_local" \
+#     "Host did not respond to nc -z probe on DB_PORT. Typo? Example: 'localhost' or 'db.example.com'.")
+#
+# Args:
+#   $1 prompt_label        text shown to user on prompt_def invocation
+#   $2 default_value       default shown in [ brackets ] (can be empty)
+#   $3 max_retries         number of retries (e.g. 3 means up to 3 re-prompts). If this many
+#                          retries still fail, we HARD DIE with a hint so user can fix env.
+#   $4 validator_fn        shell function NAME. It will be called with the PROPOSED value
+#                          as its ONLY positional argument. Exit 0 = value OK, exit non-zero
+#                          = value rejected (re-prompt).
+#   $5 hint_on_fail        text printed on VALIDATOR FAIL (before re-prompt). Tells user
+#                          what went wrong so they can fix it.
+#   $6 is_secret           if "secret" → use prompt_secret instead of prompt_def (for DB_PASSWORD / TOKEN fields).
+# Output: prints the accepted value to stdout.
+prompt_w_retry() {
+  local prompt_label="$1" default_value="$2" max_retries="${3:-3}" validator_fn="$4" hint_on_fail="$5" is_secret="${6:-}"
+  local attempt=0 current_value="" rc=0
+  while [ "$attempt" -le "$max_retries" ]; do
+    attempt=$(( attempt + 1 ))
+    if [ "$is_secret" = "secret" ]; then
+      current_value=$(prompt_secret "$prompt_label" "$default_value") || true
+    else
+      current_value=$(prompt_def "$prompt_label" "$default_value") || true
+    fi
+    # Call validator on proposed value. If validator_fn is empty/undefined, treat as always-OK.
+    rc=0
+    if [ -n "$validator_fn" ] && command -v "$validator_fn" >/dev/null 2>&1; then
+      "$validator_fn" "$current_value" >/dev/null 2>&1 || rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
+      printf "%s" "$current_value"
+      return 0
+    fi
+    # Validator rejected it.
+    if [ "$attempt" -le "$max_retries" ]; then
+      _warn "Attempt $attempt/$max_retries: value for '$prompt_label' failed validation ($validator_fn returned rc=$rc). HINT: $hint_on_fail"
+      if ! confirm_yn "Re-enter value for '$prompt_label'?" "y"; then
+        _die "User chose to ABORT retries for '$prompt_label' instead of re-entering. Correct input and rerun."
+      fi
+      # Loop back and re-prompt.
+    else
+      _die "$max_retries retries exhausted for '$prompt_label' (kept failing validator=$validator_fn, rc=$rc). HINT: $hint_on_fail"
+    fi
+  done
+  return 1
+}
+
+# ── prompt_edit_multiple: batch retry prompt for a NAMED group of related variables ──
+# Used when a GROUP of inputs fail together (e.g. all 4 DB creds, or the Django
+# settings trio). Instead of re-prompting one at a time, we print a menu of the
+# currently-entered values, let user pick which ones to overwrite (or [A] ALL), then
+# call the validator again.
+#
+# Usage (EXAMPLE for DB creds group):
+#   while validate_db_creds; rc=$? -ne 0; do
+#     prompt_edit_multiple \
+#       "Database credentials failed SELECT 1 validation" \
+#       "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
+#       "Re-run SELECT 1 validation now?" \
+#       "y"
+#     validate_db_creds && break
+#   done
+prompt_edit_multiple() {
+  local section_title="$1" fields_csv="$2" retry_question="$3" retry_default="${4:-y}"
+  local -a fields_arr=()
+  local field="" current="" choice="" edited_any=0
+  IFS=' ' read -r -a fields_arr <<<"$fields_csv"
+  printf "\n\033[1;33m%s:\033[0m\n" "$section_title" >&2
+  local i=0
+  for field in "${fields_arr[@]}"; do
+    i=$(( i + 1 ))
+    # Indirect expansion: get current value of variable whose NAME is $field
+    # shellcheck disable=SC2004,SC2086
+    eval current=\"\$$field\" || current=""
+    # Passwords are hidden, show ******** unless empty
+    if [[ "$field" == *PASS* ]] || [[ "$field" == *TOKEN* ]] || [[ "$field" == *SECRET* ]]; then
+      if [ -z "$current" ]; then current="(EMPTY — TYPICALLY REQUIRED!)"; else current="******** (length=${#current})"; fi
+    else
+      [ -z "$current" ] && current="(EMPTY)"
+    fi
+    printf "   \033[1;37m[%d]\033[0m %s = \033[0;36m%s\033[0m\n" "$i" "$field" "$current" >&2
+  done
+  printf "   \033[1;37m[A]\033[0m Edit ALL above fields in order\n" >&2
+  printf "   \033[1;37m[S]\033[0m SKIP (accept current values as-is and retry validation anyway)\n" >&2
+  printf "   \033[1;37m[Q]\033[0m Abort installation and exit (fix the underlying issue first)\n" >&2
+  choice=$(prompt_def "Which field(s) to edit? [A=all / 1..$i number / S=skip / Q=quit]" "A")
+  case "${choice^^}" in
+    Q) _die "User chose Q=QUIT on '$section_title' retry prompt. Fix the underlying config issue and rerun Option 4." ;;
+    S) _warn "User chose S=SKIP on '$section_title'. Validation will be retried with EXISTING values." ;;
+    A)
+      edited_any=1
+      for field in "${fields_arr[@]}"; do
+        local default_for=""
+        # shellcheck disable=SC2086
+        eval default_for=\"\$$field\" || default_for=""
+        local is_pass=""
+        [[ "$field" == *PASS* ]] || [[ "$field" == *TOKEN* ]] || [[ "$field" == *SECRET* ]] && is_pass="secret"
+        local new_val=""
+        if [ "$is_pass" = "secret" ]; then
+          new_val=$(prompt_secret "$field" "$default_for")
+        else
+          new_val=$(prompt_def "$field" "$default_for")
+        fi
+        # Write back: assign to the VARIABLE whose name is $field (indirect).
+        # shellcheck disable=SC2086
+        eval $field=\"\$new_val\"
+      done
+      ;;
+    *)
+      # Single numeric field number (1-based).
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ]; then
+        edited_any=1
+        field="${fields_arr[$((choice-1))]}"
+        local default_for=""
+        eval default_for=\"\$$field\" || default_for=""
+        local is_pass=""
+        [[ "$field" == *PASS* ]] || [[ "$field" == *TOKEN* ]] || [[ "$field" == *SECRET* ]] && is_pass="secret"
+        local new_val=""
+        if [ "$is_pass" = "secret" ]; then
+          new_val=$(prompt_secret "$field" "$default_for")
+        else
+          new_val=$(prompt_def "$field" "$default_for")
+        fi
+        eval $field=\"\$new_val\"
+      else
+        _warn "Unrecognized choice '$choice' (expected A/S/Q/1..$i). Treating as S=SKIP."
+      fi
+      ;;
+  esac
+  # User's last chance: are they ready to retry the validation loop?
+  if ! confirm_yn "$retry_question" "$retry_default"; then
+    _warn "User declined retry for '$section_title'. Continuing anyway (installer will likely fail on the next step)."
+  fi
+  return 0
+}
+
+# ── Convenience validators for common wizard groups (used by prompt_w_retry) ──
+# These MUST be safe to call repeatedly during prompt loops: no side effects,
+# they only run probes that verify the PROPOSED user value.
+_validator_nonempty() {
+  local v="$1"; [ -n "${v:-}" ]
+}
+_validator_dir_writable_or_parent_exists() {
+  local d="$1"
+  [ -z "${d:-}" ] && return 1
+  # Expand any ~ manually in case user typed ~/.local/myapp
+  case "$d" in "~/"*) d="${HOME}/${d#\~/}"; esac
+  # If dir already exists: must be writable by euid.
+  if [ -d "$d" ]; then [ -w "$d" ] && return 0; return 2; fi
+  # Else: parent must exist AND be writable (so we can mkdir -p later).
+  local parent="${d%/*}"
+  [ "${parent:-/}" = "$d" ] && parent="/"  # d=/foo case
+  [ -n "${parent:-}" ] || parent="/"
+  [ -d "$parent" ] && [ -w "$parent" ]
+}
+_validator_cidr_list_or_star() {
+  local raw="$1"; local ip="" ok=1
+  # Special values: * is allowed (listen_addresses='*' case), localhost, all
+  case "${raw^^}" in
+    "*"|"LOCALHOST"|"ALL") return 0 ;;
+  esac
+  while IFS=',' read -r -a _arr; do
+    for ip in "${_arr[@]}"; do
+      ip=$(printf '%s' "$ip" | sed -E 's/[[:space:]]+//g')
+      [ -z "$ip" ] && continue
+      # CIDR pattern: a.b.c.d/N or a.b.c.d single ip, or ipv6 colon forms
+      if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$ ]]; then continue; fi
+      if [[ "$ip" =~ ^[0-9a-fA-F:]+(\/[0-9]+)?$ ]] && [[ "$ip" == *:* ]]; then continue; fi
+      ok=0
+    done
+  done <<<"$raw"
+  [ "$ok" -eq 1 ]
+}
+_validator_dotted_python_module_syntax() {
+  # Sanity syntax only: letters/digits/underscore, separated by dots, no leading/trailing dot.
+  # For DJANGO_SETTINGS_MODULE this gives a quick syntax fail before we ever try clone+migrate.
+  local m="$1"
+  [[ "$m" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$ ]]
+}
+
 confirm_yn() {
   local prompt="$1" def="${2:-n}" val=""
   if [ "$def" = "y" ] || [ "$def" = "Y" ]; then printf "%s [Y/n]: " "$prompt" >&2
@@ -971,11 +1156,29 @@ precheck_app_prereqs() {
   # 11. full psql SELECT 1
   local row psql_out="/tmp/rasyatone_prechk_psql_$$.out"
   if [ "$vars_ok" = "1" ] && command -v psql >/dev/null 2>&1; then
-    _run_with_spinner "psql SELECT 1 credential test (${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME})" bash -c 'PGPASSWORD="$1" timeout 8 psql -h "$2" -p "$3" -U "$4" -d "$5" -tAc "SELECT 1" >"$6" 2>&1' _ "$DB_PASSWORD" "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_NAME" "$psql_out"
-    row=$(cat "$psql_out" 2>/dev/null | tr -d '[:space:]' || true)
+    local s1_attempt=0 s1_max=3 s1_done=0
+    while [ "$s1_attempt" -lt "$s1_max" ] && [ "$s1_done" -ne 1 ]; do
+      s1_attempt=$(( s1_attempt + 1 ))
+      _run_with_spinner "psql SELECT 1 credential test ($s1_attempt/$s1_max) ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}" bash -c 'PGPASSWORD="$1" timeout 8 psql -h "$2" -p "$3" -U "$4" -d "$5" -tAc "SELECT 1" >"$6" 2>&1' _ "$DB_PASSWORD" "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_NAME" "$psql_out" || true
+      row=$(cat "$psql_out" 2>/dev/null | tr -d '[:space:]' || true)
+      if [ "$row" = "1" ]; then
+        s1_done=1
+        _ok "psql SELECT 1 via DB_USER=$DB_USER succeeded"
+      else
+        if [ "$s1_attempt" -lt "$s1_max" ]; then
+          _warn "psql SELECT 1 FAILED attempt $s1_attempt/$s1_max (wrong DB_PASSWORD? DB/user not created yet? try Option 3 first). Last 5 lines output: $(cat "$psql_out" 2>/dev/null | tail -n 5 | tr '\n' ' ')"
+          prompt_edit_multiple \
+            "psql SELECT 1 credential test FAILED — edit DB creds to fix" \
+            "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
+            "Retry psql SELECT 1 with (possibly edited) values?" \
+            "y"
+        else
+          _warn "psql SELECT 1 FAILED all $s1_max attempts (wrong DB_PASSWORD? DB/user not created yet? try Option 3 first). Will mark as FAIL on precheck summary."
+          ((fail++)) || true
+        fi
+      fi
+    done
     rm -f "$psql_out" 2>/dev/null || true
-    if [ "$row" = "1" ]; then _ok "psql SELECT 1 via DB_USER=$DB_USER succeeded"
-    else _warn "psql SELECT 1 failed (wrong DB_PASSWORD? DB/user not created yet? try Option 3 first)"; fi
   elif [ "$vars_ok" = "1" ]; then _warn "psql client not installed; skipping full DB credential SELECT 1 validation (will fail at manage.py migrate)"; fi
 
   # 12. systemd present
@@ -995,13 +1198,16 @@ install_db() {
   load_env_file || true
 
   printf "\nEnter database settings (press Enter to keep default in [brackets]):\n"
-  DB_NAME=$(prompt_def "Database name"            "${DB_NAME:-$DEF_DB_NAME}")
-  DB_USER=$(prompt_def "Database user"            "${DB_USER:-$DEF_DB_USER}")
-  DB_PASSWORD=$(prompt_secret "Database user password" "${DB_PASSWORD:-}")
-  DB_HOST=$(prompt_def "Database host (use 'localhost' for local socket)" "${DB_HOST:-$DEF_DB_HOST}")
-  DB_PORT=$(prompt_def "Database port"            "${DB_PORT:-$DEF_DB_PORT}")
-  LISTEN_ADDRESSES=$(prompt_def "PostgreSQL listen_addresses ('*' = all, 'localhost' = local only)" \
-                              "${LISTEN_ADDRESSES:-$DEF_LISTEN_ADDRESSES}")
+  DB_NAME=$(prompt_w_retry "Database name"            "${DB_NAME:-$DEF_DB_NAME}" 3 _validator_nonempty "Database name CANNOT be empty — examples: rasyatone_db, myapp_db.")
+  DB_USER=$(prompt_w_retry "Database user"            "${DB_USER:-$DEF_DB_USER}" 3 _validator_nonempty "Database user CANNOT be empty — examples: rasyatone_db_user, appuser.")
+  DB_PASSWORD=$(prompt_w_retry "Database user password" "${DB_PASSWORD:-}" 3 _validator_nonempty "Database password CANNOT be empty. Pick a strong password and remember it — the application will need it to connect." "secret")
+  DB_HOST=$(prompt_w_retry "Database host (use 'localhost' for local socket)" "${DB_HOST:-$DEF_DB_HOST}" 3 _validator_nonempty "Database host CANNOT be empty. Examples: 'localhost' (local Unix socket), '127.0.0.1', or a remote hostname like 'db.example.com'.")
+  DB_PORT=$(prompt_w_retry "Database port"            "${DB_PORT:-$DEF_DB_PORT}" 3 _validator_nonempty "Database port CANNOT be empty. PostgreSQL default = 5432.")
+  LISTEN_ADDRESSES=$(prompt_w_retry \
+    "PostgreSQL listen_addresses ('*' = all, 'localhost' = local only)" \
+    "${LISTEN_ADDRESSES:-$DEF_LISTEN_ADDRESSES}" \
+    3 _validator_cidr_list_or_star \
+    "listen_addresses syntax error. Acceptable values: '*' (all interfaces), 'localhost', comma-separated IPv4 CIDR list (e.g. 127.0.0.1,10.0.0.0/8), or IPv6 colon forms.")
   local ALLOW_PG_DBS="ALL"  # DEFAULT = ALL (strongly recommended). Only SELF if user explicitly chooses it.
   ALLOW_PG_DBS_RAW=$(prompt_def "Which databases should '$DB_USER' connect to? [RECOMMENDED: ALL = '$DB_NAME' + postgres + all DBs. SELF = ONLY '$DB_NAME' — NOTE: pgAdmin / DBeaver default test connection uses database='postgres' and WILL FAIL if you pick SELF]" "ALL")
   ALLOW_PG_DBS_RAW=$(printf "%s" "$ALLOW_PG_DBS_RAW" | tr '[:lower:]' '[:upper:]')
@@ -1688,18 +1894,19 @@ install_app() {
 
   printf "\nEnter RaSYaTone app server settings (press Enter to keep default in [brackets]):\n"
   printf "  (Database settings — Enter keeps current value from %s)\n" "$ENV_FILE"
-  DB_NAME=$(prompt_def "Database name"      "${DB_NAME:-$DEF_DB_NAME}")
-  DB_USER=$(prompt_def "Database user"      "${DB_USER:-$DEF_DB_USER}")
-  DB_PASSWORD=$(prompt_secret "Database user password" "${DB_PASSWORD:-}")
-  DB_HOST=$(prompt_def "Database host"      "${DB_HOST:-$DEF_DB_HOST}")
-  DB_PORT=$(prompt_def "Database port"      "${DB_PORT:-$DEF_DB_PORT}")
-  APP_DIR=$(prompt_def "App install directory" "${APP_DIR:-$DEF_APP_DIR}")
+  DB_NAME=$(prompt_w_retry "Database name"      "${DB_NAME:-$DEF_DB_NAME}" 3 _validator_nonempty "Database name CANNOT be empty — example: rasyatone_db.")
+  DB_USER=$(prompt_w_retry "Database user"      "${DB_USER:-$DEF_DB_USER}" 3 _validator_nonempty "Database user CANNOT be empty — example: rasyatone_db_user.")
+  DB_PASSWORD=$(prompt_w_retry "Database user password" "${DB_PASSWORD:-}" 3 _validator_nonempty "Database password CANNOT be empty. The application uses this to connect to PostgreSQL — remember it." "secret")
+  DB_HOST=$(prompt_w_retry "Database host"      "${DB_HOST:-$DEF_DB_HOST}" 3 _validator_nonempty "Database host CANNOT be empty. Examples: 'localhost' (local) or 'db.example.com' (remote).")
+  DB_PORT=$(prompt_w_retry "Database port"      "${DB_PORT:-$DEF_DB_PORT}" 3 _validator_nonempty "Database port CANNOT be empty. PostgreSQL default = 5432.")
+  APP_DIR=$(prompt_w_retry "App install directory" "${APP_DIR:-$DEF_APP_DIR}" 3 _validator_dir_writable_or_parent_exists "App directory must either (a) exist and be writable by current user, OR (b) its PARENT directory must exist and be writable (so we can mkdir -p later). Example: /opt/rasyatone. Parent of /opt/rasyatone = /opt must exist.")
   GIT_URL=$(prompt_def "Git repository URL (https://... or git@...) (REQUIRED). PRIVATE REPO on your account: URL alone will NOT auth; installer offers METHOD1/METHOD2 wizard next." "${GIT_URL:-}")
   [ -z "$GIT_URL" ] && _die "Git URL is required — cannot clone application without a repo URL"
-  GIT_BRANCH=$(prompt_def "Git branch"          "${GIT_BRANCH:-$DEF_GIT_BRANCH}")
-  DJANGO_SETTINGS=$(prompt_def "Django settings module (Python dotted path)" "${DJANGO_SETTINGS:-$DEF_DJANGO_SETTINGS}")
-  GUNICORN_BIND=$(prompt_def "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}")
-  SERVICE_NAME=$(prompt_def "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}")
+  GIT_BRANCH=$(prompt_w_retry "Git branch"          "${GIT_BRANCH:-$DEF_GIT_BRANCH}" 3 _validator_nonempty "Git branch CANNOT be empty. Examples: main, master, develop.")
+  DJANGO_SETTINGS=$(prompt_w_retry "Django settings module (Python dotted path)" "${DJANGO_SETTINGS:-$DEF_DJANGO_SETTINGS}" 3 _validator_dotted_python_module_syntax \
+    "DJANGO_SETTINGS_MODULE syntax error: expected Python dotted identifier e.g. 'rasyatone.settings' or 'myapp.settings.production'. Rules: (1) start with letter/underscore, (2) parts separated by single dots, (3) no spaces, (4) no leading/trailing dots. HINTS: (a) if settings live at APP_DIR/myapp/settings/prod.py → type 'myapp.settings.prod'. (b) If APP_DIR has rasyaterp/settings.py (the default from DEF_DJANGO_SETTINGS above) → type 'rasyaterp.settings'.")
+  GUNICORN_BIND=$(prompt_w_retry "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}" 3 _validator_nonempty "Gunicorn bind CANNOT be empty. Formats: '0.0.0.0:8000' (all), '127.0.0.1:8000' (local only), 'unix:/tmp/rasyatone.sock' (nginx upstream).")
+  SERVICE_NAME=$(prompt_w_retry "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}" 3 _validator_nonempty "systemd service name CANNOT be empty. Example: rasyatone (becomes systemctl status rasyatone.service).")
 
   printf "\n"
   github_auth_private_repo   # rewrites GIT_URL in-place if GitHub private repo
@@ -1796,10 +2003,53 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   _section "Validate DB connectivity (DB_PASSWORD from $ENV_FILE)"
   set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
   if command -v psql >/dev/null 2>&1; then
-    _run_with_spinner "psql SELECT 1 (credential pre-check)" bash -c "set -e; row=\$(PGPASSWORD='$DB_PASSWORD' timeout 10 psql -h '$DB_HOST' -p '$DB_PORT' -U '$DB_USER' -d '$DB_NAME' -tAc 'SELECT 1' 2>/dev/null || true); [ \"\$row\" = \"1\" ]" || {
-      _warn "psql SELECT 1 probe FAILED — manage.py migrate will likely fail too. Continuing...";
-    }
-    _ok "psql SELECT 1 OK (DB credentials validate)"
+    local dbprobe_attempt=0 dbprobe_max=3 dbprobe_done=0
+    local dbprobe_out="/tmp/rasyatone_dbprobe_$$.out"
+    while [ "$dbprobe_attempt" -lt "$dbprobe_max" ] && [ "$dbprobe_done" -ne 1 ]; do
+      dbprobe_attempt=$(( dbprobe_attempt + 1 ))
+      local dbprobe_rc=0
+      _run_with_spinner "psql SELECT 1 (credential pre-check $dbprobe_attempt/$dbprobe_max) ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}" bash -c "set +e; row=\$(PGPASSWORD='$DB_PASSWORD' timeout 10 psql -h '$DB_HOST' -p '$DB_PORT' -U '$DB_USER' -d '$DB_NAME' -tAc 'SELECT 1' 2>'$dbprobe_out' || true); [ \"\$row\" = \"1\" ]" || dbprobe_rc=$?
+      local row=""
+      row=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc 'SELECT 1' 2>/dev/null || true)
+      if [ "$row" = "1" ] || [ "$dbprobe_rc" -eq 0 ]; then
+        dbprobe_done=1
+        _ok "psql SELECT 1 OK (DB credentials validate)"
+      else
+        local last_err=""
+        last_err=$(cat "$dbprobe_out" 2>/dev/null | tail -n 5 | tr '\n' ' ' || echo "")
+        if [ "$dbprobe_attempt" -lt "$dbprobe_max" ]; then
+          _warn "psql SELECT 1 FAILED attempt $dbprobe_attempt/$dbprobe_max: $last_err"
+          prompt_edit_multiple \
+            "psql SELECT 1 (credential pre-check) FAILED — edit DB creds to fix" \
+            "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
+            "Retry psql SELECT 1 with (possibly edited) values?" \
+            "y"
+          # prompt_edit_multiple modified values in memory → also persist them to ENV_FILE
+          # before we lose them (so git clone / collectstatic / migrate later use the fixed values).
+          local _dbk _dbv _sed_line
+          local _sed_bin
+          command -v gsed >/dev/null 2>&1 && _sed_bin="gsed" || _sed_bin="sed"
+          if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
+            for _dbk in DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT; do
+              eval _dbv="\${$_dbk:-}"
+              [ -z "${_dbv+x}" ] && continue
+              _sed_line="$_dbk='$_dbv'"
+              if grep -Eq "^${_dbk}=" "$ENV_FILE" 2>/dev/null; then
+                sudo "$_sed_bin" -i~ -E "s|^${_dbk}=.*|${_sed_line}|" "$ENV_FILE" 2>/dev/null || true
+                sudo rm -f "${ENV_FILE}~" 2>/dev/null || true
+              else
+                printf '%s\n' "$_sed_line" | sudo tee -a "$ENV_FILE" >/dev/null 2>/dev/null || true
+              fi
+            done
+            # Reload from ENV so DB_* vars used inside git clone block (if any) are in sync with what's on disk.
+            set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+          fi
+        else
+          _warn "psql SELECT 1 FAILED all $dbprobe_max attempts. LAST ERROR: $last_err — manage.py migrate below will likely fail too. Continuing (you can abort with Ctrl-C and rerun Option 3 first to fix creds)."
+        fi
+      fi
+    done
+    rm -f "$dbprobe_out" 2>/dev/null || true
   else _warn "psql client not installed — skipping DB credential SELECT 1 pre-validate"; fi
 
   _section "Prepare app directory: $APP_DIR"
@@ -1832,6 +2082,87 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   # Post-clone safety: a successful clone MUST produce a .git subdir. If it's not there, clone silently failed.
   [ -d "${APP_DIR}/.git" ] || _die "git clone reported exit 0 but ${APP_DIR}/.git does NOT exist — likely empty-branch / repo-initialization race / shallow clone failure. Rerun with a different branch or check repo contents on GitHub."
   _ok "App dir populated (branch=$GIT_BRANCH)"
+  # ── EARLY POST-CLONE VALIDATION: does DJANGO_SETTINGS_MODULE dotted path MATCH what we actually cloned? ──
+  # This is the #1 root cause of the user's `ModuleNotFoundError: No module named 'rasyaterp'` crash at collectstatic/migrate time.
+  # We JUST cloned the repo — BEFORE we waste 5-15 minutes creating venv + running pip install (gcc compiles psycopg2,
+  # builds cffi, etc.) we verify that the TOP-LEVEL PACKAGE DIRECTORY of DJANGO_SETTINGS_MODULE ACTUALLY EXISTS in APP_DIR.
+  # If not → offer prompt_edit_multiple RETRY so user can correct the typo (instead of dying 10 minutes later in collectstatic).
+  #
+  # Also: REWRITE THE ENV FILE if DJANGO_SETTINGS_MODULE was corrected in the loop, so the venv activate block picks up
+  # the correct value later.
+  _section "Post-clone: validate DJANGO_SETTINGS_MODULE layout matches cloned repo"
+  local dsm="" dsm_pkg_dir="" dsm_py_file="" probe_attempt=0 dsm_ok=0 max_dsm_probes=3
+  dsm="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS}"
+  while [ "$probe_attempt" -lt "$max_dsm_probes" ] && [ "$dsm_ok" -ne 1 ]; do
+    probe_attempt=$(( probe_attempt + 1 ))
+    # Convert dotted path to filesystem path:
+    #   DJANGO_SETTINGS_MODULE = "rasyaterp.settings" → package dir = APP_DIR/rasyaterp, file = APP_DIR/rasyaterp/settings.py
+    #   DJANGO_SETTINGS_MODULE = "myapp.settings.production" → package dir = APP_DIR/myapp, file = APP_DIR/myapp/settings/production.py
+    dsm_pkg_dir="${APP_DIR}/${dsm%%.*}"
+    dsm_py_file="${APP_DIR}/${dsm//./\/}.py"
+    printf "  Attempt %d/%d: DJANGO_SETTINGS_MODULE = \033[1;36m%s\033[0m\n" "$probe_attempt" "$max_dsm_probes" "$dsm" >&2
+    printf "    → expected PACKAGE DIR: \033[0;33m%s\033[0m (must exist after clone)\n" "$dsm_pkg_dir" >&2
+    printf "    → expected SETTINGS .PY FILE: \033[0;33m%s\033[0m (must exist after clone)\n" "$dsm_py_file" >&2
+    # Layered checks: (1) top-level package dir exists AND contains __init__.py or __init__.pyi (strict package marker)
+    #                 (2) the final settings.py file exists. If both pass → PASS; else FAIL + offer edit/retry.
+    local has_pkg=0 has_settings=0
+    if [ -d "$dsm_pkg_dir" ] && [ -f "$dsm_pkg_dir/__init__.py" ] || [ -f "$dsm_pkg_dir/__init__.pyi" ]; then has_pkg=1; fi
+    if [ -f "$dsm_py_file" ]; then has_settings=1; fi
+    if [ "$has_pkg" -eq 1 ] && [ "$has_settings" -eq 1 ]; then
+      dsm_ok=1
+      _ok "Post-clone settings layout OK: package dir present, settings.py file present (matches DJANGO_SETTINGS_MODULE=$dsm)."
+      break
+    fi
+    # Fail: diagnostics.
+    local diag_lines=""
+    [ "$has_pkg" -eq 0 ]        && diag_lines+="      [MISSING] Top-level package directory: $dsm_pkg_dir — typo in the first dotted part?\n"
+    [ "$has_settings" -eq 0 ]   && diag_lines+="      [MISSING] Final settings .py file:   $dsm_py_file — did you type the correct dotted path suffix (e.g. .settings vs .settings.production)?\n"
+    # Show the user what the top-level repo ACTUALLY contains so they can fix it!
+    local repo_top_level=""
+    repo_top_level=$(cd "$APP_DIR" 2>/dev/null && find . -maxdepth 2 -type f \( -name manage.py -o -name "settings.py" -o -name "settings_*.py" -o -name "asgi.py" -o -name "wsgi.py" -o -name "__init__.py" \) 2>/dev/null | sort | sed 's#^./##' | head -n 30 || echo "")
+    _warn "Post-clone validation FAILED (attempt $probe_attempt/$max_dsm_probes) for DJANGO_SETTINGS_MODULE='$dsm':
+${diag_lines}
+  TOP-LEVEL FILES FOUND in $APP_DIR (these should include your actual package dir / manage.py):
+$(printf '%s\n' "$repo_top_level" | sed 's#^#      #')
+  HINTS:
+    • If the cloned package is NOT called '${dsm%%.*}' (e.g. it's 'myapp') → set DJANGO_SETTINGS_MODULE = 'myapp.settings'.
+    • If you have a settings/ directory (myapp/settings/base.py, production.py, etc.) → DJANGO_SETTINGS_MODULE = 'myapp.settings.production'.
+    • If DJANGO_SETTINGS_MODULE = correct but you still see MISSING above → $APP_DIR has the wrong repo (wrong GIT_URL / wrong GIT_BRANCH)."
+    if [ "$probe_attempt" -lt "$max_dsm_probes" ]; then
+      prompt_edit_multiple \
+        "Post-clone DJANGO_SETTINGS_MODULE failed early validation (save time before venv/pip install)" \
+        "DJANGO_SETTINGS GIT_URL GIT_BRANCH APP_DIR" \
+        "Retry layout validation with (possibly edited) values?" \
+        "y"
+      # User may have edited DJANGO_SETTINGS → re-sync dsm for next iteration.
+      dsm="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+      # Also if user changed GIT_URL/GIT_BRANCH we can't re-clone inside this probe loop — just continue so validation can fail
+      # again cleanly.
+    fi
+  done
+  if [ "$dsm_ok" -ne 1 ]; then
+    _warn "Post-clone DJANGO_SETTINGS_MODULE validation FAILED all $max_dsm_probes attempts. Installer will continue (you may have a nonstandard layout the probe can't detect, e.g. dynamic settings package). HOWEVER: if later collectstatic/migrate fails with 'ModuleNotFoundError: No module named …' → THIS is the root cause — recheck: DJANGO_SETTINGS_MODULE=$dsm against APP_DIR=$APP_DIR actual files."
+  else
+    # DURING PROBE we may have rewritten DJANGO_SETTINGS via prompt_edit_multiple. WRITE THE CORRECTED VALUE BACK TO ENV_FILE
+    # so later pip-install/collectstatic/migrate blocks pick up the correct module path (no more 10-minutes-later ModuleNotFound crash).
+    # We detect change via: current DJANGO_SETTINGS != original DEF_DJANGO_SETTINGS or ENV_FILE value.
+    # Only rewrite if we detect a difference (no thrashing). Keep the rest of ENV_FILE intact via a sed-inplace edit that
+    # targets the DJANGO_SETTINGS_MODULE= line alone, OR appends if no line.
+    if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
+      local new_dsm_value="" new_line=""
+      new_dsm_value="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+      new_line="DJANGO_SETTINGS_MODULE='${new_dsm_value}'"
+      if grep -Eq '^DJANGO_SETTINGS_MODULE=' "$ENV_FILE" 2>/dev/null; then
+        if command -v gsed >/dev/null 2>&1; then sed_bin="gsed"; else sed_bin="sed"; fi
+        # Replace in place without touching quoting of other keys or comments.
+        sudo "$sed_bin" -i~ -E "s|^DJANGO_SETTINGS_MODULE=.*|${new_line}|" "$ENV_FILE" 2>/dev/null || true
+        sudo rm -f "${ENV_FILE}~" 2>/dev/null || true
+      else
+        printf '%s\n' "$new_line" | sudo tee -a "$ENV_FILE" >/dev/null 2>/dev/null || true
+      fi
+      _ok "Post-clone: wrote corrected DJANGO_SETTINGS_MODULE='${new_dsm_value}' to ENV_FILE so later collectstatic/migrate use it."
+    fi
+  fi
 
   _section "Create virtualenv at $APP_DIR/.venv + install dependencies"
   # ---------------------------------------------------------------------
@@ -2296,8 +2627,7 @@ the previous 'Only Python 3.14 was found MAX_ALLOWED=3.13' hard die before this 
     # with EXACTLY: what we tried, the full traceback, and copy-paste debug
     # commands the user can run locally to reproduce outside the installer.
     # -------------------------------------------------------------------------
-    # Ensure venv/bin is on PATH inside this subshell (belt+braces same as
-    # outer activate block — no activate no-op inside subshell)
+    # Belt+braces: inject PATH/PYTHONPATH/VIRTUAL_ENV explicitly INSIDE this subshell too
     case ":$PATH:" in
       *":$APP_DIR/.venv/bin:"*) : ;;
       *) export PATH="$APP_DIR/.venv/bin:$PATH" ;;
@@ -2305,15 +2635,17 @@ the previous 'Only Python 3.14 was found MAX_ALLOWED=3.13' hard die before this 
     [ -x "$APP_DIR/.venv/bin/python" ] || _die "collectstatic/migrate PRECHECK: $APP_DIR/.venv/bin/python missing (venv gone?). Run: sudo rm -rf '${APP_DIR:?}/.venv' ; rerun Option 4."
     export PYTHONPATH="${APP_DIR:?}${PYTHONPATH:+:${PYTHONPATH}}"
     export VIRTUAL_ENV="${VIRTUAL_ENV:-$APP_DIR/.venv}"
+    # Retry the probe up to 3 times, offering prompt_edit_multiple each time.
     local django_precheck_rc=0 django_precheck_traceback=""
-    django_precheck_traceback=$("$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || django_precheck_rc=$?
+    local dpm_attempt=0 dpm_max=3 dpm_ok=0
+    while [ "$dpm_attempt" -lt "$dpm_max" ] && [ "$dpm_ok" -ne 1 ]; do
+      dpm_attempt=$(( dpm_attempt + 1 ))
+      django_precheck_rc=0
+      django_precheck_traceback=$("$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || django_precheck_rc=$?
 import os, sys, traceback
 try:
     import django
     from django.conf import settings as _ds
-    # NOTE: we use os.environ.get DJANGO_SETTINGS_MODULE explicitly — the
-    # `import django; django.setup()` call below will respect env and fail
-    # with EXACT ModuleNotFoundError chain the user saw IF PYTHONPATH is wrong.
     from django.core.management import execute_from_command_line
     django.setup()
     from django.conf import settings
@@ -2324,10 +2656,12 @@ except Exception:
     sys.exit(2)
 PY
 )
-    if [ "$django_precheck_rc" -ne 0 ]; then
+      if [ "$django_precheck_rc" -eq 0 ]; then dpm_ok=1; break; fi
+      # Probe failed: either die or offer retry if stdin is a TTY
       local dsm="${DJANGO_SETTINGS_MODULE:-<UNSET>}"
-      _die "\
-Django settings import PRECHECK FAILED (rc=$django_precheck_rc). BEFORE we even
+      local diag_banner=""
+      diag_banner=$(cat <<EOBANNER
+Django settings import PRECHECK FAILED (attempt $dpm_attempt/$dpm_max, rc=$django_precheck_rc). BEFORE we even
 tried collectstatic/migrate we failed to run:
     PYTHONPATH=$APP_DIR DJANGO_SETTINGS_MODULE=$dsm $APP_DIR/.venv/bin/python \
       -c 'import django; django.setup()'
@@ -2364,10 +2698,24 @@ COPY-PASTE DEBUG COMMANDS (run as root):
   cd '$APP_DIR'
   ls -la '$APP_DIR'
   ls -la '$APP_DIR/${dsm%%.*}' 2>/dev/null || echo 'PACKAGE DIR ${dsm%%.*} NOT PRESENT -> fix DJANGO_SETTINGS_MODULE env var'
-  PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='$dsm' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.conf import settings; print(\"OK; STATIC_ROOT=\", settings.STATIC_ROOT)'
-"
-    fi
-    _ok "Django settings PRECHECK OK (PYTHONPATH=$APP_DIR; DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE; traceback clean)"
+  PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='$dsm' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.conf import settings; print("OK; STATIC_ROOT=", settings.STATIC_ROOT)'
+EOBANNER
+)
+      if [ "$dpm_attempt" -lt "$dpm_max" ]; then
+        printf "\n\033[1;31m%s\033[0m\n" "$diag_banner" >&2
+        prompt_edit_multiple \
+          "Django settings import precheck failed (attempt $dpm_attempt/$dpm_max). Edit a field to fix it before we continue:" \
+          "DJANGO_SETTINGS DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+          "Retry django.setup() precheck with (possibly edited) values?" \
+          "y"
+        # If user re-edited DB_* / DJANGO_SETTINGS_MODULE → must reload ENV into THIS subshell
+        set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+        export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+      else
+        _die "$diag_banner"
+      fi
+    done
+    _ok "Django settings PRECHECK OK (attempt $dpm_attempt/$dpm_max; PYTHONPATH=$APP_DIR; DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}; traceback clean)"
     set +e
     # collectstatic: first quiet attempt with spinner; if that fails re-run
     # noisily so user sees WHY it failed (STATIC_ROOT / permissions)
