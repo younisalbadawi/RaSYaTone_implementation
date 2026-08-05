@@ -107,6 +107,25 @@ _py_version_ok() {
   if [ "$py_maj" -eq "$MIN_PYTHON_MAJOR" ] && [ "$py_min" -ge "$MIN_PYTHON_MINOR" ]; then return 0; fi
   return 1
 }
+# Reverse check: python version <= MAX_ALLOWED_PYTHON_MINOR. Needed as SEPARATE
+# gate after venv creation / activation because _py_version_ok only checks MIN
+# floor (>= 3.10) and accepts 3.14 / 3.15 / 4.0 without complaint — exactly how
+# psycopg2-binary 2.9.9 on cpython-314 slipped through and tried to build against
+# /usr/include/python3.14 headers, producing `_PyInterpreterState_Get` errors.
+# Returns 0 if python version is on the ALLOWED side of the cap (i.e. safe to use).
+_py_version_within_max_cap() {
+  local bin="$1" py_ver py_maj py_min
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  py_ver=$("$bin" -c 'import sys;print(sys.version_info.major,sys.version_info.minor)' 2>/dev/null || echo "0 0")
+  read -r py_maj py_min <<<"$py_ver"
+  [ "$py_maj" -ge 0 ] 2>/dev/null || return 1
+  [ "$py_min" -ge 0 ] 2>/dev/null || return 1
+  if [ "$py_maj" -ne 3 ]; then
+    # CPython 4+ major — definitely beyond our cap, refuse
+    return 1
+  fi
+  [ "$py_min" -le "$MAX_ALLOWED_PYTHON_MINOR" ]
+}
 
 # Maximum Python minor version to prefer by default. Python 3.13+ has too many
 # packages (numpy 1.26.x, pandas 2.1.x, psycopg 3.x) with requires-python < 3.13
@@ -1831,6 +1850,44 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   active_py="$(command -v python 2>/dev/null || echo "")"
   [ -n "$active_py" ] || _die "After sourcing .venv/bin/activate, 'python' command is not on PATH — venv is broken. Wipe $APP_DIR/.venv and rerun."
   _py_version_ok "$active_py" || _die "Activated venv python ($active_py, version=$($active_py -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null)) is TOO OLD for Django 5 (< ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}). This means venv was created with the WRONG python binary earlier. Wipe $APP_DIR/.venv and rerun Option 4 — this time it will use PYTHON_BIN=${PYTHON_BIN}."
+  # CRITICAL reverse check: activated python MUST be <= MAX_ALLOWED_PYTHON_MINOR.
+  # _py_version_ok (above) only checks MIN floor and accepts 3.14+ silently,
+  # which causes psycopg2-binary 2.9.9 sdist build to compile against /usr/include/python3.14
+  # headers and fail with: _PyInterpreterState_Get implicit declaration (symbol removed in 3.14).
+  # If this fails → loud die with exact instructions BEFORE any gcc runs.
+  local active_mm="" active_maj="" active_min=""
+  active_mm=$("$active_py" -c 'import sys;print("%s.%s" % (sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "0.0")
+  active_maj="${active_mm%%.*}"; active_min="${active_mm#*.}"
+  if ! _py_version_within_max_cap "$active_py" 2>/dev/null; then
+    _die "\
+Venv Python ${active_mm} is ABOVE MAX_ALLOWED_PYTHON_MINOR=3.${MAX_ALLOWED_PYTHON_MINOR}.
+This is the EXACT failure that produces: error: implicit declaration of function '_PyInterpreterState_Get'
+when psycopg2-binary 2.9.9 (old pinned sdist) compiles against python3.14+ headers.
+
+Why did this happen: the installer picked PYTHON_BIN=${PYTHON_BIN} during
+detection but the actual venv python at $(command -v python 2>/dev/null) ended up
+being a different (newer) binary. Most common causes:
+  (1) pre-existing .venv from a previous run (created when this server only had
+      python 3.14) was reused because we skip venv creation if dir exists.
+  (2) shell PATH order / update-alternatives swapped /usr/bin/python3 between
+      detection and venv creation.
+  (3) you manually created the venv with system python3=3.14.
+
+Remedy (exact, copy-paste commands — run as root on server):
+  rm -rf '${APP_DIR}/.venv'
+  apt install -y software-properties-common ca-certificates
+  DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv python3.11-dev python3-pip
+  command -v python3.11 && python3.11 --version   # expect Python 3.11.x
+
+Then re-run Option 4. It will wipe any leftover stale .venv automatically when
+you confirm dir overwrite in the git clone step, and recreate it with python3.11.
+MAX_ALLOWED_PYTHON_MINOR=${MAX_ALLOWED_PYTHON_MINOR} is intentional; do NOT raise to 14 or above —
+old pinned sdists (psycopg2-binary 2.9.9, etc.) break on cpython-314+ and there
+are no prebuilt wheels for them either."
+  fi
+  _ok "Venv Python OK: ${active_py} -> Python ${active_mm} (>=3.${MIN_PYTHON_MINOR}, <= 3.${MAX_ALLOWED_PYTHON_MINOR}) — pip install will compile against correct headers"
   _run_with_spinner "pip upgrade (pip+setuptools+wheel in venv)" bash -c "python -m pip install --quiet --upgrade pip setuptools wheel" || \
     _die "pip upgrade failed — venv Python is broken or no internet. Try: $active_py -m ensurepip --upgrade"
   if [ -f "$APP_DIR/requirements.txt" ]; then
@@ -1946,16 +2003,36 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
       if printf '%s' "$log_lower" | grep -Eq "fatal error.*ffi\.h: no such file or directory|ffi\.h: no such file or directory"; then
         bullets="${bullets}|★ LIBFFI HEADERS MISSING (ffi.h). 'cffi' package cannot build because libffi-dev/libffi-devel was NOT installed by the system package manager. This is REQUIRED for cryptography / bcrypt / PyNaCl / paramiko builds. Fix: apt install libffi-dev, or dnf install libffi-devel, or apk add libffi-dev — then rerun Option 4."
       fi
-      if printf '%s' "$log_lower" | grep -Eq "pyweakref_getobject|py_dePRECATED\(3\.13\)|error: command '.*gcc' failed with exit code 1.*psycopg|building '_cffi_backend' extension failed"; then
-        # Combination of PyWeakref deprecation + C compile failure usually = Python too new
-        # for the pinned old package versions. Check actual venv Python major/minor.
+      if printf '%s' "$log_lower" | grep -Eq "pyweakref_getobject|_pyinterpreterstate_get|pyinterpreterstate_main|py_deprecated\(3\.1[3-9]\)|cpython-31[4-9]|implicit declaration of function '_py|implicit declaration of function 'pyweakref|error: command '.*gcc' failed with exit code 1.*psycopg|building '_cffi_backend' extension failed"; then
+        # ANY of these patterns → Python too new for pinned old sdists.
+        # Symbols removed in CPython 3.14 that old pinned sdists still call directly:
+        #   * PyWeakref_GetObject (Py_DEPRECATED(3.13) in 3.13, deleted in 3.14)
+        #   * _PyInterpreterState_Get (internal, made static in 3.13+ / removed in 3.14)
+        #   * PyInterpreterState_Main (API shape change; private macro gone)
+        # Compile-time header mismatch also shown by cpython-31[4-9] wheel tags in the
+        # sdist fallback lines the user's gcc compile ran under.
         local actual_py_ver=""
         actual_py_ver="$($active_py -c 'import sys;print("%s.%s" % (sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "?")"
         if [ "$actual_py_ver" != "?" ]; then
           local amj="${actual_py_ver%%.*}" amin="${actual_py_ver#*.}"
           if [ "$amj" -eq 3 ] && [ "$amin" -ge 14 ] 2>/dev/null; then
-            bullets="${bullets}|★ PYTHON TOO NEW FOR PINNED SDISTS (locked=${actual_py_ver}). Python 3.14+ removes many deprecated CPython C-API symbols that old pinned sdist versions still use (psycopg2-binary 2.9.9 calls PyWeakref_GetObject which was removed in 3.14). The installer should have REFUSED 3.14+ automatically — if it didn't, no Python 3.10/3.11/3.12/3.13 was on PATH at install time. Fix: INSTALL Python 3.11/3.12 from repos: apt install python3.11 python3.11-venv python3.11-pip python3.11-dev, then rerun Option 4."
+            bullets="${bullets}|★ PYTHON TOO NEW FOR PINNED SDISTS (locked=${actual_py_ver}). Python 3.14+ removes many deprecated CPython C-API symbols that old pinned sdist versions still use. Your EXACT error pattern: psycopg2-binary 2.9.9 called '_PyInterpreterState_Get' (private symbol made static in 3.13 and deleted in 3.14) when compiling against /usr/include/python${actual_py_ver} headers. The installer already refuses 3.14+ during detection; what happened is a PRE-EXISTING .venv (created when only 3.14 was available on this server) got re-used because the venv directory already existed. FIX = rm -rf ${APP_DIR}/.venv, install python3.11 from deadsnakes PPA, then rerun Option 4. Copy-paste exact commands (run as root on this server):
+    rm -rf '${APP_DIR}/.venv'
+    apt install -y software-properties-common ca-certificates
+    DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:deadsnakes/ppa
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv python3.11-dev python3-pip
+    command -v python3.11 && python3.11 --version   # expect Python 3.11.x
+Then re-run the installer Option 4. For the user who reported this failure:
+the previous 'Only Python 3.14 was found MAX_ALLOWED=3.13' hard die before this step has been fixed too — prechecks now auto-install python3.11 via deadsnakes BEFORE the detection pass runs."
+          else
+            # 3.10..3.13 but still got removed-symbol error — most likely a psycopg2
+            # binary wheel pinned too old; still actionable, just no 3.14 specific note
+            bullets="${bullets}|★ PSYCOPG2 C-API INCOMPATIBILITY (actual venv python=${actual_py_ver}, but sdist calls removed C symbols). Most likely psycopg2-binary==2.9.9 pinned in requirements.txt is too old for the CPython on this server. Quickest fix: edit requirements.txt (commit to your repo!) and change 'psycopg2-binary==2.9.9' → 'psycopg[binary]>=3.1.8' (psycopg v3 supports Python 3.10–3.13 with binary wheels, no sdist compile needed). Or install python3.11 from deadsnakes PPA and rerun — 3.11 has prebuilt wheels for psycopg2-binary 2.9.9 so no C compile ever runs."
           fi
+        else
+          # active_py unknown (shouldn't happen but guard anyway)
+          bullets="${bullets}|★ PYTHON / C-API INCOMPATIBILITY during sdist compile (couldn't read venv python version). Could be Python 3.14+ or a too-new psycopg. Fix: install python3.11 system-wide, remove stale ${APP_DIR}/.venv, rerun Option 4."
         fi
       fi
       if printf '%s' "$log_lower" | grep -Eq "no matching distribution found"; then
