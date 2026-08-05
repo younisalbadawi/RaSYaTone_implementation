@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0020-auto-create-db-role-from-psql-fail"
+SCRIPT_VERSION_BUILD="2026-08-06T0030-3-tier-peer-sudo-superuser-autofix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -65,24 +65,84 @@ _die()  { printf "\n\033[91mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 _section(){ printf "\n\033[1;97m=== %s ===\033[0m\n" "$*"; }
 
 # Dynamic CREATE ROLE + CREATE DATABASE + SELECT 1 one-shot auto-fixer for when psql credential test crashes
-# with "database does not exist" or "role does not exist". Runs only when:
-#   1. psql test with DB_PASSWORD failed with one of those 2 categorized causes.
-#   2. sudo -u postgres psql postgres -tAc "SELECT 1" returns 1 (superuser access works locally).
-#   3. User answers Y to prompt_def.
-# Returns 0 if after actions SELECT 1 == '1' succeeded (caller can then break out of their attempt loop).
-# Returns 1 otherwise (caller falls back to prompt_edit_multiple / manual fix).
+# with "database does not exist" or "role does not exist". Runs 3-tier superuser access probe (any 1 success = auto-fix works):
+#   (A) PEER-AUTH LOCAL UNIX SOCKET (no sudo, no password):
+#          psql -h /var/run/postgresql -U postgres -d postgres -tAc "SELECT 1" → returns '1'
+#       Most common on Ubuntu/Debian/Contabo when installer runs as root on same machine as Postgres.
+#   (B) INTERACTIVE SUDO (with password prompt IF needed):
+#          sudo -u postgres psql postgres -tAc "SELECT 1" (tty present → accepts sudo password from user)
+#       90% of VPS setups including Contabo default (sudoers has no NOPASSWD for root? It does. But remove -n probe.)
+#   (C) EXPLICIT DB_SUPERUSER_USER / DB_SUPERUSER_PASSWORD (user-managed sentinel values):
+#          PGPASSWORD=<sentinel> psql -h DB_HOST -p DB_PORT -U <superuser> -d postgres -tAc "SELECT 1"
+#       Used when Postgres is on a DIFFERENT server from the installer (not local), or peer/sudo both fail.
+# Any probe success = user gets Y/n offer, then we run CREATE ROLE + CREATE DATABASE + GRANT + re-verify SELECT 1 as app user.
+# Returns 0 if post-autofix SELECT 1 == '1' (caller can break their retry loop).
+# Returns 1 otherwise (caller falls back to prompt_edit_multiple / manual shell fix).
 _psql_auto_fix_missing_role_or_db() {
   local _cause_lc="$1"  # lowercase psql error (already from tr upper->lower)
   local _db_user="$2" _db_name="$3" _db_pw="$4"
   local _out5="/tmp/rasyatone_psql_autofix_$$.out"
-  local _can_sudo=0
-  if command -v sudo >/dev/null 2>&1 && id -u postgres >/dev/null 2>&1; then
-    local _su_row=""
-    _su_row=$(sudo -n -u postgres psql postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
-    if [ "$_su_row" = "1" ]; then _can_sudo=1; fi
+  # 3-tier probe result: "peer" | "sudo" | "superuser" | "" (none)
+  local _mode=""
+  local _trow=""
+
+  # ── TIER A: peer-auth local UNIX socket (no sudo, no password) ──────────────────────────
+  if [ -z "$_mode" ] && command -v psql >/dev/null 2>&1; then
+    # Try socket dirs in order of decreasing commonness on Debian/Ubuntu/RHEL
+    local _sdir=""
+    for _sdir in /var/run/postgresql /tmp /run/postgresql; do
+      [ -S "${_sdir}/.s.PGSQL.5432" ] || [ -d "$_sdir" ] || continue
+      _trow=$(psql -h "$_sdir" -U postgres -d postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+      if [ "$_trow" = "1" ]; then
+        _mode="peer|$_sdir"
+        break
+      fi
+    done
   fi
-  if [ "$_can_sudo" -ne 1 ]; then
-    _info "AUTO-FIX NOT AVAILABLE: sudo -u postgres psql (non-interactive, NOPASSWD) not reachable from this shell — so we cannot create the role/DB on the Postgres server. Use the manual SQL command provided above instead, then retry."
+
+  # ── TIER B: interactive sudo (no -n flag; accepts sudo password prompt if tty present) ──
+  if [ -z "$_mode" ] && command -v sudo >/dev/null 2>&1 && id -u postgres >/dev/null 2>&1; then
+    # Only probe sudo if user is NOT root OR sudo binary is installed (Contabo root has sudo NOPASSWD usually).
+    _trow=$(sudo -u postgres psql postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ "$_trow" = "1" ]; then
+      _mode="sudo"
+    elif [ -t 0 ]; then
+      # Stdin is a tty → sudo might need interactive password. Re-try without silencing stderr so user sees prompt.
+      local _yes
+      _yes=$(prompt_def "sudo -n probe failed; retry sudo WITH tty password prompt (needed if your sudoers lacks NOPASSWD entry)? [Y/n]" "Y")
+      case "$_yes" in y|Y|yes|YES|Yes|1)
+        printf "  Running: sudo -u postgres psql postgres -tAc 'SELECT 1' — enter sudo password if asked.\n" >&2
+        _trow=$(sudo -u postgres psql postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ "$_trow" = "1" ]; then _mode="sudo"; fi
+      ;; esac
+    fi
+  fi
+
+  # ── TIER C: explicit DB_SUPERUSER sentinel fields (user can paste superuser credentials here) ──
+  local _su_user="${DB_SUPERUSER_USER:-postgres}" _su_pw="${DB_SUPERUSER_PASSWORD:-}"
+  if [ -z "$_mode" ] && command -v psql >/dev/null 2>&1; then
+    # If sentinel not set yet → prompt_def to let user paste them now (optional: hitting Enter skips).
+    if [ -z "${_su_pw}" ]; then
+      local _offered_su
+      _offered_su=$(prompt_def "No local peer/sudo superuser access found. Connect as DB superuser VIA TCP to ${DB_HOST}:${DB_PORT} to create role+DB remotely? Enter superuser username [postgres or hit Enter=SKIP]" "${_su_user}")
+      if [ -n "${_offered_su}" ] && [ "${_offered_su}" != "SKIP" ] && [ "${_offered_su}" != "skip" ]; then
+        _su_user="${_offered_su}"
+        _su_pw=$(prompt_secret "Superuser password for ${_su_user} @ ${DB_HOST}:${DB_PORT}/postgres (no echo, empty=skip tier C)" "")
+        if [ -n "${_su_pw}" ]; then
+          export DB_SUPERUSER_USER="${_su_user}" DB_SUPERUSER_PASSWORD="${_su_pw}"
+          _trow=$(PGPASSWORD="$_su_pw" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_su_user}" -d postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+          if [ "$_trow" = "1" ]; then _mode="superuser|tcp"; fi
+        fi
+      fi
+    else
+      # Sentinel values already in env/ENV_FILE → quick probe silently.
+      _trow=$(PGPASSWORD="$_su_pw" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_su_user}" -d postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+      if [ "$_trow" = "1" ]; then _mode="superuser|tcp"; fi
+    fi
+  fi
+
+  if [ -z "$_mode" ]; then
+    _info "AUTO-FIX NOT AVAILABLE: ALL 3 superuser probes failed (peer unix socket DNE or peer-auth denied, sudo -u postgres not reachable, and no DB_SUPERUSER_PASSWORD sentinel value given for remote superuser TCP create). Use the manual SQL command provided above then retry, OR pick Option 3 from main menu first. You can also set sentinel fields in prompt_edit_multiple: DB_SUPERUSER_USER=postgres DB_SUPERUSER_PASSWORD=<pw> for remote-TCP create."
     return 1
   fi
   local _needs_role=0 _needs_db=0
@@ -93,17 +153,17 @@ _psql_auto_fix_missing_role_or_db() {
   if [ "$_needs_db" -eq 0 ] && [ "$_needs_role" -eq 0 ]; then return 1; fi
   local _offer=""
   if [ "$_needs_role" -eq 1 ] && [ "$_needs_db" -eq 1 ]; then
-    _offer="CREATE ROLE ${_db_user} (LOGIN + password from ENV_FILE DB_PASSWORD=) + CREATE DATABASE ${_db_name} OWNER ${_db_user} + GRANT CONNECT + SELECT 1 verify"
+    _offer="CREATE ROLE ${_db_user} (LOGIN + password from ENV_FILE DB_PASSWORD=) + CREATE DATABASE ${_db_name} OWNER ${_db_user} + GRANT CONNECT + SELECT 1 verify. SUPERUSER MODE=${_mode%%|*}."
   else
-    _offer="CREATE DATABASE ${_db_name} OWNER ${_db_user} + SELECT 1 verify (role already exists; password OK — DB object alone missing)"
+    _offer="CREATE DATABASE ${_db_name} OWNER ${_db_user} + SELECT 1 verify (role already exists; password OK — DB object alone missing). SUPERUSER MODE=${_mode%%|*}."
   fi
   local _do_it
-  _do_it=$(prompt_def "AUTO-FIX AVAILABLE (sudo -u postgres works non-interactively): Run: ${_offer}? [Y/n]" "Y")
+  _do_it=$(prompt_def "AUTO-FIX AVAILABLE via ${_mode%%|*}: Run: ${_offer}? [Y/n]" "Y")
   case "$_do_it" in
     y|Y|yes|YES|Yes|1) ;;
     *) return 1 ;;
   esac
-  _section "AUTO-FIX: ${_offer}"
+  _section "AUTO-FIX (mode ${_mode%%|*}): ${_offer}"
   # Escape single quotes in password for SQL literals: every ' → ''
   local _sql_pw
   _sql_pw=$(printf '%s' "${_db_pw}" | sed "s/'/''/g")
@@ -111,31 +171,77 @@ _psql_auto_fix_missing_role_or_db() {
   _esc_user=$(printf '%s' "${_db_user}" | sed "s/'/''/g")
   local _esc_db
   _esc_db=$(printf '%s' "${_db_name}" | sed "s/'/''/g")
+  # Build CREATE ROLE sql (always write file even if _needs_role=0 so both branches have consistent temp file cleanup).
+  local _role_sql="/tmp/rasyatone_autofix_role_$$.sql"
+  : > "$_role_sql"
   if [ "$_needs_role" -eq 1 ]; then
-    local _role_sql="/tmp/rasyatone_autofix_role_$$.sql"
     printf "CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEROLE CREATEDB;\n" "${_esc_user}" "${_sql_pw}" > "$_role_sql"
-    _run_with_spinner "psql auto-fix (CREATE ROLE ${_db_user})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_role_sql" >/dev/null 2>"$_out5" || true
-    rm -f "$_role_sql"
   fi
+  local _db_sql="/tmp/rasyatone_autofix_db_$$.sql"
+  : > "$_db_sql"
   if [ "$_needs_db" -eq 1 ]; then
-    local _db_sql="/tmp/rasyatone_autofix_db_$$.sql"
     printf "CREATE DATABASE %s OWNER %s;\n" "${_esc_db}" "${_esc_user}" > "$_db_sql"
-    _run_with_spinner "psql auto-fix (CREATE DATABASE ${_db_name} OWNER ${_db_user})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_db_sql" >/dev/null 2>"$_out5" || true
-    rm -f "$_db_sql"
-    local _grant_sql="/tmp/rasyatone_autofix_grant_$$.sql"
-    printf 'GRANT CONNECT ON DATABASE %s TO %s;\n' "${_esc_db}" "${_esc_user}" > "$_grant_sql"
-    _run_with_spinner "psql auto-fix (GRANT CONNECT ON DATABASE ${_db_name} TO ${_db_user})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_grant_sql" >/dev/null 2>"$_out5" || true
-    rm -f "$_grant_sql"
   fi
-  # Verify SELECT 1 immediately (same psql as caller test, so if we fixed the right thing it returns 1 here too).
+  local _grant_sql="/tmp/rasyatone_autofix_grant_$$.sql"
+  printf 'GRANT CONNECT ON DATABASE %s TO %s;\n' "${_esc_db}" "${_esc_user}" > "$_grant_sql"
+  # Apply mode dispatch:
+  case "$_mode" in
+    peer\|*)
+      local _sdir="${_mode#*|}"
+      if [ "$_needs_role" -eq 1 ]; then
+        _run_with_spinner "psql auto-fix (CREATE ROLE ${_db_user} via peer socket)" psql -h "$_sdir" -U postgres -v ON_ERROR_STOP=1 -d postgres -f "$_role_sql" >/dev/null 2>"$_out5" || true
+      fi
+      if [ "$_needs_db" -eq 1 ]; then
+        _run_with_spinner "psql auto-fix (CREATE DATABASE ${_db_name} via peer socket)" psql -h "$_sdir" -U postgres -v ON_ERROR_STOP=1 -d postgres -f "$_db_sql" >/dev/null 2>"$_out5" || true
+        _run_with_spinner "psql auto-fix (GRANT CONNECT via peer socket)" psql -h "$_sdir" -U postgres -v ON_ERROR_STOP=1 -d postgres -f "$_grant_sql" >/dev/null 2>"$_out5" || true
+      fi
+      ;;
+    sudo)
+      if [ "$_needs_role" -eq 1 ]; then
+        _run_with_spinner "psql auto-fix (CREATE ROLE ${_db_user} via sudo postgres)" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_role_sql" >/dev/null 2>"$_out5" || true
+      fi
+      if [ "$_needs_db" -eq 1 ]; then
+        _run_with_spinner "psql auto-fix (CREATE DATABASE ${_db_name} via sudo postgres)" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_db_sql" >/dev/null 2>"$_out5" || true
+        _run_with_spinner "psql auto-fix (GRANT CONNECT via sudo postgres)" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_grant_sql" >/dev/null 2>"$_out5" || true
+      fi
+      ;;
+    superuser\|tcp)
+      # Remote TCP via superuser credentials.
+      if [ "$_needs_role" -eq 1 ]; then
+        _run_with_spinner "psql auto-fix (CREATE ROLE ${_db_user} via superuser TCP)" bash -c "PGPASSWORD='${_su_pw//\'/\'\\\'\'}' psql -h '${DB_HOST}' -p '${DB_PORT}' -U '${_su_user}' -d postgres -v ON_ERROR_STOP=1 -f '${_role_sql}'" >/dev/null 2>"$_out5" || true
+      fi
+      if [ "$_needs_db" -eq 1 ]; then
+        _run_with_spinner "psql auto-fix (CREATE DATABASE ${_db_name} via superuser TCP)" bash -c "PGPASSWORD='${_su_pw//\'/\'\\\'\'}' psql -h '${DB_HOST}' -p '${DB_PORT}' -U '${_su_user}' -d postgres -v ON_ERROR_STOP=1 -f '${_db_sql}'" >/dev/null 2>"$_out5" || true
+        _run_with_spinner "psql auto-fix (GRANT CONNECT via superuser TCP)" bash -c "PGPASSWORD='${_su_pw//\'/\'\\\'\'}' psql -h '${DB_HOST}' -p '${DB_PORT}' -U '${_su_user}' -d postgres -v ON_ERROR_STOP=1 -f '${_grant_sql}'" >/dev/null 2>"$_out5" || true
+      fi
+      ;;
+  esac
+  rm -f "$_role_sql" "$_db_sql" "$_grant_sql"
+  # Verify SELECT 1 immediately as the REAL app user DB_USER against the REAL target DB:
   local _verify_row=""
   _verify_row=$(PGPASSWORD="${_db_pw}" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_db_user}" -d "${_db_name}" -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
   rm -f "$_out5"
   if [ "$_verify_row" = "1" ]; then
-    _ok "AUTO-FIX SUCCESS: SELECT 1 returned '1' — role ${_db_user} + DB ${_db_name} ready (all missing objects created in-place)."
+    _ok "AUTO-FIX SUCCESS (mode ${_mode%%|*}): SELECT 1 returned '1' — role ${_db_user} + DB ${_db_name} ready (all missing objects created in-place)."
+    # Persist sentinel superuser values if user just gave them via tier C so prompt_edit_multiple sees them.
+    if [ -n "${DB_SUPERUSER_PASSWORD:-}" ] && [ -n "${ENV_FILE:-}" ]; then
+      local _sed_bin _sufield _suvalue _sedline
+      command -v gsed >/dev/null 2>&1 && _sed_bin="gsed" || _sed_bin="sed"
+      for _sufield in DB_SUPERUSER_USER DB_SUPERUSER_PASSWORD; do
+        eval _suvalue="\${$_sufield:-}"
+        [ -z "${_suvalue+x}" ] && continue
+        _sedline="$_sufield='$_suvalue'"
+        if grep -Eq "^${_sufield}=" "$ENV_FILE" 2>/dev/null; then
+          sudo "$_sed_bin" -i~ -E "s|^${_sufield}=.*|${_sedline}|" "$ENV_FILE" 2>/dev/null || true
+          sudo rm -f "${ENV_FILE}~" 2>/dev/null || true
+        else
+          printf '%s\n' "$_sedline" | sudo tee -a "$ENV_FILE" >/dev/null 2>/dev/null || true
+        fi
+      done
+    fi
     return 0
   fi
-  _warn "AUTO-FIX applied but SELECT 1 still fails (verify row='${_verify_row}' not '1'). Proceeding to manual prompt_edit_multiple / manual shell fix menu."
+  _warn "AUTO-FIX applied (mode ${_mode%%|*}) but SELECT 1 still fails (verify row='${_verify_row}' not '1'). Proceeding to manual prompt_edit_multiple / manual shell fix menu."
   return 1
 }
 
@@ -1594,9 +1700,15 @@ precheck_app_prereqs() {
         if [ "$s1_attempt" -lt "$s1_max" ] && [ "$_auto_ok" -ne 1 ]; then
           _warn "psql SELECT 1 FAILED attempt $s1_attempt/$s1_max. DETECTED CAUSE: ${_psql_cause2}. Raw output: $(cat "$psql_out" 2>/dev/null | tail -n 5 | tr '\n' ' ')"
           _info "FIX SUGGESTION: ${_psql_action2}"
+          # ── Pre-populate superuser sentinel defaults into ENV_FILE before prompt_edit_multiple (prevents (EMPTY) for new fields; user can overwrite.
+          if [ -n "${ENV_FILE:-}" ]; then
+            grep -q "^DB_SUPERUSER_USER=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_USER='postgres'" >> "$ENV_FILE"
+            grep -q "^DB_SUPERUSER_PASSWORD=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_PASSWORD=''" >> "$ENV_FILE"
+            set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+          fi
           prompt_edit_multiple \
-            "psql SELECT 1 credential test FAILED — edit DB creds to fix" \
-            "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
+            "psql SELECT 1 credential test FAILED — edit DB creds to fix. Sentinel fields: DB_SUPERUSER_USER/DB_SUPERUSER_PASSWORD enable remote-TCP CREATE ROLE/DATABASE if local peer/sudo unavailable." \
+            "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT DB_SUPERUSER_USER DB_SUPERUSER_PASSWORD" \
             "Retry psql SELECT 1 with (possibly edited) values?" \
             "y"
         else
@@ -2496,9 +2608,15 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
         if [ "$dbprobe_attempt" -lt "$dbprobe_max" ] && [ "$_auto_ok2" -ne 1 ]; then
           _warn "psql SELECT 1 FAILED attempt $dbprobe_attempt/$dbprobe_max. DETECTED CAUSE: ${_psql_cause}. RAW LAST ERROR: $last_err"
           _info "FIX SUGGESTION: ${_psql_action}"
+          # ── Pre-populate superuser sentinel defaults into ENV_FILE before prompt_edit_multiple (prevents (EMPTY) for new fields.
+          if [ -n "${ENV_FILE:-}" ]; then
+            grep -q "^DB_SUPERUSER_USER=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_USER='postgres'" >> "$ENV_FILE"
+            grep -q "^DB_SUPERUSER_PASSWORD=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_PASSWORD=''" >> "$ENV_FILE"
+            set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+          fi
           prompt_edit_multiple \
-            "psql SELECT 1 (credential pre-check) FAILED — edit DB creds to fix (pre-filled defaults from ENV_FILE on first open)" \
-            "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
+            "psql SELECT 1 (credential pre-check) FAILED — edit DB creds to fix (pre-filled defaults from ENV_FILE on first open). Sentinels DB_SUPERUSER_USER/DB_SUPERUSER_PASSWORD create role+DB REMOTELY via TCP when local peer/sudo unavailable." \
+            "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT DB_SUPERUSER_USER DB_SUPERUSER_PASSWORD" \
             "Retry psql SELECT 1 with (possibly edited) values?" \
             "y"
           # prompt_edit_multiple modified values in memory → also persist them to ENV_FILE
