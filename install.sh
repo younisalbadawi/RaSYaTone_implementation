@@ -1930,13 +1930,48 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   # NOTE: `set -u` (nounset) from top of script causes activate scripts to crash
   # when they reference variables like _OLD_VIRTUAL_PATH that may not exist.
   # We temporarily disable nounset during activate and re-enable it after.
+  #
+  # BELT+BRACES PATH INJECTION: The venv "activate" script does TWO things:
+  #   (1) prepend $VENV_BIN to $PATH so bare `python` resolves to venv python
+  #   (2) set VIRTUAL_ENV shell variable
+  # Bug we are fixing NOW: on some Debian bash setups, sourcing the activate
+  # script inside a function with set +e + set -u toggles can silently no-op
+  # (activate uses bash 'hash -r' which interacts weirdly with non-interactive
+  #  bash, or the script may exit early due to nounset edge cases before
+  #  reaching the PATH assignment). When this happens, command -v python returns
+  #  EMPTY / system python, but the venv itself (APP_DIR/.venv/bin/python) is
+  #  still 100% healthy. The OLD check DIED here unnecessarily:
+  #    [ -n "$active_py" ] || _die "After sourcing .venv/bin/activate, 'python'
+  #                                 command is not on PATH — venv is broken."
+  # FIX:
+  #   (a) ALWAYS build active_py from the absolute venv/bin/python path
+  #       (NOT from command -v python lookup). This is what we actually want
+  #       to validate version/MAX cap on — it cannot be broken by PATH env.
+  #   (b) Explicitly prepend VENV_BIN to PATH ourselves AFTER sourcing activate
+  #       (guarantees bare `python` / `pip` / `gunicorn` resolve correctly even
+  #        if activate script no-op'd.)
+  #   (c) `command -v python` failure is now WARN + AUTO-FIX, not DIE.
+  local venv_bin="${APP_DIR:?}/.venv/bin"
+  [ -d "$venv_bin" ] || _die "Venv bin dir $venv_bin does not exist after venv creation step! Something wiped it between create and activate. Try: sudo rm -rf '${APP_DIR}/.venv' ; rerun Option 4."
+  local active_py="${venv_bin}/python"
+  [ -x "$active_py" ] || _die "Venv python binary $active_py does NOT exist or is NOT executable (after successful create). This is almost always (1) disk corruption, (2) parallel install script run wiped it, or (3) antivirus/security tool quarantined it. Try: sudo rm -rf '${APP_DIR}/.venv' ; rerun Option 4."
   set +u
   . "$APP_DIR/.venv/bin/activate" 2>/dev/null || true
   set -u
+  # Belt+braces: explicitly inject venv/bin onto PATH (even if activate script
+  # no-op'd due to non-interactive bash nounset/hash weirdness described above).
+  # Use bash colon-separated dedupe pattern: only prepend if not already present.
+  case ":$PATH:" in
+    *":$venv_bin:"*) : ;;   # already there (activate worked normally)
+    *) export PATH="$venv_bin:$PATH" ;;
+  esac
+  export VIRTUAL_ENV="${VIRTUAL_ENV:-${APP_DIR:?}/.venv}"
+  # Now: if `command -v python` is STILL empty (shouldn't be, since we prepended),
+  # it's only a cosmetic issue (absolute active_py works). Warn, don't die.
+  if ! command -v python >/dev/null 2>&1; then
+    _warn "After activate+manual PATH inject, bare 'python' still not on PATH via command -v lookup. This is cosmetic; we will use absolute venv python=$active_py directly below. Child processes that call bare 'python' or 'pip' may need to re-source activate manually once."
+  fi
   # Sanity check: verify the activated `python` is the same one we chose
-  local active_py=""
-  active_py="$(command -v python 2>/dev/null || echo "")"
-  [ -n "$active_py" ] || _die "After sourcing .venv/bin/activate, 'python' command is not on PATH — venv is broken. Wipe $APP_DIR/.venv and rerun."
   _py_version_ok "$active_py" || _die "Activated venv python ($active_py, version=$($active_py -c 'import sys;print(sys.version_info.major,".",sys.version_info.minor,sep="")' 2>/dev/null)) is TOO OLD for Django 5 (< ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}). This means venv was created with the WRONG python binary earlier. Wipe $APP_DIR/.venv and rerun Option 4 — this time it will use PYTHON_BIN=${PYTHON_BIN}."
   # CRITICAL reverse check: activated python MUST be <= MAX_ALLOWED_PYTHON_MINOR.
   # _py_version_ok (above) only checks MIN floor and accepts 3.14+ silently,
@@ -1960,12 +1995,20 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
       _die "Post-activate: auto-remove of incompatible venv FAILED. Manual fix: sudo rm -rf '${APP_DIR:?}/.venv' ; rerun Option 4."
     _run_with_spinner "Post-activate auto-fix: recreate venv with ${PYTHON_BIN##*/}" bash -c "'${PYTHON_BIN}' -m venv '${APP_DIR:?}/.venv'" || \
       _die "Post-activate: recreate venv with PYTHON_BIN=${PYTHON_BIN} FAILED. Fix the underlying system package issue (${PYTHON_BIN##*/}-venv missing? disk full?) then rerun Option 4."
-    # Re-activate with our new fixed venv
+    # Re-activate with our new fixed venv (use same absolute-path pattern as
+    # first activate block so we can't die on PATH-population no-op again).
+    venv_bin="${APP_DIR:?}/.venv/bin"
+    [ -d "$venv_bin" ] || _die "After recreate: venv bin dir $venv_bin missing."
+    active_py="${venv_bin}/python"
+    [ -x "$active_py" ] || _die "After recreate: venv python=$active_py not executable."
     set +u
     . "$APP_DIR/.venv/bin/activate" 2>/dev/null || true
     set -u
-    active_py="$(command -v python 2>/dev/null || echo "")"
-    [ -n "$active_py" ] || _die "Post-activate auto-recreate: reactivate FAILED. Venv at ${APP_DIR}/.venv is broken. Try: sudo rm -rf '${APP_DIR:?}/.venv' ; rerun Option 4."
+    case ":$PATH:" in
+      *":$venv_bin:"*) : ;;
+      *) export PATH="$venv_bin:$PATH" ;;
+    esac
+    export VIRTUAL_ENV="${APP_DIR:?}/.venv"
     active_mm=$("$active_py" -c 'import sys;print("%s.%s" % (sys.version_info.major,sys.version_info.minor))' 2>/dev/null || echo "0.0")
     _py_version_ok "$active_py" || _die "Post-activate auto-recreate: regenerated venv python (${active_mm}) TOO OLD (< 3.${MIN_PYTHON_MINOR}). PYTHON_BIN=${PYTHON_BIN} is wrong or broken. Try: install python3.11 (deadsnakes PPA), then rerun Option 4."
     if ! _py_version_within_max_cap "$active_py" 2>/dev/null; then
