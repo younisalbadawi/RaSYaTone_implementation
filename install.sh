@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0030-3-tier-peer-sudo-superuser-autofix"
+SCRIPT_VERSION_BUILD="2026-08-06T0040-per-tier-diagnostic-autofix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -85,66 +85,136 @@ _psql_auto_fix_missing_role_or_db() {
   # 3-tier probe result: "peer" | "sudo" | "superuser" | "" (none)
   local _mode=""
   local _trow=""
+  # Per-tier diagnostic capture (so if all tiers fail, user sees EXACTLY what went wrong per tier).
+  local _tierA_rc=0 _tierA_cmd="" _tierA_err="/tmp/rasyatone_autofix_tierA_$$.err"
+  local _tierB_rc=0 _tierB_cmd="" _tierB_err="/tmp/rasyatone_autofix_tierB_$$.err"
+  local _tierC_rc=0 _tierC_cmd="" _tierC_err="/tmp/rasyatone_autofix_tierC_$$.err"
+  local _tierC_skipped=0  # 1 = user answered Enter=SKIP, not probe failure
+  : > "$_tierA_err"; : > "$_tierB_err"; : > "$_tierC_err"
 
   # ── TIER A: peer-auth local UNIX socket (no sudo, no password) ──────────────────────────
-  if [ -z "$_mode" ] && command -v psql >/dev/null 2>&1; then
-    # Try socket dirs in order of decreasing commonness on Debian/Ubuntu/RHEL
-    local _sdir=""
-    for _sdir in /var/run/postgresql /tmp /run/postgresql; do
-      [ -S "${_sdir}/.s.PGSQL.5432" ] || [ -d "$_sdir" ] || continue
-      _trow=$(psql -h "$_sdir" -U postgres -d postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
-      if [ "$_trow" = "1" ]; then
-        _mode="peer|$_sdir"
-        break
+  _tierA_cmd="(not attempted; psql command missing from PATH)"
+  if [ -z "$_mode" ]; then
+    if command -v psql >/dev/null 2>&1; then
+      # Try socket dirs in order of decreasing commonness on Debian/Ubuntu/RHEL
+      local _sdir=""
+      for _sdir in /var/run/postgresql /tmp /run/postgresql; do
+        [ -S "${_sdir}/.s.PGSQL.5432" ] || [ -d "$_sdir" ] || continue
+        _tierA_cmd="psql -h '$_sdir' -U postgres -d postgres -tAc 'SELECT 1'"
+        _trow=$(psql -h "$_sdir" -U postgres -d postgres -tAc "SELECT 1" 2>"$_tierA_err" | tr -d '[:space:]' || true)
+        _tierA_rc=$?
+        if [ "$_trow" = "1" ]; then
+          _mode="peer|$_sdir"
+          break
+        fi
+      done
+      if [ -z "$_mode" ]; then
+        # Either: no socket dir found at all, or peer auth denied for OS user. Record for diagnostics.
+        if [ "$_tierA_cmd" = "(not attempted; psql command missing from PATH)" ]; then
+          local _found_dirs=""
+          for _sdir in /var/run/postgresql /tmp /run/postgresql; do
+            if [ -S "${_sdir}/.s.PGSQL.5432" ] || [ -d "$_sdir" ]; then
+              _found_dirs="${_found_dirs}${_sdir},"
+            fi
+          done
+          printf 'No peer socket dirs found (checked /var/run/postgresql,/tmp,/run/postgresql: found=[%s])\n' "${_found_dirs%,}" >> "$_tierA_err"
+        fi
       fi
-    done
+    else
+      printf 'psql command NOT FOUND on PATH (install postgresql-client first)\n' >> "$_tierA_err"
+    fi
   fi
 
   # ── TIER B: interactive sudo (no -n flag; accepts sudo password prompt if tty present) ──
-  if [ -z "$_mode" ] && command -v sudo >/dev/null 2>&1 && id -u postgres >/dev/null 2>&1; then
-    # Only probe sudo if user is NOT root OR sudo binary is installed (Contabo root has sudo NOPASSWD usually).
-    _trow=$(sudo -u postgres psql postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
-    if [ "$_trow" = "1" ]; then
-      _mode="sudo"
-    elif [ -t 0 ]; then
-      # Stdin is a tty → sudo might need interactive password. Re-try without silencing stderr so user sees prompt.
-      local _yes
-      _yes=$(prompt_def "sudo -n probe failed; retry sudo WITH tty password prompt (needed if your sudoers lacks NOPASSWD entry)? [Y/n]" "Y")
-      case "$_yes" in y|Y|yes|YES|Yes|1)
-        printf "  Running: sudo -u postgres psql postgres -tAc 'SELECT 1' — enter sudo password if asked.\n" >&2
-        _trow=$(sudo -u postgres psql postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ "$_trow" = "1" ]; then _mode="sudo"; fi
-      ;; esac
+  _tierB_cmd="(not attempted)"
+  if [ -z "$_mode" ]; then
+    if command -v sudo >/dev/null 2>&1 && id -u postgres >/dev/null 2>&1; then
+      _tierB_cmd="sudo -u postgres psql postgres -tAc 'SELECT 1'"
+      _trow=$(sudo -u postgres psql postgres -tAc "SELECT 1" 2>"$_tierB_err" | tr -d '[:space:]' || true)
+      _tierB_rc=$?
+      if [ "$_trow" = "1" ]; then
+        _mode="sudo"
+      elif [ -t 0 ]; then
+        # Stdin is a tty → sudo might need interactive password. Re-try without silencing stderr so user sees prompt.
+        local _yes
+        _yes=$(prompt_def "sudo probe first pass failed; retry sudo WITH tty password prompt (needed if your sudoers lacks NOPASSWD entry)? [Y/n]" "Y")
+        case "$_yes" in y|Y|yes|YES|Yes|1)
+          printf "  Running: sudo -u postgres psql postgres -tAc 'SELECT 1' — enter sudo password if asked.\n" >&2
+          _trow=$(sudo -u postgres psql postgres -tAc "SELECT 1" 2> "$_tierB_err" | tr -d '[:space:]' || true)
+          _tierB_rc=$?
+          if [ "$_trow" = "1" ]; then _mode="sudo"; fi
+        ;; esac
+      fi
+    else
+      printf 'sudo command missing OR postgres OS user DNE (id -u postgres failed)\n' >> "$_tierB_err"
     fi
   fi
 
   # ── TIER C: explicit DB_SUPERUSER sentinel fields (user can paste superuser credentials here) ──
   local _su_user="${DB_SUPERUSER_USER:-postgres}" _su_pw="${DB_SUPERUSER_PASSWORD:-}"
-  if [ -z "$_mode" ] && command -v psql >/dev/null 2>&1; then
-    # If sentinel not set yet → prompt_def to let user paste them now (optional: hitting Enter skips).
-    if [ -z "${_su_pw}" ]; then
-      local _offered_su
-      _offered_su=$(prompt_def "No local peer/sudo superuser access found. Connect as DB superuser VIA TCP to ${DB_HOST}:${DB_PORT} to create role+DB remotely? Enter superuser username [postgres or hit Enter=SKIP]" "${_su_user}")
-      if [ -n "${_offered_su}" ] && [ "${_offered_su}" != "SKIP" ] && [ "${_offered_su}" != "skip" ]; then
-        _su_user="${_offered_su}"
-        _su_pw=$(prompt_secret "Superuser password for ${_su_user} @ ${DB_HOST}:${DB_PORT}/postgres (no echo, empty=skip tier C)" "")
-        if [ -n "${_su_pw}" ]; then
-          export DB_SUPERUSER_USER="${_su_user}" DB_SUPERUSER_PASSWORD="${_su_pw}"
-          _trow=$(PGPASSWORD="$_su_pw" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_su_user}" -d postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
-          if [ "$_trow" = "1" ]; then _mode="superuser|tcp"; fi
+  _tierC_cmd="(not attempted)"
+  if [ -z "$_mode" ]; then
+    if command -v psql >/dev/null 2>&1; then
+      # If sentinel not set yet → prompt_def to let user paste them now (optional: hitting Enter skips).
+      if [ -z "${_su_pw}" ]; then
+        local _offered_su
+        _offered_su=$(prompt_def "No local peer/sudo superuser access found. Connect as DB superuser VIA TCP to ${DB_HOST}:${DB_PORT} to create role+DB remotely? Enter superuser username [postgres or hit Enter=SKIP]" "${_su_user}")
+        if [ -z "${_offered_su}" ] || [ "${_offered_su}" = "SKIP" ] || [ "${_offered_su}" = "skip" ]; then
+          _tierC_skipped=1
+          printf 'USER-SKIPPED: user hit Enter=SKIP on superuser username prompt (no remote TCP create requested)\n' >> "$_tierC_err"
+        else
+          _su_user="${_offered_su}"
+          _su_pw=$(prompt_secret "Superuser password for ${_su_user} @ ${DB_HOST}:${DB_PORT}/postgres (no echo, empty=skip tier C)" "")
+          if [ -z "${_su_pw}" ]; then
+            _tierC_skipped=1
+            printf 'USER-SKIPPED: user left superuser password empty (no remote TCP create requested)\n' >> "$_tierC_err"
+          else
+            export DB_SUPERUSER_USER="${_su_user}" DB_SUPERUSER_PASSWORD="${_su_pw}"
+            _tierC_cmd="PGPASSWORD=<redacted> psql -h '${DB_HOST}' -p '${DB_PORT}' -U '${_su_user}' -d postgres -tAc 'SELECT 1'"
+            _trow=$(PGPASSWORD="$_su_pw" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_su_user}" -d postgres -tAc "SELECT 1" 2>"$_tierC_err" | tr -d '[:space:]' || true)
+            _tierC_rc=$?
+            if [ "$_trow" = "1" ]; then _mode="superuser|tcp"; fi
+          fi
         fi
+      else
+        # Sentinel values already in env/ENV_FILE → quick probe silently.
+        _tierC_cmd="PGPASSWORD=<redacted> psql -h '${DB_HOST}' -p '${DB_PORT}' -U '${_su_user}' -d postgres -tAc 'SELECT 1'"
+        _trow=$(PGPASSWORD="$_su_pw" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_su_user}" -d postgres -tAc "SELECT 1" 2>"$_tierC_err" | tr -d '[:space:]' || true)
+        _tierC_rc=$?
+        if [ "$_trow" = "1" ]; then _mode="superuser|tcp"; fi
       fi
     else
-      # Sentinel values already in env/ENV_FILE → quick probe silently.
-      _trow=$(PGPASSWORD="$_su_pw" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_su_user}" -d postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
-      if [ "$_trow" = "1" ]; then _mode="superuser|tcp"; fi
+      printf 'psql command NOT FOUND on PATH (install postgresql-client)\n' >> "$_tierC_err"
     fi
   fi
 
   if [ -z "$_mode" ]; then
-    _info "AUTO-FIX NOT AVAILABLE: ALL 3 superuser probes failed (peer unix socket DNE or peer-auth denied, sudo -u postgres not reachable, and no DB_SUPERUSER_PASSWORD sentinel value given for remote superuser TCP create). Use the manual SQL command provided above then retry, OR pick Option 3 from main menu first. You can also set sentinel fields in prompt_edit_multiple: DB_SUPERUSER_USER=postgres DB_SUPERUSER_PASSWORD=<pw> for remote-TCP create."
+    # ── ALL 3 probes failed or user skipped tier C — print FULL DIAGNOSTIC breakdown per tier so user knows EXACTLY what broke.
+    local _failed_tiers=0 _sep="  \033[95m[TIER]\033[0m "
+    printf "\n" >&2
+    printf "${_sep}A (peer unix socket): cmd = %s | rc = %d | last 6 err lines:\n" "$_tierA_cmd" "$_tierA_rc" >&2
+    if [ -s "$_tierA_err" ]; then tail -n 6 "$_tierA_err" | sed 's/^/      /' >&2; fi
+    [ "$_tierA_cmd" != "(not attempted)" ] && _failed_tiers=$((_failed_tiers+1))
+    printf "${_sep}B (sudo -u postgres): cmd = %s | rc = %d | last 6 err lines:\n" "$_tierB_cmd" "$_tierB_rc" >&2
+    if [ -s "$_tierB_err" ]; then tail -n 6 "$_tierB_err" | sed 's/^/      /' >&2; fi
+    [ "$_tierB_cmd" != "(not attempted)" ] && _failed_tiers=$((_failed_tiers+1))
+    # Tier C only marked as FAIL if user actually attempted probe (not skip).
+    if [ "$_tierC_skipped" -eq 1 ]; then
+      printf "${_sep}C (superuser TCP): user SKIPPED (no remote superuser credentials provided).\n" >&2
+    else
+      printf "${_sep}C (superuser TCP): cmd = %s | rc = %d | last 6 err lines:\n" "$_tierC_cmd" "$_tierC_rc" >&2
+      if [ -s "$_tierC_err" ]; then tail -n 6 "$_tierC_err" | sed 's/^/      /' >&2; fi
+      [ "$_tierC_cmd" != "(not attempted)" ] && _failed_tiers=$((_failed_tiers+1))
+    fi
+    if [ "$_tierC_skipped" -eq 1 ]; then
+      _info "AUTO-FIX PARTIALLY UNAVAILABLE: $_failed_tiers local probe(s) FAILED + user SKIPPED remote Tier C superuser create. Diagnostic per-tier breakdown just printed above this line. Use manual SQL commands above OR pick Option 3 from main menu OR populate DB_SUPERUSER_USER/DB_SUPERUSER_PASSWORD in prompt_edit_multiple menu below and retry (then Tier C probe retries too)."
+    else
+      _info "AUTO-FIX NOT AVAILABLE: $_failed_tiers superuser probe(s) FAILED. Diagnostic per-tier breakdown just printed above this line. Most common fix if DB is local to this machine: make postgres OS role accept peer-auth from OS root user — run: sudo -u postgres psql postgres -c \"CREATE ROLE root SUPERUSER LOGIN;\" — OR simpler: pick Option 3 from main menu which always uses sudo -u postgres psql directly (with password prompt if needed) and will create role + DB there. If DB is remote server, populate sentinels DB_SUPERUSER_USER=postgres DB_SUPERUSER_PASSWORD=<pw> and retry."
+    fi
+    rm -f "$_tierA_err" "$_tierB_err" "$_tierC_err"
     return 1
   fi
+  rm -f "$_tierA_err" "$_tierB_err" "$_tierC_err"
   local _needs_role=0 _needs_db=0
   case "$_cause_lc" in
     *database*does*not*exist*)   _needs_db=1 ;;
