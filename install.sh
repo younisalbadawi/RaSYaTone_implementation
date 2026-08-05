@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-05T2359-dynamic-transitive-dep-resolution-nounset-hardening"
+SCRIPT_VERSION_BUILD="2026-08-06T0000-dynamic-auth-app-deps-fi-balanced-bash-n"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -3750,15 +3750,10 @@ DIAGNOSTIC CONTEXT:
           done
           rm -f "$aum_fresh"
           if [ "$aum_ok" -eq 1 ]; then
-            _ok "manage.py migrate ${aum_app} SUCCESS (AUTH_USER_MODEL custom user table ${aum_db_table} now exists). Proceeding to full migrate (admin.0001 FK will resolve cleanly)."
+            _ok "manage.py migrate ${aum_app} SUCCESS (AUTH_USER_MODEL custom user table ${aum_db_table} now exists via fallback retry banner). Proceeding to full migrate."
           fi
-        else
-          _ok "manage.py migrate ${aum_app} (custom user app) SUCCESS after auto-makemigrations retry. Proceeding to full migrate."
         fi
-      else
-        _ok "AUTH_USER_MODEL precheck ok: migrate ${aum_app} (custom user app) applied cleanly; table ${aum_db_table} now exists — admin.0001 FK will resolve."
       fi
-    fi
     # ── Pre-migrate SAFETY-2: Parse showmigrations output for partially-applied contenttypes-only state (user's exact DB state:
     #    contenttypes.0001 = [X] applied, every other app = [ ] NOT applied). This is ALWAYS the result of a prior migrate
     #    run that crashed right after contenttypes.0001_initial but before anything else (the exact user's crash scenario on
