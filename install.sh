@@ -433,9 +433,9 @@ _validate_and_bootstrap_py_venv_pip() {
   if ! "$pybin" -m venv --help >/dev/null 2>&1; then
     _warn "${label_short} -m venv module MISSING after install — trying distro-default python3-venv meta-package (it ships ensurepip wheels shared across all python versions)"
     case "$PM" in
-      apt) _sudo_pkg_install python3-venv >/dev/null 2>&1 || true ;;
-      dnf) _sudo_pkg_install python3-virtualenv platform-python-devel >/dev/null 2>&1 || true ;;
-      apk) _sudo_pkg_install py3-virtualenv python3-dev >/dev/null 2>&1 || true ;;
+      apt) _run_with_spinner "${label_short}: restore venv module (install distro-default python3-venv meta)" _sudo_pkg_install python3-venv || true ;;
+      dnf) _run_with_spinner "${label_short}: restore venv module (dnf: python3-virtualenv + platform-python-devel)" _sudo_pkg_install python3-virtualenv platform-python-devel || true ;;
+      apk) _run_with_spinner "${label_short}: restore venv module (apk: py3-virtualenv + python3-dev)" _sudo_pkg_install py3-virtualenv python3-dev || true ;;
     esac
     if ! "$pybin" -m venv --help >/dev/null 2>&1; then
       _nok "${label_short} -m venv STILL MISSING after meta-package install — venv creation will likely fail later; install python<version>-venv manually and rerun"
@@ -446,12 +446,12 @@ _validate_and_bootstrap_py_venv_pip() {
   fi
   if ! "$pybin" -m pip --version >/dev/null 2>&1; then
     _warn "${label_short} -m pip MISSING (no separate ${label_short}-pip package shipped by repo) — bootstrapping via ${label_short} -m ensurepip --upgrade (bundled in CPython stdlib, 100% reliable)"
-    if ! _run_with_spinner "Bootstrap pip via ${label_short} -m ensurepip --upgrade" "$pybin" -m ensurepip --upgrade >/dev/null 2>&1; then
+    if ! _run_with_spinner "Bootstrap pip via ${label_short} -m ensurepip --upgrade" "$pybin" -m ensurepip --upgrade; then
       # 2nd tier: download get-pip.py as a last resort
       _warn "ensurepip failed — fallback: curl get-pip.py -> ${label_short} installer"
       curl -fsSL --max-time 30 https://bootstrap.pypa.io/get-pip.py -o /tmp/rasyatone_get_pip.py 2>/dev/null || true
       if [ -s /tmp/rasyatone_get_pip.py ]; then
-        _run_with_spinner "Bootstrap pip via get-pip.py (${label_short})" "$pybin" /tmp/rasyatone_get_pip.py --quiet >/dev/null 2>&1 || true
+        _run_with_spinner "Bootstrap pip via get-pip.py (${label_short})" "$pybin" /tmp/rasyatone_get_pip.py --quiet || true
       fi
       rm -f /tmp/rasyatone_get_pip.py 2>/dev/null || true
     fi
@@ -549,10 +549,16 @@ _install_compatible_python_runtime() {
   # ---------------------------------------------------------------
   # If we just installed pydot_11/pydot_10/pydot_12 via the PM-specific branches
   # above, validate and run ensurepip bootstrap on them FIRST (highest priority).
+  # NOTE: do NOT redirect output to /dev/null — this section runs slow spinner
+  # operations (ensurepip bootstrap, get-pip.py download, apt install venv meta)
+  # that MUST be visible to the user (they are exactly the activity indicator
+  # the user expects; hiding them reproduces the "blinking cursor / shows nothing"
+  # bug reported repeatedly in prior runs). Caller sets || true anyway so RC≠0
+  # never aborts anything in set -e mode.
   local pv
   for pv in "$pydot_12" "$pydot_11" "$pydot_10"; do
     if [ -n "${pv:-}" ] && command -v "$pv" >/dev/null 2>&1; then
-      _validate_and_bootstrap_py_venv_pip "$pv" >/dev/null 2>&1 || true
+      _validate_and_bootstrap_py_venv_pip "$pv" || true
       validated_any=1
     fi
   done
@@ -560,7 +566,7 @@ _install_compatible_python_runtime() {
   # one), fall back to whatever _detect_compatible_python3 finds and validate it.
   if [ "$validated_any" -eq 0 ]; then
     if _detect_compatible_python3 2>/dev/null && [ -n "${PYTHON_BIN:-}" ] && command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-      _validate_and_bootstrap_py_venv_pip "$PYTHON_BIN" >/dev/null 2>&1 || true
+      _validate_and_bootstrap_py_venv_pip "$PYTHON_BIN" || true
     fi
   fi
   # Final post-install check: is there now a compatible python?
