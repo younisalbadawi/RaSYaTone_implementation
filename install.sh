@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-05T2300-fix-multiline-awk-parse-error-auth-app-undefinedtable"
+SCRIPT_VERSION_BUILD="2026-08-05T2359-dynamic-transitive-dep-resolution-nounset-hardening"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -336,9 +336,17 @@ prompt_edit_multiple() {
   local i=0
   for field in "${fields_arr[@]}"; do
     i=$(( i + 1 ))
-    # Indirect expansion: get current value of variable whose NAME is $field
-    # shellcheck disable=SC2004,SC2086
-    eval current=\"\$$field\" || current=""
+    # Indirect expansion: get current value of variable whose NAME is $field.
+    # Protect against set -u (nounset): expand through ${!field:-} then direct; wrap in set +u block for eval.
+    current=${!field:-}
+    if [ -z "${current:+set}" ]; then
+      # field might not be exported as bash var but exist in ENV_FILE; try indirect expansion via eval with nounset temporarily off
+      local _pu_restore=1
+      case "$-" in *u*) ;; *) _pu_restore=0;; esac
+      [ "$_pu_restore" -eq 1 ] && set +u
+      eval current=\"\${${field}:-}\" 2>/dev/null || current=""
+      [ "$_pu_restore" -eq 1 ] && set -u
+    fi
     # Passwords are hidden, show ******** unless empty
     if [[ "$field" == *PASS* ]] || [[ "$field" == *TOKEN* ]] || [[ "$field" == *SECRET* ]]; then
       if [ -z "$current" ]; then current="(EMPTY — TYPICALLY REQUIRED!)"; else current="******** (length=${#current})"; fi
@@ -358,8 +366,15 @@ prompt_edit_multiple() {
       edited_any=1
       for field in "${fields_arr[@]}"; do
         local default_for=""
-        # shellcheck disable=SC2086
-        eval default_for=\"\$$field\" || default_for=""
+        # set -u nounset protection for indirect expansion (read).
+        default_for=${!field:-}
+        if [ -z "${default_for:+set}" ]; then
+          local _pu1=1
+          case "$-" in *u*) ;; *) _pu1=0;; esac
+          [ "$_pu1" -eq 1 ] && set +u
+          eval default_for=\"\${${field}:-}\" 2>/dev/null || default_for=""
+          [ "$_pu1" -eq 1 ] && set -u
+        fi
         local is_pass=""
         [[ "$field" == *PASS* ]] || [[ "$field" == *TOKEN* ]] || [[ "$field" == *SECRET* ]] && is_pass="secret"
         local new_val=""
@@ -369,8 +384,22 @@ prompt_edit_multiple() {
           new_val=$(prompt_def "$field" "$default_for")
         fi
         # Write back: assign to the VARIABLE whose name is $field (indirect).
-        # shellcheck disable=SC2086
-        eval $field=\"\$new_val\"
+        # set -u nounset safe direct assignment via printf -v (if bash >= 4.2, universal fallback: eval with set +u).
+        if printf -v "$field" '%s' "$new_val" 2>/dev/null; then
+          :
+        else
+          local _pu2=1
+          case "$-" in *u*) ;; *) _pu2=0;; esac
+          [ "$_pu2" -eq 1 ] && set +u
+          eval $field=\"\$new_val\" 2>/dev/null || true
+          [ "$_pu2" -eq 1 ] && set -u
+        fi
+        # ALWAYS write to ENV_FILE so subsequent set -a; . "$ENV_FILE"; set +a syncs the new value for subshells.
+        if [ -n "${ENV_FILE:-}" ]; then
+          grep -v "^${field}=" "$ENV_FILE" > "$ENV_FILE.tmp.$$" 2>/dev/null || true
+          printf "%s=%s\n" "$field" "$new_val" >> "$ENV_FILE.tmp.$$" 2>/dev/null
+          mv "$ENV_FILE.tmp.$$" "$ENV_FILE" 2>/dev/null || true
+        fi
       done
       ;;
     *)
@@ -379,7 +408,14 @@ prompt_edit_multiple() {
         edited_any=1
         field="${fields_arr[$((choice-1))]}"
         local default_for=""
-        eval default_for=\"\$$field\" || default_for=""
+        default_for=${!field:-}
+        if [ -z "${default_for:+set}" ]; then
+          local _pu3=1
+          case "$-" in *u*) ;; *) _pu3=0;; esac
+          [ "$_pu3" -eq 1 ] && set +u
+          eval default_for=\"\${${field}:-}\" 2>/dev/null || default_for=""
+          [ "$_pu3" -eq 1 ] && set -u
+        fi
         local is_pass=""
         [[ "$field" == *PASS* ]] || [[ "$field" == *TOKEN* ]] || [[ "$field" == *SECRET* ]] && is_pass="secret"
         local new_val=""
@@ -388,7 +424,20 @@ prompt_edit_multiple() {
         else
           new_val=$(prompt_def "$field" "$default_for")
         fi
-        eval $field=\"\$new_val\"
+        if printf -v "$field" '%s' "$new_val" 2>/dev/null; then
+          :
+        else
+          local _pu4=1
+          case "$-" in *u*) ;; *) _pu4=0;; esac
+          [ "$_pu4" -eq 1 ] && set +u
+          eval $field=\"\$new_val\" 2>/dev/null || true
+          [ "$_pu4" -eq 1 ] && set -u
+        fi
+        if [ -n "${ENV_FILE:-}" ]; then
+          grep -v "^${field}=" "$ENV_FILE" > "$ENV_FILE.tmp.$$" 2>/dev/null || true
+          printf "%s=%s\n" "$field" "$new_val" >> "$ENV_FILE.tmp.$$" 2>/dev/null
+          mv "$ENV_FILE.tmp.$$" "$ENV_FILE" 2>/dev/null || true
+        fi
       else
         _warn "Unrecognized choice '$choice' (expected A/S/Q/1..$i). Treating as S=SKIP."
       fi
@@ -3391,77 +3440,312 @@ PY
       aum_db_table=${aum_raw#*DB_TABLE=}
     fi
     if [ -n "${aum_app}" ] && [ "${aum_app}" != "auth" ]; then
-      _section "AUTH_USER_MODEL PRECHECK: custom user = '${aum_app}.${aum_model}' → table ${aum_db_table}. Running 'migrate ${aum_app}' SINGLE-APP FIRST BEFORE full migrate (prevents admin.0001 FK UndefinedTable)."
-      local aum_rc=0
-      local aum_cmd="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${aum_app}'"
-      _run_with_spinner "manage.py migrate ${aum_app} (custom user app FIRST, BEFORE full migrate — so ${aum_db_table} table exists for admin FK)" \
-        bash -c "$aum_cmd" || aum_rc=$?
-      if [ "$aum_rc" -ne 0 ]; then
-        # Single-app migrate failed (most likely: migration files for ${aum_app} DO NOT EXIST in repo / migrations/__init__.py missing).
-        # Immediately try the automatic makemigrations SPECIFICALLY for ${aum_app}, then retry the single migrate once.
-        _warn "First migrate ${aum_app} FAILED (rc=$aum_rc). Likely cause: ${aum_app}/migrations/0001_initial.py missing from repo (not committed / not yet generated). Auto-running: makemigrations ${aum_app} then retry migrate ${aum_app} once."
-        local mmk_aum_rc=0
-        _run_with_spinner "manage.py makemigrations ${aum_app} (generate missing 0001_initial.py for custom user app)" \
-          bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}'" || mmk_aum_rc=$?
-        if [ "$mmk_aum_rc" -eq 0 ]; then
-          _ok "makemigrations ${aum_app} SUCCESS — migration files written. Retrying migrate ${aum_app} once."
-          aum_rc=0
-          _run_with_spinner "manage.py migrate ${aum_app} (RETRY after auto-makemigrations)" bash -c "$aum_cmd" || aum_rc=$?
+      # ── ── ── DYNAMIC SAFETY-1: AUTH_USER_MODEL single-app migration with AUTOMATIC TRANSITIVE DEPENDENCY RESOLUTION ── ── ──
+      # TWO-STAGE strategy (because user's real-world repo has auth_app.User with ForeignKey('companies.Company') → auth_app
+      # 0001 dependency on companies.0001 → naive single migrate auth_app alone FAILS with relation "companies_company" DNE):
+      #   STAGE 1 (PROACTIVE, NO ERRORS REQUIRED): Introspect Django MigrationLoader.graph for the user app's initial 0001
+      #      migration file dependencies list → extract any app_label != self.app_label != django.contrib.* → these are the
+      #      transitive INSTALLED_APPS we MUST run BEFORE aum_app. Run migrate <dep> one at a time (with auto-makemigrations
+      #      fallback if their migration files missing) in dependency order.
+      #   STAGE 2 (REACTIVE, ERROR-DRIVEN): Even STAGE 1 misses some (e.g. model FK through through table not reflected in
+      #      Migration.dependencies). Iteratively: try running migrate <current_target>. If FAILS with ProgrammingError relation
+      #      X does not exist:
+      #        → parse relation X → guess app_label B (same parser as main migrate banner).
+      #        → if B NOT already applied AND B NOT already in next-queue → PREPEND to migration queue (so B runs NEXT attempt).
+      #        → cap max 8 iterations → avoid infinite loops (circular FK impossible with Django tables but defensive for user code).
+      # If STAGE 1 + STAGE 2 still fail → fall back to 3-attempt retry banner with prompt_edit_multiple as before.
+      _section "AUTH_USER_MODEL PRECHECK: custom user = '${aum_app}.${aum_model}' → table ${aum_db_table}. Resolving TRANSITIVE dependencies dynamically (STAGE 1: graph introspection; STAGE 2: UndefinedTable-driven iteration)."
+      local _dyn_base_env="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'"
+      local _dyn_dep_apps=""   # space-separated ordered list: STAGE 1 + STAGE 2 discovered dependencies, in required order (dep first).
+      local _dyn_applied=""    # space-separated list: apps that SUCCESSFULLY applied (skip on retry).
+      local _dyn_max_iter=8 _dyn_iter=0 _dyn_rc=0 _dyn_tb="" _dyn_rel="" _dyn_guess=""
+      local _dyn_queue="${aum_app}"   # queue: next app to try. Starts with aum_app; dependencies are PREPENDED as discovered.
+      local _dyn_done=0
+      # ── STAGE 1: proactive graph introspection BEFORE any migrate attempt.
+      local _stage1_deps=""
+      _stage1_deps=$( TARGET_AUM_APP="${aum_app}" PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>/dev/null || true
+import os, sys, json
+try:
+    import django; django.setup()
+    from django.conf import settings
+    from django.db import connections
+    from django.db.migrations.loader import MigrationLoader
+    # Introspect migration loader WITHOUT DB access (ignore migration records — we want the filesystem migration graph).
+    from django.db.migrations.loader import MIGRATIONS_MODULE_NAME
+    from django.apps import apps
+    from django.db.migrations.recorder import MigrationRecorder
+    target_app_label = os.environ.get("TARGET_AUM_APP", "")
+    # Build loader with connection (we won't write to DB; loader reads both DB + filesystem).
+    loader = MigrationLoader(connections["default"], ignore_no_migrations=False)
+    # Collect: for every migration key (app, name) that STARTS with target_app_label, walk its .dependencies, filter to only
+    # those dependencies whose dep[0] != target_app_label and dep[0] not in built-in django.contrib.* apps.
+    # Then walk those dependencies recursively, depth-first.
+    builtins = {"admin","auth","authtoken","contenttypes","sessions","messages","staticfiles","sites","flatpages","redirects","django_celery_beat","django_celery_results","guardian"}
+    seen = set()
+    order = []
+    def walk_deps_of(app_label, depth=0):
+        if depth > 12:
+            return
+        for key, mig in loader.disk_migrations.items():
+            if key[0] != app_label:
+                continue
+            for dep in getattr(mig, "dependencies", []) or []:
+                dep_app = dep[0]
+                if dep_app in builtins or dep_app == app_label or dep_app in seen:
+                    continue
+                # Skip django.contrib.* style apps that ship with migrations but are handled by full migrate later.
+                if dep_app in seen:
+                    continue
+                seen.add(dep_app)
+                order.append(dep_app)
+                walk_deps_of(dep_app, depth+1)
+    walk_deps_of(target_app_label)
+    # Also: walk ForeignKey targets of the User model's own 0001 CreateModel. If CreateModel operation has FK field with
+    # to="app_label.ModelName" not in builtins → add dep_app if not already.
+    try:
+        from django.db.migrations.state import ModelState
+        from django.db.migrations import operations
+        for key, mig in loader.disk_migrations.items():
+            if key[0] != target_app_label:
+                continue
+            for op in getattr(mig, "operations", []) or []:
+                if hasattr(op, "fields"):  # CreateModel
+                    for _fname, _field in op.fields or []:
+                        to_val = None
+                        if hasattr(_field, "remote_field") and _field.remote_field and hasattr(_field.remote_field, "model"):
+                            to_val = _field.remote_field.model
+                        elif hasattr(_field, "to"):
+                            to_val = getattr(_field, "to", None)
+                        if not to_val:
+                            continue
+                        to_s = str(to_val)
+                        if "." in to_s:
+                            fk_app, _ = to_s.split(".", 1)
+                        else:
+                            # FK to self or same app.
+                            continue
+                        if fk_app not in builtins and fk_app != target_app_label and fk_app not in seen:
+                            seen.add(fk_app)
+                            order.insert(0, fk_app)
+                            walk_deps_of(fk_app, 1)
+    except Exception:
+        pass
+    print(" ".join(order))
+    sys.exit(0)
+except Exception as _e:
+    # Graph introspection can fail for a myriad reasons (0001 not generated yet, we fail silently and STAGE 2 will catch deps via errors).
+    sys.exit(0)
+PY
+)
+      if [ -n "${_stage1_deps}" ]; then
+        _info "STAGE 1 graph introspection: ${aum_app} 0001 transitive dependencies (non-builtin) = [${_stage1_deps}]. Will run these BEFORE ${aum_app}."
+        # Prepend dependencies in order to queue. STAGE 1 output is in dependency order (dep first) → queue = [deps order] + aum_app.
+        _dyn_queue="${_stage1_deps} ${aum_app}"
+      else
+        _info "STAGE 1 graph introspection: no transitive deps discoverable (0001 missing? falling back to STAGE 2 UndefinedTable-driven discovery)."
+      fi
+      # ── STAGE 2: iterative UndefinedTable-driven topological single-app migrate loop.
+      while [ "$_dyn_done" -ne 1 ] && [ "$_dyn_iter" -lt "$_dyn_max_iter" ]; do
+        _dyn_iter=$(( _dyn_iter + 1 ))
+        # Take FIRST app from queue (preserve order so dependencies run first).
+        local _dyn_next="" _dyn_rest=""
+        for _dyn_next in $_dyn_queue; do break; done
+        _dyn_rest=${_dyn_queue#"${_dyn_next}"}; _dyn_rest=${_dyn_rest# }; _dyn_rest=${_dyn_rest% }
+        if [ -z "${_dyn_next}" ]; then _dyn_done=1; break; fi
+        # If already applied → skip (don't re-apply already applied single-app).
+        local _skip=0
+        local _a
+        for _a in $_dyn_applied; do [ "$_a" = "$_dyn_next" ] && _skip=1; done
+        if [ "$_skip" -eq 1 ]; then
+          _dyn_queue="${_dyn_rest}"
+          continue
         fi
-        if [ "$aum_rc" -ne 0 ]; then
-          # Still failing → full 3-attempt retry loop with evidence banner + prompt_edit_multiple.
-          local aum_att=0 aum_max=3 aum_ok=0 aum_frc=0
-          local aum_fresh="/tmp/rasyatone_aum_fresh_$$.tmp"
-          while [ "$aum_att" -lt "$aum_max" ] && [ "$aum_ok" -ne 1 ]; do
-            aum_att=$(( aum_att + 1 ))
-            aum_frc=0
-            _run_with_spinner "manage.py migrate ${aum_app} (attempt $aum_att/$aum_max — custom user app)" bash -c "$aum_cmd" || aum_frc=$?
-            if [ "$aum_frc" -eq 0 ]; then aum_ok=1; break; fi
-            # Full banner: exactly like migrate banner but specific to AUTH_USER_MODEL app.
-            local aum_tb=""
-            aum_tb=$( bash -c "$aum_cmd" 2>&1 | tail -n 80 || true )
-            printf '%s\n' "$aum_tb" > "$aum_fresh" 2>/dev/null || true
-            local aum_sho=""
-            aum_sho=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py showmigrations '${aum_app}'" 2>&1 | tail -n 40 || true )
-            printf "\n\033[1;31m=== migrate ${aum_app} (AUTH_USER_MODEL app) FAILED attempt $aum_att/$aum_max (rc=$aum_frc) — EVIDENCE ===\033[0m\n" >&2
-            printf "  \033[1;33m[EXACT CMD:]  \033[0m%s\n" "$aum_cmd" >&2
-            printf "  \033[1;33m[FRESH DIRECT TRACEBACK:]\033[0m\n" >&2
-            printf '%s\n' "$aum_tb" | sed 's#^#    #' >&2
-            printf "  \033[1;33m[showmigrations ${aum_app}:]\033[0m\n" >&2
-            printf '%s\n' "$aum_sho" | sed 's#^#    #' >&2
-            if [ "$aum_att" -lt "$aum_max" ]; then
-              prompt_edit_multiple \
-                "migrate ${aum_app} FAILED attempt $aum_att/$aum_max — edit fields then retry (the sentinel MAKEMIGRATIONS_APP=y will auto-run makemigrations ${aum_app} pre-retry):" \
-                "DJANGO_SETTINGS_MODULE MAKEMIGRATIONS_APP DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
-                "Retry migrate ${aum_app} with edited values?" \
-                "y"
-              set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
-              export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
-              local mmk_yn=${MAKEMIGRATIONS_APP:-y}
-              if [ "${mmk_yn}" = "y" ] || [ "${mmk_yn}" = "Y" ]; then
-                _run_with_spinner "(pre-retry) manage.py makemigrations --noinput ${aum_app}" bash -c \
-                  "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}'" || true
+        # If migration files MISSING for next app → auto-makemigrations for it once (same pattern as before).
+        local _mmk_fallback_rc=0
+        {
+          local _has_mk=0
+          if PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py showmigrations "$_dyn_next" >/dev/null 2>&1 ; then
+            local _sm_head
+            _sm_head=$( cd "$APP_DIR" && PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py showmigrations "$_dyn_next" 2>&1 | head -n 3 || true )
+            if printf '%s\n' "$_sm_head" | grep -q '\[ \] 0001\|0001_initial\|App .* does not have migrations'; then _has_mk=1; fi
+          fi
+          if [ "$_has_mk" -ne 1 ]; then
+            _info "App '${_dyn_next}' has NO migration files yet (${aum_app} dependency chain). Auto-running: makemigrations ${_dyn_next}."
+            _run_with_spinner "manage.py makemigrations ${_dyn_next} (auto — required by AUTH_USER_MODEL dependency chain)" bash -c \
+              "${_dyn_base_env} manage.py makemigrations --noinput '${_dyn_next}'" || _mmk_fallback_rc=$?
+          fi
+        } 2>/dev/null || true
+        local _dyn_next_cmd="${_dyn_base_env} manage.py migrate '${_dyn_next}'"
+        _dyn_rc=0
+        _run_with_spinner "(auth-user dep chain iteration $_dyn_iter/$_dyn_max_iter) manage.py migrate ${_dyn_next} (app in dependency order)" bash -c "$_dyn_next_cmd" || _dyn_rc=$?
+        if [ "$_dyn_rc" -eq 0 ]; then
+          _ok "migrate ${_dyn_next} OK (iteration $_dyn_iter). Added to applied set."
+          _dyn_applied="${_dyn_applied} ${_dyn_next}"; _dyn_applied=${_dyn_applied# }; _dyn_applied=${_dyn_applied% }
+          _dyn_queue="${_dyn_rest}"
+          [ -z "${_dyn_queue}" ] && _dyn_done=1
+          continue
+        fi
+        # FAILURE: check whether it's ProgrammingError UndefinedTable — if yes, resolve dependency dynamically.
+        _dyn_tb=$( bash -c "$_dyn_next_cmd" 2>&1 | tail -n 80 || true )
+        _dyn_rel=$( printf '%s\n' "$_dyn_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
+        if [ -z "${_dyn_rel}" ]; then
+          # Not a dependency error — break out of STAGE 2 into 3-attempt retry banner with prompt_edit_multiple.
+          _warn "migrate ${_dyn_next} FAILED (rc=$_dyn_rc) BUT error is NOT UndefinedTable — leaving STAGE 2 and entering full 3-attempt retry loop for ${aum_app} with evidence banner."
+          break
+        fi
+        # UndefinedTable hit! Guess app_label from relation name (same as main migrate banner).
+        _dyn_guess=$(printf '%s' "$_dyn_rel" | awk -F'_' '{if(NF>2)print $1"_"$2"/"$1; else if(NF==2)print $1; else print $0}' 2>/dev/null || true)
+        local _dep_candidate=""
+        # Try guesses in order: multi-segment first, then single segment.
+        case "$_dyn_guess" in
+          */*) _dep_candidate="${_dyn_guess%%/*}" ;;
+          *  ) _dep_candidate="${_dyn_guess}" ;;
+        esac
+        local _fallback_dep=""
+        # If the guesses don't seem to exist, also try: first segment only.
+        if [ -z "${_fallback_dep}" ]; then _fallback_dep=$(printf '%s' "$_dyn_rel" | awk -F'_' '{print $1}' 2>/dev/null || true); fi
+        local _picked_dep=""
+        local _cand
+        for _cand in "$_dep_candidate" "$_fallback_dep"; do
+          [ -z "$_cand" ] && continue
+          # Quick check: does INSTALLED_APPS know an app with this label? (python probe, tolerant of failure).
+          local _found=0
+          if PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" -c "import django,sys; django.setup(); from django.apps import apps; sys.exit(0 if apps.is_installed(sys.argv[1]) else 1)" "$_cand" 2>/dev/null; then
+            _found=1
+          fi
+          if [ "$_found" -eq 1 ]; then _picked_dep="$_cand"; break; fi
+        done
+        if [ -z "${_picked_dep}" ]; then
+          _warn "STAGE 2: UndefinedTable relation '${_dyn_rel}' → guess '${_dyn_guess}' not installed in INSTALLED_APPS. Can't resolve dependency dynamically → falling to 3-attempt retry banner."
+          break
+        fi
+        # Sanity: dependency must NOT be the same app that just failed (would loop forever).
+        if [ "${_picked_dep}" = "${_dyn_next}" ]; then
+          _warn "STAGE 2: UndefinedTable within SAME app '${_picked_dep}' (self-referential FK). This is NOT a transitive dep bug; it's a migration file integrity error inside app. Falling out."
+          break
+        fi
+        # Prevent duplicates in queue:
+        local _dup=0
+        for _a in $_dyn_queue; do [ "$_a" = "${_picked_dep}" ] && _dup=1; done
+        for _a in $_dyn_applied; do [ "$_a" = "${_picked_dep}" ] && _dup=2; done
+        if [ "$_dup" -ge 2 ]; then
+          _warn "STAGE 2: dep '${_picked_dep}' ALREADY applied successfully (not in DB state! likely a second FK referencing different table in same app OR existing migration dependencies don't match DB. Falling out to retry banner.)"
+          break
+        fi
+        if [ "$_dup" -eq 1 ]; then
+          _info "STAGE 2: dep '${_picked_dep}' already in queue (will run in order)."
+          # It's already in queue somewhere; to guarantee it runs NEXT (because ${_dyn_next} depends on it RIGHT NOW), remove it
+          # from wherever it is and PREPEND.
+          local _new_q="" _w
+          for _w in $_dyn_queue; do
+            [ "$_w" = "${_picked_dep}" ] && continue
+            [ "$_w" = "${_dyn_next}" ] && continue
+            _new_q="${_new_q} ${_w}"
+          done
+          _new_q="${_new_q# }"
+          _dyn_queue="${_picked_dep} ${_dyn_next} ${_new_q}"; _dyn_queue=${_dyn_queue% }
+        else
+          # Fresh dependency → PREPEND to queue so it runs NEXT iteration, then retry ${_dyn_next} after.
+          _dyn_queue="${_picked_dep} ${_dyn_next} ${_dyn_rest}"; _dyn_queue=${_dyn_queue% }
+        fi
+        _info "STAGE 2 iteration $_dyn_iter/$_dyn_max_iter: migrate ${_dyn_next} failed with UndefinedTable '${_dyn_rel}' → resolved to dependency app '${_picked_dep}'. New queue = [${_dyn_queue}]"
+      done
+      # Check if we're DONE: queue empty AND target aum_app in applied list.
+      local _aum_success=0
+      for _a in $_dyn_applied; do [ "$_a" = "${aum_app}" ] && _aum_success=1; done
+      if [ "$_aum_success" -eq 1 ]; then
+        _ok "DYNAMIC AUTH_USER_MODEL DEPENDENCY RESOLUTION SUCCESS (${_dyn_iter} iterations). Applied apps in order: [${_dyn_applied}]. Table ${aum_db_table} now exists; admin.0001 FK will resolve cleanly. Proceeding to full migrate."
+      else
+        # ── Fallback full 3-attempt retry banner with prompt_edit_multiple for aum_app.
+        _warn "Dynamic auth_user_model resolution did not fully succeed after ${_dyn_iter} iterations. Entering 3-attempt retry banner for '${aum_app}' migrate."
+        local aum_att=0 aum_max=3 aum_ok=0 aum_frc=0
+        local aum_fresh="/tmp/rasyatone_aum_fresh_$$.tmp"
+        local aum_cmd="${_dyn_base_env} manage.py migrate '${aum_app}'"
+        while [ "$aum_att" -lt "$aum_max" ] && [ "$aum_ok" -ne 1 ]; do
+          aum_att=$(( aum_att + 1 ))
+          aum_frc=0
+          _run_with_spinner "manage.py migrate ${aum_app} (attempt $aum_att/$aum_max — custom user app)" bash -c "$aum_cmd" || aum_frc=$?
+          if [ "$aum_frc" -eq 0 ]; then aum_ok=1; break; fi
+          local aum_tb=""
+          aum_tb=$( bash -c "$aum_cmd" 2>&1 | tail -n 80 || true )
+          printf '%s\n' "$aum_tb" > "$aum_fresh" 2>/dev/null || true
+          local aum_sho=""
+          aum_sho=$( bash -c "${_dyn_base_env} manage.py showmigrations '${aum_app}'" 2>&1 | tail -n 40 || true )
+          printf "\n\033[1;31m=== migrate ${aum_app} (AUTH_USER_MODEL app) FAILED attempt $aum_att/$aum_max (rc=$aum_frc) — EVIDENCE ===\033[0m\n" >&2
+          printf "  \033[1;33m[EXACT CMD:]  \033[0m%s\n" "$aum_cmd" >&2
+          printf "  \033[1;33m[FRESH DIRECT TRACEBACK:]\033[0m\n" >&2
+          printf '%s\n' "$aum_tb" | sed 's#^#    #' >&2
+          printf "  \033[1;33m[showmigrations ${aum_app}:]\033[0m\n" >&2
+          printf '%s\n' "$aum_sho" | sed 's#^#    #' >&2
+          printf "  \033[1;33m[STAGE 1 graph deps:]\033[0m %s\n" "${_stage1_deps:-<none discovered>}" >&2
+          printf "  \033[1;33m[STAGE 2 applied:]\033[0m %s\n  \033[1;33m[STAGE 2 final queue:]\033[0m %s\n" "${_dyn_applied:-<none>}" "${_dyn_queue:-<empty>}" >&2
+          if [ "$aum_att" -lt "$aum_max" ]; then
+            # Pre-populate sentinel defaults for prompt_edit_multiple.
+            local _sugg_dep=""
+            local _rel2
+            _rel2=$(printf '%s\n' "$aum_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true)
+            [ -n "${_rel2}" ] && _sugg_dep=$(printf '%s' "$_rel2" | awk -F'_' '{if(NF>2)print $1"_"$2; else print $1}' 2>/dev/null || true)
+            # Ensure sentinels exist in ENV_FILE (set -u nounset protection).
+            [ -n "${ENV_FILE:-}" ] && {
+              { [ -z "${DJANGO_SETTINGS_MODULE+x}" ] && echo "DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}" >> "$ENV_FILE" 2>/dev/null; } || true
+              grep -q "^MAKEMIGRATIONS_APP=" "$ENV_FILE" 2>/dev/null || echo "MAKEMIGRATIONS_APP=y" >> "$ENV_FILE" 2>/dev/null || true
+              if [ -n "${_sugg_dep}" ]; then
+                grep -q "^MIGRATE_DEPENDENCY_FIRST=" "$ENV_FILE" 2>/dev/null && sed -i "/^MIGRATE_DEPENDENCY_FIRST=/d" "$ENV_FILE" 2>/dev/null || true
+                echo "MIGRATE_DEPENDENCY_FIRST=${_sugg_dep}" >> "$ENV_FILE" 2>/dev/null || true
+              else
+                grep -q "^MIGRATE_DEPENDENCY_FIRST=" "$ENV_FILE" 2>/dev/null || echo "MIGRATE_DEPENDENCY_FIRST=" >> "$ENV_FILE" 2>/dev/null || true
               fi
-              aum_cmd="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${aum_app}'"
-            else
-              rm -f "$aum_fresh"
-              _die "\
+            } || true
+            prompt_edit_multiple \
+              "migrate ${aum_app} FAILED attempt $aum_att/$aum_max — edit fields then retry (fields 8-9 auto-run dependent apps before retry):" \
+              "DJANGO_SETTINGS_MODULE MAKEMIGRATIONS_APP MIGRATE_DEPENDENCY_FIRST DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+              "Retry migrate ${aum_app} with edited values?" \
+              "y"
+            set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+            export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
+            local mmk_yn=${MAKEMIGRATIONS_APP:-y}
+            if [ "${mmk_yn}" = "y" ] || [ "${mmk_yn}" = "Y" ]; then
+              _run_with_spinner "(pre-retry) manage.py makemigrations --noinput ${aum_app}" bash -c \
+                "${_dyn_base_env} manage.py makemigrations --noinput '${aum_app}'" || true
+            fi
+            local dep_first=${MIGRATE_DEPENDENCY_FIRST:-}
+            if [ -n "${dep_first}" ]; then
+              _run_with_spinner "(pre-retry) manage.py makemigrations --noinput ${dep_first} (dependency chain)" bash -c \
+                "${_dyn_base_env} manage.py makemigrations --noinput '${dep_first}'" || true
+              _run_with_spinner "(pre-retry) manage.py migrate ${dep_first} (dependency FIRST)" bash -c \
+                "${_dyn_base_env} manage.py migrate '${dep_first}'" || true
+            fi
+            aum_cmd="${_dyn_base_env} manage.py migrate '${aum_app}'"
+          else
+            rm -f "$aum_fresh"
+            _die "\
 AUTH_USER_MODEL single-app migrate FAILED all $aum_max attempts for custom user app '${aum_app}' (last rc=$aum_frc).
 ROOT CAUSE SETS:
   1. Migration files for ${aum_app} DO NOT EXIST in git-pushed repo: missing ${aum_app}/migrations/__init__.py (empty file required by Django migrations loader) OR no 0001_initial.py present → fix:
        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}'
      then:
        $aum_cmd
-  2. 0001_initial.py exists but references a dependency that itself isn't applied yet → add run_before = [('admin', '0001_initial')] inside class Migration(…) in ${aum_app}/migrations/0001_initial.py then re-run.
-  3. INSTALLED_APPS typo: '${aum_app}' misspelled in settings.py → showmigrations above would be empty for ${aum_app}.
-COPY-PASTE IMMEDIATE FIX:
-  cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}' && \\
-  PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${aum_app}'
-FULL ENV:
-  PYTHONPATH=$APP_DIR
-  DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-<UNSET>}
-  AUTH_USER_MODEL=${aum_app}.${aum_model}
-  DB_TABLE=${aum_db_table}"
+  2. TRANSITIVE DEPENDENCY CHAIN MISSING APPLIED: ${aum_app}.0001 has ForeignKey('companies.Company') / similar → relation 'companies_company' DNE. Run dependency app migrate FIRST (STAGE 2 resolves most automatically; manual order if failed):
+       cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput companies && \\
+       PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate companies && \\
+       $aum_cmd
+  3. 0001_initial.py exists but Migration.dependencies inside class Migration misses the app → edit ${aum_app}/migrations/0001_initial.py class Migration: dependencies = [('companies','0001_initial'), …]; or add run_before = [('admin', '0001_initial')] then re-run.
+  4. INSTALLED_APPS typo: '${aum_app}' misspelled → showmigrations above empty for ${aum_app}.
+COPY-PASTE IMMEDIATE FIX (transitive dep chain version — handles any FK depth):
+  cd '$APP_DIR' && \\
+  for APP in companies ${aum_app}; do
+    mkdir -p \$APP/migrations && touch \$APP/migrations/__init__.py 2>/dev/null || true
+    PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput \$APP
+    PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate \$APP
+  done
+  # Finally full migrate:
+  PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate
+DIAGNOSTIC CONTEXT:
+  STAGE 1 graph deps:  ${_stage1_deps:-<none discovered>}
+  STAGE 2 applied:     ${_dyn_applied:-<none>}
+  STAGE 2 final queue: ${_dyn_queue:-<empty>}
+  AUTH_USER_MODEL: ${aum_app}.${aum_model} → DB table = ${aum_db_table}
+"
             fi
           done
           rm -f "$aum_fresh"
