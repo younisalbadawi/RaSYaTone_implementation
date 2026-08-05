@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0000-dynamic-auth-app-deps-fi-balanced-bash-n"
+SCRIPT_VERSION_BUILD="2026-08-06T0010-dynamic-6-family-psql-cause-categorizer"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -1468,15 +1468,48 @@ precheck_app_prereqs() {
         s1_done=1
         _ok "psql SELECT 1 via DB_USER=$DB_USER succeeded"
       else
+        local _psql_cause2="" _psql_action2="" _pe2=""
+        _pe2=$(cat "$psql_out" 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "")
+        case "$_pe2" in
+          *database*does*not*exist*)
+            _psql_cause2="DATABASE OBJECT MISSING: PostgreSQL is running + your password was CORRECT (postgres did NOT reject auth) — but CREATE DATABASE '${DB_NAME}' was never run, so the object does not exist in pg_catalog.pg_database. You must run Option 3 FIRST (install PostgreSQL + CREATE ROLE + CREATE DATABASE) before Option 4 can validate credentials against the target DB."
+            _psql_action2="Action 1 (recommended): exit this menu → run Option 3 fully (will CREATE DATABASE ${DB_NAME} OWNER ${DB_USER} and return here). Action 2 (if Postgres is already installed/running): run this one-liner NOW on the DB server as root:  sudo -u postgres psql postgres -c \"CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};\"  then retry this preflight."
+            ;;
+          *password*authentication*failed*for*user*)
+            _psql_cause2="WRONG DB_PASSWORD (PostgreSQL scram-sha-256/md5 auth failed). DB_HOST, DB_PORT, DB_USER, DB_NAME are all VALID and reachable; only the password hash stored for role does not match DB_PASSWORD="
+            _psql_action2="Fix DB_PASSWORD value above (edit in prompt) OR reset role password on DB server: sudo -u postgres psql postgres -c \"ALTER ROLE ${DB_USER} WITH PASSWORD 'your-new-password-here';\" then paste that value into DB_PASSWORD in this prompt."
+            ;;
+          *role*\"*\"*does*not*exist*|*role*does*not*exist|*user*\"*\"*does*not*exist*)
+            _psql_cause2="ROLE ${DB_USER} DOES NOT EXIST in pg_roles on server. Option 3 CREATE ROLE was never run or failed — otherwise everything else is OK."
+            _psql_action2="Run Option 3 FIRST from main menu to create role+password+DB, OR on DB server: sudo -u postgres psql postgres -c \"CREATE ROLE ${DB_USER} LOGIN PASSWORD 'password' NOSUPERUSER NOCREATEROLE CREATEDB; CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};\"."
+            ;;
+          *no*pg_hba\.conf*entry*|*host\ *no\ *authentication|*pg_hba*)
+            _psql_cause2="pg_hba.conf REJECT: server has no allow rule for source_IP + user + DB combination. Postgres is reachable + password would be tested next (after pg_hba), but this is a firewall-style first reject."
+            _psql_action2="On DB server: append 'host all all 10.0.0.0/24 scram-sha-256' to /etc/postgresql/*/main/pg_hba.conf; ensure postgresql.conf listen_addresses='*'; then sudo systemctl restart postgresql."
+            ;;
+          *connection\ *refused|could\ *not\ *connect\ *to\ *server|no\ *route\ *to\ *host|connection\ *timed\ *out|host\ *is\ *not\ *listening*)
+            _psql_cause2="NETWORK/SERVER DOWN: PostgreSQL daemon not listening on DB_HOST:DB_PORT = ${DB_HOST}:${DB_PORT} (postgres not running, firewall blocking 5432, or wrong host/port)."
+            _psql_action2="Check DB server: sudo systemctl status postgresql; sudo ss -ltnp | grep :5432; sudo nc -zv ${DB_HOST} ${DB_PORT}; fix listen_addresses/start postgres/open firewall."
+            ;;
+          *timeout*|*terminating\ *connection\ *due\ *to\ *connection\ *timeout*)
+            _psql_cause2="NETWORK TIMEOUT (packets dropped, not rejected). Firewall DROP rule or wrong DB_HOST."
+            _psql_action2="Same as CONNECTION REFUSED plus check iptables -S FORWARD for drops."
+            ;;
+          *)
+            _psql_cause2="Other psql error: $(cat "$psql_out" 2>/dev/null | tail -n 3 | tr '\n' ' ')"
+            _psql_action2="Edit credentials in prompt and retry; or view server log journalctl -u postgresql --since '10 min ago'."
+            ;;
+        esac
         if [ "$s1_attempt" -lt "$s1_max" ]; then
-          _warn "psql SELECT 1 FAILED attempt $s1_attempt/$s1_max (wrong DB_PASSWORD? DB/user not created yet? try Option 3 first). Last 5 lines output: $(cat "$psql_out" 2>/dev/null | tail -n 5 | tr '\n' ' ')"
+          _warn "psql SELECT 1 FAILED attempt $s1_attempt/$s1_max. DETECTED CAUSE: ${_psql_cause2}. Raw output: $(cat "$psql_out" 2>/dev/null | tail -n 5 | tr '\n' ' ')"
+          _info "FIX SUGGESTION: ${_psql_action2}"
           prompt_edit_multiple \
             "psql SELECT 1 credential test FAILED — edit DB creds to fix" \
             "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
             "Retry psql SELECT 1 with (possibly edited) values?" \
             "y"
         else
-          _warn "psql SELECT 1 FAILED all $s1_max attempts (wrong DB_PASSWORD? DB/user not created yet? try Option 3 first). Will mark as FAIL on precheck summary."
+          _warn "psql SELECT 1 FAILED all $s1_max attempts. DETECTED CAUSE: ${_psql_cause2}. FIX SUGGESTION: ${_psql_action2}. Will mark as FAIL on precheck summary."
           ((fail++)) || true
         fi
       fi
@@ -2321,12 +2354,45 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
         dbprobe_done=1
         _ok "psql SELECT 1 OK (DB credentials validate)"
       else
-        local last_err=""
+        local last_err="" _psql_cause="" _psql_action=""
         last_err=$(cat "$dbprobe_out" 2>/dev/null | tail -n 5 | tr '\n' ' ' || echo "")
+        # ── CAUSE (I): Dynamic categorize psql error into 6 common families + suggest concrete action (never generic "wrong pw?").
+        local _pe=$(cat "$dbprobe_out" 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "")
+        case "$_pe" in
+          *database*does*not*exist*)
+            _psql_cause="DATABASE OBJECT MISSING: PostgreSQL is running + auth works (password OK) but CREATE DATABASE '${DB_NAME}' was never run. Common cause: Option 3 (install PostgreSQL + create DB) was NOT yet executed, or it failed partway through."
+            _psql_action="Create the DB now: run Option 3 first from the menu (it will CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}), OR — if Postgres is externally managed and you have sudo on the DB server — run: sudo -u postgres psql postgres -c \"CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};\" then retry."
+            ;;
+          *password*authentication*failed*for*user*)
+            _psql_cause="WRONG DB_PASSWORD (scram-sha-256 / md5 auth denied). PostgreSQL is running + host:port + DB_NAME are all correct; only the password value in ENV_FILE DB_PASSWORD= does not match the role's stored password hash."
+            _psql_action="Edit DB_PASSWORD above to match the password entered during Option 3. If forgotten, on the DB server run: sudo -u postgres psql postgres -c \"ALTER ROLE ${DB_USER} WITH PASSWORD 'new-good-password';\" then paste that new password back into DB_PASSWORD here."
+            ;;
+          *role*\"*\"*does*not*exist*|*role*does*not*exist|*user*\"*\"*does*not*exist*)
+            _psql_cause="DB_USER '${DB_USER}' ROLE NOT CREATED: Option 3 CREATE ROLE was never executed, or it failed. PostgreSQL is running, auth is asked, but there is no role '${DB_USER}' in pg_roles."
+            _psql_action="Run Option 3 FIRST from the installer menu (Option 3 creates the role + password), OR on the DB server run: sudo -u postgres psql postgres -c \"CREATE ROLE ${DB_USER} LOGIN PASSWORD 'your-password' NOSUPERUSER NOCREATEROLE CREATEDB;\" plus CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};."
+            ;;
+          *no*pg_hba\.conf*entry*|*host\ *no\ *authentication|*pg_hba*)
+            _psql_cause="pg_hba.conf AUTH METHOD MISMATCH: PostgreSQL is running but your client source IP/host/user/database combo is not listed in pg_hba.conf on the server (typically: your server IP is 10.0.0.1, client connecting from Contabo public IP, but pg_hba only has 127.0.0.1 allow rules)."
+            _psql_action="On the DB server edit /etc/postgresql/*/main/pg_hba.conf: add a line 'host all all 10.0.0.0/24 scram-sha-256' (or client's real IP). Also set listen_addresses='*' in postgresql.conf. Then systemctl restart postgresql."
+            ;;
+          *connection\ *refused|could\ *not\ *connect\ *to\ *server|no\ *route\ *to\ *host|connection\ *timed\ *out|host\ *is\ *not\ *listening*)
+            _psql_cause="NETWORK / SERVER DOWN: PostgreSQL daemon is NOT LISTENING on ${DB_HOST}:${DB_PORT} (postgres not running, wrong DB_HOST/DB_PORT, firewall drop on 5432, or wrong IP)."
+            _psql_action="Run on DB server: sudo systemctl status postgresql; sudo ss -ltnp | grep :5432; nc -zv ${DB_HOST} ${DB_PORT}. Verify DB_HOST=${DB_HOST} DB_PORT=${DB_PORT} match what Postgres reports (it defaults port 5432 and listen_addresses=localhost unless changed)."
+            ;;
+          ""|*timeout*\ *10*|*terminating\ *connection\ *due\ *to\ *connection\ *timeout*)
+            _psql_cause="TIMEOUT / NO RESPONSE: 10-second timeout with zero packets back. Same family as CONNECTION REFUSED but firewall DROPS packets instead of RST."
+            _psql_action="Check iptables/nftables/security groups for inbound 5432 allow. Confirm Postgres is running and listening on 0.0.0.0 not 127.0.0.1 only."
+            ;;
+          *)
+            _psql_cause="Other psql error (generic classification failed)."
+            _psql_action="Retry with edited credentials / verify PostgreSQL server logs (journalctl -u postgresql --since \"10 min ago\") for exact cause."
+            ;;
+        esac
         if [ "$dbprobe_attempt" -lt "$dbprobe_max" ]; then
-          _warn "psql SELECT 1 FAILED attempt $dbprobe_attempt/$dbprobe_max: $last_err"
+          _warn "psql SELECT 1 FAILED attempt $dbprobe_attempt/$dbprobe_max. DETECTED CAUSE: ${_psql_cause}. RAW LAST ERROR: $last_err"
+          _info "FIX SUGGESTION: ${_psql_action}"
           prompt_edit_multiple \
-            "psql SELECT 1 (credential pre-check) FAILED — edit DB creds to fix" \
+            "psql SELECT 1 (credential pre-check) FAILED — edit DB creds to fix (pre-filled defaults from ENV_FILE on first open)" \
             "DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
             "Retry psql SELECT 1 with (possibly edited) values?" \
             "y"
@@ -2351,7 +2417,7 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
             set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
           fi
         else
-          _warn "psql SELECT 1 FAILED all $dbprobe_max attempts. LAST ERROR: $last_err — manage.py migrate below will likely fail too. Continuing (you can abort with Ctrl-C and rerun Option 3 first to fix creds)."
+          _warn "psql SELECT 1 FAILED all $dbprobe_max attempts. DETECTED CAUSE: ${_psql_cause}. LAST ERROR: $last_err — manage.py migrate below will likely fail too. FIX SUGGESTION: ${_psql_action}. Continuing (you can abort with Ctrl-C and rerun Option 3 first to fix creds / create DB)."
         fi
       fi
     done
