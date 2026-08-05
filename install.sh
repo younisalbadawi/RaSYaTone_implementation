@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0010-dynamic-6-family-psql-cause-categorizer"
+SCRIPT_VERSION_BUILD="2026-08-06T0020-auto-create-db-role-from-psql-fail"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -63,6 +63,81 @@ _warn() { printf "  \033[93m[WARN]\033[0m %s\n" "$*"; }
 _info() { local fmt="$1"; shift; printf "  \033[96m[INFO]\033[0m ${fmt}\n" "$@"; }
 _die()  { printf "\n\033[91mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 _section(){ printf "\n\033[1;97m=== %s ===\033[0m\n" "$*"; }
+
+# Dynamic CREATE ROLE + CREATE DATABASE + SELECT 1 one-shot auto-fixer for when psql credential test crashes
+# with "database does not exist" or "role does not exist". Runs only when:
+#   1. psql test with DB_PASSWORD failed with one of those 2 categorized causes.
+#   2. sudo -u postgres psql postgres -tAc "SELECT 1" returns 1 (superuser access works locally).
+#   3. User answers Y to prompt_def.
+# Returns 0 if after actions SELECT 1 == '1' succeeded (caller can then break out of their attempt loop).
+# Returns 1 otherwise (caller falls back to prompt_edit_multiple / manual fix).
+_psql_auto_fix_missing_role_or_db() {
+  local _cause_lc="$1"  # lowercase psql error (already from tr upper->lower)
+  local _db_user="$2" _db_name="$3" _db_pw="$4"
+  local _out5="/tmp/rasyatone_psql_autofix_$$.out"
+  local _can_sudo=0
+  if command -v sudo >/dev/null 2>&1 && id -u postgres >/dev/null 2>&1; then
+    local _su_row=""
+    _su_row=$(sudo -n -u postgres psql postgres -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ "$_su_row" = "1" ]; then _can_sudo=1; fi
+  fi
+  if [ "$_can_sudo" -ne 1 ]; then
+    _info "AUTO-FIX NOT AVAILABLE: sudo -u postgres psql (non-interactive, NOPASSWD) not reachable from this shell — so we cannot create the role/DB on the Postgres server. Use the manual SQL command provided above instead, then retry."
+    return 1
+  fi
+  local _needs_role=0 _needs_db=0
+  case "$_cause_lc" in
+    *database*does*not*exist*)   _needs_db=1 ;;
+    *role*does*not*exist*|*user*does*not*exist*) _needs_role=1; _needs_db=1 ;;
+  esac
+  if [ "$_needs_db" -eq 0 ] && [ "$_needs_role" -eq 0 ]; then return 1; fi
+  local _offer=""
+  if [ "$_needs_role" -eq 1 ] && [ "$_needs_db" -eq 1 ]; then
+    _offer="CREATE ROLE ${_db_user} (LOGIN + password from ENV_FILE DB_PASSWORD=) + CREATE DATABASE ${_db_name} OWNER ${_db_user} + GRANT CONNECT + SELECT 1 verify"
+  else
+    _offer="CREATE DATABASE ${_db_name} OWNER ${_db_user} + SELECT 1 verify (role already exists; password OK — DB object alone missing)"
+  fi
+  local _do_it
+  _do_it=$(prompt_def "AUTO-FIX AVAILABLE (sudo -u postgres works non-interactively): Run: ${_offer}? [Y/n]" "Y")
+  case "$_do_it" in
+    y|Y|yes|YES|Yes|1) ;;
+    *) return 1 ;;
+  esac
+  _section "AUTO-FIX: ${_offer}"
+  # Escape single quotes in password for SQL literals: every ' → ''
+  local _sql_pw
+  _sql_pw=$(printf '%s' "${_db_pw}" | sed "s/'/''/g")
+  local _esc_user
+  _esc_user=$(printf '%s' "${_db_user}" | sed "s/'/''/g")
+  local _esc_db
+  _esc_db=$(printf '%s' "${_db_name}" | sed "s/'/''/g")
+  if [ "$_needs_role" -eq 1 ]; then
+    local _role_sql="/tmp/rasyatone_autofix_role_$$.sql"
+    printf "CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEROLE CREATEDB;\n" "${_esc_user}" "${_sql_pw}" > "$_role_sql"
+    _run_with_spinner "psql auto-fix (CREATE ROLE ${_db_user})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_role_sql" >/dev/null 2>"$_out5" || true
+    rm -f "$_role_sql"
+  fi
+  if [ "$_needs_db" -eq 1 ]; then
+    local _db_sql="/tmp/rasyatone_autofix_db_$$.sql"
+    printf "CREATE DATABASE %s OWNER %s;\n" "${_esc_db}" "${_esc_user}" > "$_db_sql"
+    _run_with_spinner "psql auto-fix (CREATE DATABASE ${_db_name} OWNER ${_db_user})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_db_sql" >/dev/null 2>"$_out5" || true
+    rm -f "$_db_sql"
+    local _grant_sql="/tmp/rasyatone_autofix_grant_$$.sql"
+    printf 'GRANT CONNECT ON DATABASE %s TO %s;\n' "${_esc_db}" "${_esc_user}" > "$_grant_sql"
+    _run_with_spinner "psql auto-fix (GRANT CONNECT ON DATABASE ${_db_name} TO ${_db_user})" sudo -u postgres psql -v ON_ERROR_STOP=1 postgres -f "$_grant_sql" >/dev/null 2>"$_out5" || true
+    rm -f "$_grant_sql"
+  fi
+  # Verify SELECT 1 immediately (same psql as caller test, so if we fixed the right thing it returns 1 here too).
+  local _verify_row=""
+  _verify_row=$(PGPASSWORD="${_db_pw}" timeout 8 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${_db_user}" -d "${_db_name}" -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+  rm -f "$_out5"
+  if [ "$_verify_row" = "1" ]; then
+    _ok "AUTO-FIX SUCCESS: SELECT 1 returned '1' — role ${_db_user} + DB ${_db_name} ready (all missing objects created in-place)."
+    return 0
+  fi
+  _warn "AUTO-FIX applied but SELECT 1 still fails (verify row='${_verify_row}' not '1'). Proceeding to manual prompt_edit_multiple / manual shell fix menu."
+  return 1
+}
 
 # Canonicalize ANY GitHub HTTPS URL (with or without x-access-token auth) so it has exactly ONE trailing .git,
 # no doubled .git.git, and no trailing slashes. Works as an output safety net on ANY GitHub URL form.
@@ -1500,7 +1575,23 @@ precheck_app_prereqs() {
             _psql_action2="Edit credentials in prompt and retry; or view server log journalctl -u postgresql --since '10 min ago'."
             ;;
         esac
-        if [ "$s1_attempt" -lt "$s1_max" ]; then
+        # ── AUTO-FIX: if cause is DB missing OR role missing AND sudo -u postgres is available, offer to create them RIGHT HERE.
+        local _auto_ok=0
+        case "$_pe2" in
+          *database*does*not*exist*|*role*does*not*exist*|*user*does*not*exist*)
+            if _psql_auto_fix_missing_role_or_db "$_pe2" "${DB_USER}" "${DB_NAME}" "${DB_PASSWORD}"; then
+              # Reload row since auto-fix created DB/role:
+              local _arow=""
+              _arow=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+              if [ "$_arow" = "1" ]; then
+                s1_done=1
+                _auto_ok=1
+                _ok "psql SELECT 1 via DB_USER=$DB_USER succeeded after AUTO-FIX."
+              fi
+            fi
+            ;;
+        esac
+        if [ "$s1_attempt" -lt "$s1_max" ] && [ "$_auto_ok" -ne 1 ]; then
           _warn "psql SELECT 1 FAILED attempt $s1_attempt/$s1_max. DETECTED CAUSE: ${_psql_cause2}. Raw output: $(cat "$psql_out" 2>/dev/null | tail -n 5 | tr '\n' ' ')"
           _info "FIX SUGGESTION: ${_psql_action2}"
           prompt_edit_multiple \
@@ -2388,7 +2479,21 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
             _psql_action="Retry with edited credentials / verify PostgreSQL server logs (journalctl -u postgresql --since \"10 min ago\") for exact cause."
             ;;
         esac
-        if [ "$dbprobe_attempt" -lt "$dbprobe_max" ]; then
+        # ── AUTO-FIX: if cause is DB missing OR role missing AND sudo -u postgres works, offer to create them RIGHT NOW (no exit to Option3/shell).
+        local _auto_ok2=0
+        case "$_pe" in
+          *database*does*not*exist*|*role*does*not*exist*|*user*does*not*exist*)
+            if _psql_auto_fix_missing_role_or_db "$_pe" "${DB_USER}" "${DB_NAME}" "${DB_PASSWORD}"; then
+              local _arow2=""
+              _arow2=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>/dev/null | tr -d '[:space:]' || true)
+              if [ "$_arow2" = "1" ]; then
+                dbprobe_done=1; _auto_ok2=1
+                _ok "psql SELECT 1 OK (DB credentials validate) after AUTO-FIX."
+              fi
+            fi
+            ;;
+        esac
+        if [ "$dbprobe_attempt" -lt "$dbprobe_max" ] && [ "$_auto_ok2" -ne 1 ]; then
           _warn "psql SELECT 1 FAILED attempt $dbprobe_attempt/$dbprobe_max. DETECTED CAUSE: ${_psql_cause}. RAW LAST ERROR: $last_err"
           _info "FIX SUGGESTION: ${_psql_action}"
           prompt_edit_multiple \
