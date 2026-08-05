@@ -2092,6 +2092,7 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   # the correct value later.
   _section "Post-clone: validate DJANGO_SETTINGS_MODULE layout matches cloned repo"
   local dsm="" dsm_pkg_dir="" dsm_py_file="" probe_attempt=0 dsm_ok=0 max_dsm_probes=3
+  local diag_lines=""   # MUST be declared before stage 2 block so appends work consistently
   dsm="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS}"
   while [ "$probe_attempt" -lt "$max_dsm_probes" ] && [ "$dsm_ok" -ne 1 ]; do
     probe_attempt=$(( probe_attempt + 1 ))
@@ -2104,14 +2105,121 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
     printf "    → expected PACKAGE DIR: \033[0;33m%s\033[0m (must exist after clone)\n" "$dsm_pkg_dir" >&2
     printf "    → expected SETTINGS .PY FILE: \033[0;33m%s\033[0m (must exist after clone)\n" "$dsm_py_file" >&2
     # Layered checks: (1) top-level package dir exists AND contains __init__.py or __init__.pyi (strict package marker)
-    #                 (2) the final settings.py file exists. If both pass → PASS; else FAIL + offer edit/retry.
+    #                 (2) the final settings.py file exists. If both pass → pass STAGE 1 (layout ok).
     local has_pkg=0 has_settings=0
     if [ -d "$dsm_pkg_dir" ] && [ -f "$dsm_pkg_dir/__init__.py" ] || [ -f "$dsm_pkg_dir/__init__.pyi" ]; then has_pkg=1; fi
     if [ -f "$dsm_py_file" ]; then has_settings=1; fi
+    diag_lines=""
     if [ "$has_pkg" -eq 1 ] && [ "$has_settings" -eq 1 ]; then
-      dsm_ok=1
-      _ok "Post-clone settings layout OK: package dir present, settings.py file present (matches DJANGO_SETTINGS_MODULE=$dsm)."
-      break
+      # ── STAGE 2 (beyond dir/file exists): ACTUAL PYTHON importability probe of TOP-LEVEL PACKAGE ──
+      local stage2_rc=0 stage2_output="" stage2_python=""
+      # Pick any python binary available for STAGE 2: prefer PYTHON_BIN else python3 else python else empty.
+      if [ -n "${PYTHON_BIN:-}" ] && [ -x "$PYTHON_BIN" ]; then stage2_python="$PYTHON_BIN"
+      elif command -v python3 >/dev/null 2>&1; then stage2_python="$(command -v python3)"
+      elif command -v python  >/dev/null 2>&1; then stage2_python="$(command -v python)"
+      else stage2_python=""; fi
+      local dsm_pkg_name=""
+      dsm_pkg_name="${dsm%%.*}"   # "rasyaterp.settings" → rasyaterp
+      if [ -n "$stage2_python" ] && [ -n "$dsm_pkg_name" ]; then
+        stage2_rc=0
+        # CRITICAL: pass PROBE_PKG_NAME as env var (was missing in the first draft of STAGE 2)
+        stage2_output=$( PROBE_PKG_NAME="$dsm_pkg_name" PYTHONPATH="$APP_DIR" "$stage2_python" - <<'PY' 2>&1 || stage2_rc=$?
+import os, sys, importlib, traceback
+pkg = os.environ.get("PROBE_PKG_NAME", "")
+if not pkg:
+    sys.stderr.write("ENV MISSING PROBE_PKG_NAME\n")
+    sys.exit(2)  # treat as "skip with expected-only" since we can't probe safely
+# KNOWN pip-provided modules (not in repo) that WILL be present after pip install -r requirements.txt.
+# If ANY of these are the root cause of failure during STAGE 2 (before pip), we SKIP (expected).
+KNOWN_REQ_MODULES = {
+    "django", "rest_framework", "psycopg2", "psycopg", "storages", "celery",
+    "redis", "gunicorn", "whitenoise", "corsheaders", "allauth", "crispy_forms",
+    "drf_yasg", "PIL", "pandas", "numpy", "openpyxl", "requests", "boto3",
+    "sendgrid", "twilio", "stripe", "jwt", "simplejwt",
+}
+try:
+    importlib.import_module(pkg)
+    sys.stderr.write("STAGE2_OK: top-level package %s imported cleanly\n" % pkg)
+    sys.exit(0)
+except SyntaxError as e:
+    traceback.print_exc()
+    sys.stderr.write("\nSTAGE2_REAL_FAIL: SYNTAX ERROR in package %s (__init__.py is malformed; fix before rerun)\n" % pkg)
+    sys.exit(1)
+except Exception as e:
+    # Walk traceback chain to find the REAL "root" exception message (CPython masks nested package failures).
+    tb_exc = e
+    depth = 0
+    while True:
+        cause = getattr(tb_exc, "__cause__", None) or getattr(tb_exc, "__context__", None)
+        if cause is None or depth > 8:
+            break
+        tb_exc = cause
+        depth += 1
+    msg = str(tb_exc).lower()
+    # Extract likely module name from ModuleNotFoundError messages: "No module named 'foo.bar'" → foo.bar
+    missing_mod = None
+    if isinstance(tb_exc, ModuleNotFoundError):
+        missing_mod = str(getattr(tb_exc, "name", "")).lower() or None
+    if missing_mod is None:
+        # Fallback: scrape "No module named 'X'" pattern anywhere in chained messages
+        import re
+        full = "\n".join([str(type(e).__name__), str(e), str(type(tb_exc).__name__), str(tb_exc)]).lower()
+        m = re.search(r"no module named ['\"]([^'\"]+)['\"]", full)
+        if m:
+            missing_mod = m.group(1).lower()
+    # Decision: if missing_mod is in KNOWN_REQ_MODULES → EXPECTED BEFORE PIP INSTALL (treat ok).
+    #           if missing_mod starts with pkg. (internal submodule) → REAL FAIL (typo inside repo).
+    #           if missing_mod is some other third-party lib → REAL FAIL (either requirements wrong OR typo).
+    #           if SyntaxError (handled above) or any other exception: REAL FAIL (traceback shows actual issue).
+    if missing_mod:
+        top_level_missing = missing_mod.split(".")[0]
+        if top_level_missing in KNOWN_REQ_MODULES:
+            traceback.print_exc()
+            sys.stderr.write("\nSTAGE2_EXPECTED_PIP_MISSING: import of %s failed only because requirements modules (%s) are not installed yet. This is normal BEFORE pip install. Treating as PASS.\n" % (pkg, top_level_missing))
+            sys.exit(2)
+        if missing_mod.startswith(pkg + "."):
+            # INTERNAL MODULE TYPO inside the package (e.g. rasyaterp.conrig missing 'f' in config → REAL FAIL with traceback)
+            traceback.print_exc()
+            sys.stderr.write("\nSTAGE2_REAL_FAIL: MISSING INTERNAL SUBMODULE %s inside package %s — this is a TYPO in your repo code (e.g. rasyaterp/__init__.py imports it wrong).\n" % (missing_mod, pkg))
+            sys.exit(1)
+    # Anything else: print traceback + REAL_FAIL so user sees actual root exception (not masked ModuleNotFound).
+    traceback.print_exc()
+    sys.stderr.write("\nSTAGE2_REAL_FAIL: exception during import of top-level package %s (root type: %s; root message: %s)\n" % (pkg, type(tb_exc).__name__, str(tb_exc)[:200]))
+    sys.exit(1)
+PY
+)
+        # Post-process rc: Python exit 2 = EXPECTED_PIP_MISSING (KNOWN_REQ_MODULES only, treat as PASS),
+        # Python exit 0 = import cleanly (treat as PASS),
+        # Python exit 1 = REAL syntax/import failure with traceback (treat as FAIL).
+        local stage2_pass=0
+        case "$stage2_rc" in
+            0|2) stage2_pass=1 ;;
+            *)   stage2_pass=0 ;;
+        esac
+        if [ "$stage2_pass" -eq 1 ]; then
+          dsm_ok=1
+          local stage2_label=""
+          if [ "$stage2_rc" -eq 0 ]; then stage2_label="__init__.py imported cleanly (only stdlib used)"; else stage2_label="__init__.py only requires pip modules (DJANGO/REST_FRAMEWORK/etc.) — normal before pip install, treating pass"; fi
+          _ok "Post-clone STAGE 2 (top-level package importability) OK: $stage2_label."
+          # Mark both stages passed to prevent later WARN.
+          has_pkg=1; has_settings=1
+          break
+        else
+          # REAL FAIL: stage2_rc=1. Output already contains the Python traceback with the REAL exception.
+          diag_lines+="      [STAGE 2 REAL FAIL] top-level package '$dsm_pkg_name' EXISTS on disk but IMPORT during __init__.py execution FAILED with the above exception.\n"
+          diag_lines+="              NOTE: CPython masks this failure as 'ModuleNotFoundError: No module named $dsm_pkg_name' in later migrate/collectstatic — STAGE 2 catches the REAL cause EARLY.\n"
+          diag_lines+="              FULL PYTHON TRACEBACK (from '$stage2_python' with PYTHONPATH=$APP_DIR):\n"
+          diag_lines+="$(printf '%s\n' "$stage2_output" | sed 's#^#                  #')\n"
+          # Reset has_pkg so the retry prompt is shown.
+          has_pkg=0
+        fi
+      else
+        # No python available yet (very rare since _install_compatible_python_runtime runs before Option 4 clone)
+        _warn "Post-clone STAGE 2 skipped: no python binary on PATH (PYTHON_BIN=$PYTHON_BIN, no python3/python). Will rely on final django.setup() PRECHECK before collectstatic/migrate for catch."
+        dsm_ok=1
+        has_pkg=1; has_settings=1
+        break
+      fi
     fi
     # Fail: diagnostics.
     local diag_lines=""
@@ -2730,25 +2838,134 @@ EOBANNER
     else
       _ok "collectstatic ok"
     fi
-    _run_with_spinner "manage.py migrate (apply DB migrations)" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate" || \
-      _die "manage.py migrate FAILED (rc=$?). Full categorized causes IN ORDER:
-  (A) SETTINGS-IMPORT FAILURE (the #1 cause, this is the error we ran a precheck
-      probe for above — if you hit this, the probe above should have died first,
-      but if it slipped through, run: cd '$APP_DIR' && PYTHONPATH='$APP_DIR'
-      DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}'
-      '$APP_DIR/.venv/bin/python' -c 'import django; django.setup()' — full
-      traceback will show actual missing package / broken import).
-  (B) DB CONNECTION FAILURE (2nd most common). Env file loaded: $ENV_FILE.
-      Check: DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD set and match
-      what install_db (Option 3) created? SELECT 1 probe during prechecks
-      (terminal line near psql) should show if credentials work.
-  (C) DB PRIVILEGE FAILURE. CREATEDB missing? If DB_NAME did not exist and
-      Django tried to autocreate it (some settings configs do that), DB_USER
-      needs CREATEDB attribute: sudo -u postgres psql -c \"ALTER USER $DB_USER WITH CREATEDB;\"
-      Also CONNECT on database: sudo -u postgres psql -c \"REVOKE CONNECT ON DATABASE $DB_NAME FROM PUBLIC; GRANT CONNECT ON DATABASE $DB_NAME TO $DB_USER;\"
-  (D) MIGRATION FILES MISSING / BROKEN. Check APP_DIR/migrations/ or each app
-      migration dirs. Run: cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py showmigrations
-  (E) PYTHON version mismatch. Venv python version: $("$APP_DIR/.venv/bin/python" -c 'import sys;print(sys.version)' 2>/dev/null). Django 5+ needs >= 3.10 and <= 3.13 (MAX_ALLOWED_PYTHON_MINOR=3.13 cap to avoid cpython-314 psycopg2 sdist crashes)."
+    # ── migrate: wrapped in 3-attempt retry loop with prompt_edit_multiple + banner shows FRESH traceback on every fail ──
+    # The user's EXACT issue: spinner failed with `ModuleNotFoundError: No module named 'rasyaterp'` but the old
+    # banner only had static text causes list. This loop:
+    #   (1) Runs migrate exactly like the spinner does (same PYTHONPATH / DJANGO_SETTINGS_MODULE / venv python).
+    #   (2) On FAIL: immediately re-runs the same command (no spinner) so we capture a FRESH full traceback into
+    #       a temp file, then dumps: that FRESH traceback + the spinner's own redirected log file (from _run_with_spinner)
+    #       + auto-runs cause (A)'s django.setup probe + dumps ENV used so user sees root cause masked by CPython.
+    #   (3) BEFORE DIE: offers prompt_edit_multiple menu for all the vars migrate actually uses
+    #       (DJANGO_SETTINGS DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR) so the user
+    #       can fix typoed password / wrong settings module / wrong DB host RIGHT HERE without rerunning the entire installer.
+    local mig_attempt=0 mig_max=3 mig_ok=0 mig_rc=0
+    local mig_spin_log="" mig_fresh_tmp="/tmp/rasyatone_mig_fresh_$$.tmp"
+    local mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate"
+    while [ "$mig_attempt" -lt "$mig_max" ] && [ "$mig_ok" -ne 1 ]; do
+      mig_attempt=$(( mig_attempt + 1 ))
+      mig_spin_log=""
+      mig_rc=0
+      _run_with_spinner "manage.py migrate (attempt $mig_attempt/$mig_max) — apply DB migrations" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate" || mig_rc=$?
+      # Locate most recent _run_with_spinner migrate log file (newest by mtime matching label pattern).
+      # _run_with_spinner writes to /tmp/rasyatone_spin_<pid>_<label>.log with <label> sanitized — glob newest matching migrate file.
+      local _gl
+      for _gl in $(ls -1t /tmp/rasyatone_spin_*_*migrate* 2>/dev/null | head -n 3); do
+        [ -f "$_gl" ] || continue
+        # Use the first one that's non-empty (most recent)
+        if [ -s "$_gl" ]; then mig_spin_log="$_gl"; break; fi
+        [ -z "${mig_spin_log}" ] && mig_spin_log="$_gl"
+      done
+      if [ "$mig_rc" -eq 0 ]; then
+        mig_ok=1
+        break
+      fi
+      # ── migrate FAILED this attempt: build a SUPER detailed evidence banner (not static text) ──
+      # Part A: rerun migrate immediately with stdout/stderr UNREDICTED (no spinner redirect) so we capture FRESH traceback.
+      local fresh_tb=""
+      fresh_tb=$( bash -c "$mig_cmd_fresh" 2>&1 | tail -n 80 || true )
+      printf '%s\n' "$fresh_tb" > "$mig_fresh_tmp" 2>/dev/null || true
+      # Part B: auto-run cause (A)'s django.setup probe — this is the #1 cause.
+      local dsetup_out="" dsetup_rc=0
+      dsetup_out=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || dsetup_rc=$?
+import os, sys, traceback
+try:
+    import django
+    django.setup()
+    from django.conf import settings
+    print("django.setup() OK; ROOT_URLCONF=%s; STATIC_ROOT=%s; DATABASES.default.HOST=%s" % (settings.ROOT_URLCONF, settings.STATIC_ROOT if hasattr(settings, "STATIC_ROOT") else "<UNSET>", settings.DATABASES["default"].get("HOST", "<UNSET>")))
+    sys.exit(0)
+except Exception:
+    traceback.print_exc()
+    sys.exit(2)
+PY
+)
+      # Part C: auto-run cause (D)'s manage.py showmigrations so user sees missing migration files.
+      local show_out=""
+      show_out=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py showmigrations" 2>&1 | tail -n 50 || true )
+      # Part D: list EXACT env that was used for migrate bash -c (for env leak debugging: APP_DIR empty? DJANGO_SETTINGS_MODULE defaulted?).
+      local venv_pv=""
+      venv_pv=$("$APP_DIR/.venv/bin/python" -c 'import sys;print(sys.version)' 2>/dev/null || echo "UNKNOWN")
+      printf "\n\033[1;31m=== manage.py migrate FAILED attempt %d/%d (rc=%s) — FULL EVIDENCE BELOW ===\033[0m\n" "$mig_attempt" "$mig_max" "$mig_rc" >&2
+      printf "  \033[1;33m[EXACT CMD used for migrate bash -c (COPY-PASTE REPRODUCE LINE):]\033[0m\n    %s\n" "$mig_cmd_fresh" >&2
+      printf "  \033[1;33m[ENV VARS migrate ran with:]\033[0m\n    PYTHONPATH=%s\n    DJANGO_SETTINGS_MODULE=%s\n    VENV_BIN=%s\n    VENV_PY_VERSION=%s\n" \
+        "$APP_DIR" "${DJANGO_SETTINGS_MODULE:-<UNSET (using $DJANGO_SETTINGS=$DJANGO_SETTINGS)>}" "$APP_DIR/.venv/bin/python" "$venv_pv" >&2
+      printf "  \033[1;33m[SPINNER LOG FILE contents (migrate stderr/stdout captured inside _run_with_spinner):]\033[0m" >&2
+      if [ -n "${mig_spin_log}" ] && [ -f "${mig_spin_log}" ]; then
+        printf " (file=%s, size=$(wc -c <"$mig_spin_log" 2>/dev/null || echo 0) bytes)\n" "$mig_spin_log" >&2
+        tail -n 60 "$mig_spin_log" 2>/dev/null | sed 's#^#    #' >&2 || true
+      else
+        printf "\n    [NO SPINNER LOG FOUND — _run_with_spinner may not have written one or glob missed it]\n" >&2
+      fi
+      printf "  \033[1;33m[FRESH DIRECT traceback (migrate rerun OUTSIDE spinner, no redirection — should match actual error):]\033[0m\n" >&2
+      printf '%s\n' "$fresh_tb" | sed 's#^#    #' >&2
+      printf "  \033[1;33m[Cause (A) PROBE: django.setup() standalone check rc=%d]:\033[0m\n" "$dsetup_rc" >&2
+      printf '%s\n' "$dsetup_out" | sed 's#^#    #' >&2
+      printf "  \033[1;33m[Cause (D) PROBE: manage.py showmigrations tail]:\033[0m\n" >&2
+      printf '%s\n' "$show_out" | sed 's#^#    #' >&2
+      # Cleanup temp before next iteration / before retry prompt.
+      rm -f "$mig_fresh_tmp" 2>/dev/null || true
+      if [ "$mig_attempt" -lt "$mig_max" ]; then
+        # Retry menu: user can fix DB creds / DJANGO_SETTINGS right here!
+        prompt_edit_multiple \
+          "manage.py migrate FAILED attempt $mig_attempt/$mig_max — edit a field to fix it before we retry:" \
+          "DJANGO_SETTINGS DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+          "Retry manage.py migrate with (possibly edited) values NOW?" \
+          "y"
+        # Re-sync migrate command string + subshell env after edit menu wrote new values.
+        set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+        export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}"
+        mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate"
+      else
+        # 3rd and final fail: hard die with the categorized list + evidence summary so user has it for copy-paste.
+        _die "\
+manage.py migrate FAILED all $mig_max attempts (last rc=$mig_rc).
+
+Full categorized causes IN ORDER (matching the numbered evidence blocks above):
+
+  (A) SETTINGS-IMPORT FAILURE (the #1 cause, matches django.setup() standalone probe above).
+      Root cause of '$fresh_tb' traceback: if django.setup() probe above printed:
+        • ModuleNotFoundError: No module named 'rasyaterp' → TOP-LEVEL PACKAGE NAME in DJANGO_SETTINGS_MODULE does not match actual cloned repo (typo like 'rasyaterp' vs 'rasyatone'), OR rasyaterp/__init__.py has a broken internal import that CPython masks.
+        • ModuleNotFoundError: No module named 'rest_framework'/'storages'/etc. → pip install -r requirements.txt PARTIALLY FAILED during venv setup (see earlier terminal line: pip install rc).
+      COPY-PASTE DEBUG:
+        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.conf import settings; print(settings.ROOT_URLCONF)'
+
+  (B) DB CONNECTION FAILURE (2nd most common — see DATABASES.default.HOST printed in django.setup() probe above).
+      Loaded env file: $ENV_FILE. Verify DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD values match the ones install_db (Option 3) created.
+      COPY-PASTE DB SMOKE:
+        PGPASSWORD='$DB_PASSWORD' psql -h '$DB_HOST' -p '$DB_PORT' -U '$DB_USER' -d '$DB_NAME' -c 'SELECT 1;'
+
+  (C) DB PRIVILEGE FAILURE (django.setup OK, SELECT 1 OK, but migrate fails on CREATE TABLE/ALTER).
+      CREATEDB missing?  sudo -u postgres psql -c \"ALTER USER $DB_USER WITH CREATEDB;\"
+      CONNECT missing?  sudo -u postgres psql -c \"REVOKE CONNECT ON DATABASE $DB_NAME FROM PUBLIC; GRANT CONNECT ON DATABASE $DB_NAME TO $DB_USER;\"
+
+  (D) MIGRATION FILES MISSING / BROKEN — see showmigrations probe above. If NO apps are listed, your INSTALLED_APPS in settings.py is empty or points to non-existent apps (typo). COPY-PASTE:
+        cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py makemigrations
+
+  (E) PYTHON version mismatch. Venv python: $venv_pv. Must be >= 3.10 AND <= 3.$MAX_ALLOWED_PYTHON_MINOR (3.13 — intentionally capped to avoid psycopg2 cpython-314 _PyInterpreterState_Get compile crash).
+
+COPY-PASTE REPRODUCE (SINGLE LINE):
+  $mig_cmd_fresh
+
+FULL migrate bash -c env (for debugging leaks):
+  PYTHONPATH=$APP_DIR
+  DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-<UNSET>}
+  VENV_PY=$APP_DIR/.venv/bin/python
+  APP_DIR=$APP_DIR"
+      fi
+    done
+    if [ "$mig_ok" -eq 1 ]; then
+      _ok "manage.py migrate SUCCESS (attempt $mig_attempt/$mig_max). All migrations applied."
+    fi
   )
   _ok "Django migrate OK"
 
