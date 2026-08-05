@@ -2273,22 +2273,134 @@ the previous 'Only Python 3.14 was found MAX_ALLOWED=3.13' hard die before this 
     # shellcheck disable=SC1091
     . "./.venv/bin/activate" 2>/dev/null || true
     set -u
+    # -------------------------------------------------------------------------
+    # PYTHONPATH + settings-import PRECHECK (catches the EXACT user crash
+    # before we run collectstatic/migrate so die message is specific).
+    #
+    # Root cause of the user's ModuleNotFoundError: No module named 'rasyaterp':
+    #   (a) DJANGO_SETTINGS_MODULE defaults to "rasyaterp.settings" (expected
+    #       repo layout: $APP_DIR/rasyaterp/settings.py next to manage.py).
+    #   (b) For Django's import_module("rasyaterp.settings") to resolve, the
+    #       PARENT directory containing `rasyaterp/` MUST be on PYTHONPATH.
+    #   (c) When user runs via `./manage.py`, CPython adds cwd to sys.path[0]
+    #       automatically — HOWEVER some Debian setuid/non-interactive bash
+    #       sessions running with `bash -c "python manage.py …"` can have
+    #       `sys.path[0] = ''` (empty string = "cwd at import time") which
+    #       no-ops inside Django's import_module call chain, OR the user has
+    #       a top-level rasyaterp/__init__.py with a broken import that
+    #       propagates up as a generic ModuleNotFoundError mask.
+    #
+    # Fix: explicitly export PYTHONPATH = APP_DIR, then run a 2-line probe
+    # that tries: `import django; django.setup(); from django.conf import
+    # settings; print(settings.INSTALLED_APPS[0])`. If probe fails → loud die
+    # with EXACTLY: what we tried, the full traceback, and copy-paste debug
+    # commands the user can run locally to reproduce outside the installer.
+    # -------------------------------------------------------------------------
+    # Ensure venv/bin is on PATH inside this subshell (belt+braces same as
+    # outer activate block — no activate no-op inside subshell)
+    case ":$PATH:" in
+      *":$APP_DIR/.venv/bin:"*) : ;;
+      *) export PATH="$APP_DIR/.venv/bin:$PATH" ;;
+    esac
+    [ -x "$APP_DIR/.venv/bin/python" ] || _die "collectstatic/migrate PRECHECK: $APP_DIR/.venv/bin/python missing (venv gone?). Run: sudo rm -rf '${APP_DIR:?}/.venv' ; rerun Option 4."
+    export PYTHONPATH="${APP_DIR:?}${PYTHONPATH:+:${PYTHONPATH}}"
+    export VIRTUAL_ENV="${VIRTUAL_ENV:-$APP_DIR/.venv}"
+    local django_precheck_rc=0 django_precheck_traceback=""
+    django_precheck_traceback=$("$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || django_precheck_rc=$?
+import os, sys, traceback
+try:
+    import django
+    from django.conf import settings as _ds
+    # NOTE: we use os.environ.get DJANGO_SETTINGS_MODULE explicitly — the
+    # `import django; django.setup()` call below will respect env and fail
+    # with EXACT ModuleNotFoundError chain the user saw IF PYTHONPATH is wrong.
+    from django.core.management import execute_from_command_line
+    django.setup()
+    from django.conf import settings
+    print("django.setup() OK; ROOT_URLCONF=%s; INSTALLED_APPS_n=%d" % (settings.ROOT_URLCONF, len(settings.INSTALLED_APPS)))
+    sys.exit(0)
+except Exception:
+    traceback.print_exc()
+    sys.exit(2)
+PY
+)
+    if [ "$django_precheck_rc" -ne 0 ]; then
+      local dsm="${DJANGO_SETTINGS_MODULE:-<UNSET>}"
+      _die "\
+Django settings import PRECHECK FAILED (rc=$django_precheck_rc). BEFORE we even
+tried collectstatic/migrate we failed to run:
+    PYTHONPATH=$APP_DIR DJANGO_SETTINGS_MODULE=$dsm $APP_DIR/.venv/bin/python \
+      -c 'import django; django.setup()'
+
+This is the EXACT failure chain that produced the ModuleNotFoundError: No
+module named 'rasyaterp' traceback in your log. Root causes IN ORDER:
+
+  (1) DJANGO_SETTINGS_MODULE=$dsm does not match reality in repo.
+      Expected repo layout at APP_DIR=$APP_DIR is:
+        $APP_DIR/manage.py (exists OK)
+        $APP_DIR/${dsm%%.*}/__init__.py (PACKAGE DIR of the top-level settings module)
+        $APP_DIR/${dsm//./\/}.py (actual settings.py file)
+      If your package is not named '${dsm%%.*}' you need to pass an env override
+      to Option 4 (edit the env file at $ENV_FILE and set DJANGO_SETTINGS_MODULE
+      to e.g. 'myactualpackage.settings.production'). Debug with:
+        cd '$APP_DIR' && sudo -E '$APP_DIR/.venv/bin/python' manage.py check --settings=$dsm
+
+  (2) PYTHONPATH did not include APP_DIR at import time. We export it above,
+      but some NFS mounts / setcap(8) / AppArmor profiles can clear PYTHONPATH
+      for child processes. If the debug command below works but the installer
+      still dies here → add PYTHONPATH to your /etc/environment and rerun.
+
+  (3) The actual settings package $dsm has a broken import in __init__.py
+      (e.g. a third-party package listed in INSTALLED_APPS wasn't installed
+      because pip install -r requirements.txt partially failed). Run the
+      debug command and look for 2nd line of traceback (below rasyaterp line)
+      to find the ACTUAL missing module (could be something like 'storages'
+      or 'rest_framework' masked by import chain).
+
+FULL TRACEBACK FROM PROBE:
+$django_precheck_traceback
+
+COPY-PASTE DEBUG COMMANDS (run as root):
+  cd '$APP_DIR'
+  ls -la '$APP_DIR'
+  ls -la '$APP_DIR/${dsm%%.*}' 2>/dev/null || echo 'PACKAGE DIR ${dsm%%.*} NOT PRESENT -> fix DJANGO_SETTINGS_MODULE env var'
+  PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='$dsm' '$APP_DIR/.venv/bin/python' -c 'import django; django.setup(); from django.conf import settings; print(\"OK; STATIC_ROOT=\", settings.STATIC_ROOT)'
+"
+    fi
+    _ok "Django settings PRECHECK OK (PYTHONPATH=$APP_DIR; DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE; traceback clean)"
     set +e
     # collectstatic: first quiet attempt with spinner; if that fails re-run
     # noisily so user sees WHY it failed (STATIC_ROOT / permissions)
-    _run_with_spinner "manage.py collectstatic --noinput (scan static files)" bash -c "python manage.py collectstatic --noinput >/dev/null 2>&1"
+    _run_with_spinner "manage.py collectstatic --noinput (scan static files)" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py collectstatic --noinput >/dev/null 2>&1"
     local csrc=$?
     set -e
     if [ "$csrc" -ne 0 ]; then
       # Re-run noisily with a secondary spinner so progress still shown during long re-run
       _warn "collectstatic exited non-zero — re-running with full output for debugging:"
-      python manage.py collectstatic --noinput 2>&1 | tail -n 20 || true
+      (cd "$APP_DIR" && PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}" "$APP_DIR/.venv/bin/python" manage.py collectstatic --noinput 2>&1 | tail -n 20 || true)
       _warn "Continuing anyway — if STATIC_ROOT was unset or wrong path this is expected."
     else
       _ok "collectstatic ok"
     fi
-    _run_with_spinner "manage.py migrate (apply DB migrations)" bash -c "python manage.py migrate" || \
-      _die "manage.py migrate failed — most common causes: (1) DB credentials in $ENV_FILE wrong? (2) DB_USER missing CREATEDB / CONNECT on DB=$DB_NAME? (3) Wrong Python version in venv ($(python --version 2>&1) when Django 5 needs >= 3.10?)"
+    _run_with_spinner "manage.py migrate (apply DB migrations)" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py migrate" || \
+      _die "manage.py migrate FAILED (rc=$?). Full categorized causes IN ORDER:
+  (A) SETTINGS-IMPORT FAILURE (the #1 cause, this is the error we ran a precheck
+      probe for above — if you hit this, the probe above should have died first,
+      but if it slipped through, run: cd '$APP_DIR' && PYTHONPATH='$APP_DIR'
+      DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}'
+      '$APP_DIR/.venv/bin/python' -c 'import django; django.setup()' — full
+      traceback will show actual missing package / broken import).
+  (B) DB CONNECTION FAILURE (2nd most common). Env file loaded: $ENV_FILE.
+      Check: DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD set and match
+      what install_db (Option 3) created? SELECT 1 probe during prechecks
+      (terminal line near psql) should show if credentials work.
+  (C) DB PRIVILEGE FAILURE. CREATEDB missing? If DB_NAME did not exist and
+      Django tried to autocreate it (some settings configs do that), DB_USER
+      needs CREATEDB attribute: sudo -u postgres psql -c \"ALTER USER $DB_USER WITH CREATEDB;\"
+      Also CONNECT on database: sudo -u postgres psql -c \"REVOKE CONNECT ON DATABASE $DB_NAME FROM PUBLIC; GRANT CONNECT ON DATABASE $DB_NAME TO $DB_USER;\"
+  (D) MIGRATION FILES MISSING / BROKEN. Check APP_DIR/migrations/ or each app
+      migration dirs. Run: cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE:-$DJANGO_SETTINGS}' '$APP_DIR/.venv/bin/python' manage.py showmigrations
+  (E) PYTHON version mismatch. Venv python version: $("$APP_DIR/.venv/bin/python" -c 'import sys;print(sys.version)' 2>/dev/null). Django 5+ needs >= 3.10 and <= 3.13 (MAX_ALLOWED_PYTHON_MINOR=3.13 cap to avoid cpython-314 psycopg2 sdist crashes)."
   )
   _ok "Django migrate OK"
 
