@@ -292,6 +292,22 @@ _human_elapsed() {
   printf "%dh %02dm" $((secs/3600)) $(((secs%3600)/60))
 }
 
+# Safe label truncation (avoid bash arithmetic-syntax crashes from malformed
+# parameter-expansion chains like ${VAR:60:+...} which some bash versions try
+# to parse as arithmetic context, interpreting "..." dots as unknown operands).
+# Usage: _trunc_label "$string" 60 → first 60 chars + "..." when longer.
+_trunc_label() {
+  local s="$1" maxlen=$2
+  [ -z "${s:-}" ] && { printf ""; return 0; }
+  [ -z "${maxlen:-}" ] && maxlen=60
+  local curlen=${#s}
+  if [ "$curlen" -gt "$maxlen" ]; then
+    printf "%s..." "${s:0:$maxlen}"
+  else
+    printf "%s" "$s"
+  fi
+}
+
 # Usage: _run_with_spinner "Label" command [args...]
 #   Label — short single-line description shown next to spinner (no newlines!).
 #   command + args — the actual long-running command. Arguments are passed
@@ -891,7 +907,9 @@ precheck_app_prereqs() {
   else _nok "git binary not installed" || ((fail++)); fi
   if [ -z "${GIT_URL:-}" ]; then printf "\n"; GIT_URL=$(prompt_def "Git repository URL (to verify reachability)" "") || true; fi
   if [ -n "$GIT_URL" ] && command -v git >/dev/null 2>&1; then
-    if _run_with_spinner "Git ls-remote reachability probe (${GIT_URL:0:60}${GIT_URL:60:+...})" bash -c 'GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$1" >/dev/null 2>&1' _ "$GIT_URL"; then
+    local git_label=""
+    git_label=$(_trunc_label "$GIT_URL" 60)
+    if _run_with_spinner "Git ls-remote reachability probe (${git_label})" bash -c 'GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$1" >/dev/null 2>&1' _ "$GIT_URL"; then
       _ok "Git URL reachable (ls-remote returned heads)"
     else _nok "Git URL '$GIT_URL' not reachable (bad URL? need SSH key? private repo auth?)" || ((fail++)); fi
   else _warn "Skipping git URL probe (no URL / no git)"; fi
