@@ -3354,6 +3354,148 @@ FULL makemigrations reproduce (SINGLE LINE):
       fi
     fi
     set -e
+    # ── Pre-migrate SAFETY-1: AUTH_USER_MODEL probe. Classic Django bug #1: custom user model (AUTH_USER_MODEL !=
+    #    auth.User, e.g. AUTH_USER_MODEL='auth_app.User' → table 'auth_app_user') MUST have ITS OWN 0001 migration
+    #    applied BEFORE django.contrib.admin.0001_initial runs. Admin.0001 creates FK django_admin_log.user_id
+    #    REFERENCES auth_app_user(id). If auth_app's migration hasn't run yet we get:
+    #      ProgrammingError: relation "auth_app_user" does not exist
+    #    during admin.0001_initial — EXACTLY the crash in the user's banner (see showmigrations probe: auth_app
+    #    wasn't even listed because its 0001.py / migrations/__init__.py was missing from git).
+    # Steps: (1) Python probe reads settings.AUTH_USER_MODEL → split into app_label / model_name.
+    #        (2) If app_label != 'auth' (custom user) → run `manage.py migrate <app_label>` ALONE, FIRST,
+    #            BEFORE running the full `migrate` (with no args). This creates auth_app_user table so admin FK succeeds.
+    #        (3) If this single-app migrate FAILS: full 3-attempt retry banner for it, not swallow.
+    local aum_raw="" aum_app="" aum_model="" aum_db_table=""
+    aum_raw=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>/dev/null || true
+import os, sys
+try:
+    import django; django.setup()
+    from django.conf import settings
+    from django.apps import apps
+    aum = getattr(settings, "AUTH_USER_MODEL", "auth.User")
+    al, _, mn = aum.partition(".")
+    try:
+        mc = apps.get_model(al, mn, require_ready=False)
+        tbl = mc._meta.db_table
+    except Exception:
+        tbl = al.lower() + "_" + mn.lower()
+    print("APP=" + al + "\tMODEL=" + mn + "\tDB_TABLE=" + tbl)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+)
+    if [ -n "${aum_raw}" ]; then
+      aum_app=${aum_raw#*APP=}; aum_app=${aum_app%%$'\t'*}
+      aum_model=${aum_raw#*MODEL=}; aum_model=${aum_model%%$'\t'*}
+      aum_db_table=${aum_raw#*DB_TABLE=}
+    fi
+    if [ -n "${aum_app}" ] && [ "${aum_app}" != "auth" ]; then
+      _section "AUTH_USER_MODEL PRECHECK: custom user = '${aum_app}.${aum_model}' → table ${aum_db_table}. Running 'migrate ${aum_app}' SINGLE-APP FIRST BEFORE full migrate (prevents admin.0001 FK UndefinedTable)."
+      local aum_rc=0
+      local aum_cmd="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${aum_app}'"
+      _run_with_spinner "manage.py migrate ${aum_app} (custom user app FIRST, BEFORE full migrate — so ${aum_db_table} table exists for admin FK)" \
+        bash -c "$aum_cmd" || aum_rc=$?
+      if [ "$aum_rc" -ne 0 ]; then
+        # Single-app migrate failed (most likely: migration files for ${aum_app} DO NOT EXIST in repo / migrations/__init__.py missing).
+        # Immediately try the automatic makemigrations SPECIFICALLY for ${aum_app}, then retry the single migrate once.
+        _warn "First migrate ${aum_app} FAILED (rc=$aum_rc). Likely cause: ${aum_app}/migrations/0001_initial.py missing from repo (not committed / not yet generated). Auto-running: makemigrations ${aum_app} then retry migrate ${aum_app} once."
+        local mmk_aum_rc=0
+        _run_with_spinner "manage.py makemigrations ${aum_app} (generate missing 0001_initial.py for custom user app)" \
+          bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}'" || mmk_aum_rc=$?
+        if [ "$mmk_aum_rc" -eq 0 ]; then
+          _ok "makemigrations ${aum_app} SUCCESS — migration files written. Retrying migrate ${aum_app} once."
+          aum_rc=0
+          _run_with_spinner "manage.py migrate ${aum_app} (RETRY after auto-makemigrations)" bash -c "$aum_cmd" || aum_rc=$?
+        fi
+        if [ "$aum_rc" -ne 0 ]; then
+          # Still failing → full 3-attempt retry loop with evidence banner + prompt_edit_multiple.
+          local aum_att=0 aum_max=3 aum_ok=0 aum_frc=0
+          local aum_fresh="/tmp/rasyatone_aum_fresh_$$.tmp"
+          while [ "$aum_att" -lt "$aum_max" ] && [ "$aum_ok" -ne 1 ]; do
+            aum_att=$(( aum_att + 1 ))
+            aum_frc=0
+            _run_with_spinner "manage.py migrate ${aum_app} (attempt $aum_att/$aum_max — custom user app)" bash -c "$aum_cmd" || aum_frc=$?
+            if [ "$aum_frc" -eq 0 ]; then aum_ok=1; break; fi
+            # Full banner: exactly like migrate banner but specific to AUTH_USER_MODEL app.
+            local aum_tb=""
+            aum_tb=$( bash -c "$aum_cmd" 2>&1 | tail -n 80 || true )
+            printf '%s\n' "$aum_tb" > "$aum_fresh" 2>/dev/null || true
+            local aum_sho=""
+            aum_sho=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py showmigrations '${aum_app}'" 2>&1 | tail -n 40 || true )
+            printf "\n\033[1;31m=== migrate ${aum_app} (AUTH_USER_MODEL app) FAILED attempt $aum_att/$aum_max (rc=$aum_frc) — EVIDENCE ===\033[0m\n" >&2
+            printf "  \033[1;33m[EXACT CMD:]  \033[0m%s\n" "$aum_cmd" >&2
+            printf "  \033[1;33m[FRESH DIRECT TRACEBACK:]\033[0m\n" >&2
+            printf '%s\n' "$aum_tb" | sed 's#^#    #' >&2
+            printf "  \033[1;33m[showmigrations ${aum_app}:]\033[0m\n" >&2
+            printf '%s\n' "$aum_sho" | sed 's#^#    #' >&2
+            if [ "$aum_att" -lt "$aum_max" ]; then
+              prompt_edit_multiple \
+                "migrate ${aum_app} FAILED attempt $aum_att/$aum_max — edit fields then retry (the sentinel MAKEMIGRATIONS_APP=y will auto-run makemigrations ${aum_app} pre-retry):" \
+                "DJANGO_SETTINGS_MODULE MAKEMIGRATIONS_APP DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+                "Retry migrate ${aum_app} with edited values?" \
+                "y"
+              set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+              export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
+              local mmk_yn=${MAKEMIGRATIONS_APP:-y}
+              if [ "${mmk_yn}" = "y" ] || [ "${mmk_yn}" = "Y" ]; then
+                _run_with_spinner "(pre-retry) manage.py makemigrations --noinput ${aum_app}" bash -c \
+                  "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}'" || true
+              fi
+              aum_cmd="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${aum_app}'"
+            else
+              rm -f "$aum_fresh"
+              _die "\
+AUTH_USER_MODEL single-app migrate FAILED all $aum_max attempts for custom user app '${aum_app}' (last rc=$aum_frc).
+ROOT CAUSE SETS:
+  1. Migration files for ${aum_app} DO NOT EXIST in git-pushed repo: missing ${aum_app}/migrations/__init__.py (empty file required by Django migrations loader) OR no 0001_initial.py present → fix:
+       cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}'
+     then:
+       $aum_cmd
+  2. 0001_initial.py exists but references a dependency that itself isn't applied yet → add run_before = [('admin', '0001_initial')] inside class Migration(…) in ${aum_app}/migrations/0001_initial.py then re-run.
+  3. INSTALLED_APPS typo: '${aum_app}' misspelled in settings.py → showmigrations above would be empty for ${aum_app}.
+COPY-PASTE IMMEDIATE FIX:
+  cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${aum_app}' && \\
+  PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${aum_app}'
+FULL ENV:
+  PYTHONPATH=$APP_DIR
+  DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-<UNSET>}
+  AUTH_USER_MODEL=${aum_app}.${aum_model}
+  DB_TABLE=${aum_db_table}"
+            fi
+          done
+          rm -f "$aum_fresh"
+          if [ "$aum_ok" -eq 1 ]; then
+            _ok "manage.py migrate ${aum_app} SUCCESS (AUTH_USER_MODEL custom user table ${aum_db_table} now exists). Proceeding to full migrate (admin.0001 FK will resolve cleanly)."
+          fi
+        else
+          _ok "manage.py migrate ${aum_app} (custom user app) SUCCESS after auto-makemigrations retry. Proceeding to full migrate."
+        fi
+      else
+        _ok "AUTH_USER_MODEL precheck ok: migrate ${aum_app} (custom user app) applied cleanly; table ${aum_db_table} now exists — admin.0001 FK will resolve."
+      fi
+    fi
+    # ── Pre-migrate SAFETY-2: Parse showmigrations output for partially-applied contenttypes-only state (user's exact DB state:
+    #    contenttypes.0001 = [X] applied, every other app = [ ] NOT applied). This is ALWAYS the result of a prior migrate
+    #    run that crashed right after contenttypes.0001_initial but before anything else (the exact user's crash scenario on
+    #    attempt 1 with auth_app_user missing). If we detect this AND the user later gets ProgrammingError UndefinedTable,
+    #    we will auto-offer to fake-migrate apps that were actually applied out-of-band and continue.
+    local pm_partial_state=0
+    {
+      local _so_full
+      _so_full=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py showmigrations --list" 2>&1 || true )
+      local _applied_count
+      _applied_count=$(printf '%s\n' "$_so_full" | grep -c '\[X\]' 2>/dev/null || true)
+      local _contenttypes_line
+      _contenttypes_line=$(printf '%s\n' "$_so_full" | grep -n 'contenttypes' 2>/dev/null | head -n 1 || true)
+      if [ "$_applied_count" -eq 1 ] && printf '%s\n' "$_so_full" | grep -q '\[X\] 0001_initial' 2>/dev/null && printf '%s\n' "$_so_full" | grep -q '^contenttypes' 2>/dev/null; then
+        # Only 1 applied migration overall, it is contenttypes.0001_initial → classic partial migrate state.
+        pm_partial_state=1
+      fi
+    } 2>/dev/null || true
+    if [ "$pm_partial_state" -eq 1 ]; then
+      _warn "Detected PARTIALLY-APPLIED DB state: ONLY contenttypes.0001_initial = [X] applied (all other apps [ ]). This is ALWAYS a prior migrate that crashed mid-way. On next ProgrammingError UndefinedTable fail the retry banner will auto-offer to run makemigrations for the missing app_label referenced in the error and run single-app migrate first."
+    fi
     # ── migrate: wrapped in 3-attempt retry loop with prompt_edit_multiple + banner shows FRESH traceback on every fail ──
     # The user's EXACT issue: spinner failed with `ModuleNotFoundError: No module named 'rasyaterp'` but the old
     # banner only had static text causes list. This loop:
@@ -3405,9 +3547,48 @@ except Exception:
     sys.exit(2)
 PY
 )
-      # Part C: auto-run cause (D)'s manage.py showmigrations so user sees missing migration files.
-      local show_out=""
-      show_out=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py showmigrations" 2>&1 | tail -n 50 || true )
+      # Part C: auto-run cause (D)'s manage.py showmigrations — SHOW HEAD+TAIL (not just tail) because user's
+      # custom apps (like auth_app) appear FIRST in showmigrations output, before django built-ins.
+      # If auth_app is missing entirely (due to migrations/__init__.py missing or app not in INSTALLED_APPS),
+      # tail-only probe showed only celery/guardian/sessions and the user missed the root cause.
+      local show_out="" show_full="" show_head="" show_tail=""
+      show_full=$( bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py showmigrations" 2>&1 || true )
+      show_head=$(printf '%s\n' "$show_full" | head -n 40 || true)
+      show_tail=$(printf '%s\n' "$show_full" | tail -n 40 || true)
+      local sh_ln_ct
+      sh_ln_ct=$(printf '%s\n' "$show_full" | wc -l 2>/dev/null | tr -d ' ' || true)
+      if [ "${sh_ln_ct:-0}" -le 80 ]; then
+        show_out="$show_full"
+      else
+        show_out="(showmigrations total ${sh_ln_ct} lines — truncated to HEAD 40 + TAIL 40)\n--- HEAD (first 40 lines, custom apps show up FIRST — check for MISSING auth_app/your_user_app here):\n${show_head}\n--- TAIL (last 40 lines, django + 3rd-party apps):\n${show_tail}"
+      fi
+      # If AUTH_USER_MODEL custom user probe was run (aum_app set), explicitly grep for it in showmigrations so
+      # even if it's buried the user can see it present/missing instantly.
+      if [ -n "${aum_app:-}" ]; then
+        local show_aum_hits
+        show_aum_hits=$(printf '%s\n' "$show_full" | grep -n "^${aum_app}" 2>/dev/null || true)
+        if [ -z "${show_aum_hits}" ]; then
+          show_out="${show_out}\n--- AUTH_USER_MODEL APP '${aum_app}' (custom user = '${aum_app}.${aum_model}' → table ${aum_db_table}) — **NOT FOUND in showmigrations output!** This is ALWAYS the root cause of ProgrammingError relation ${aum_db_table} does not exist during admin.0001_initial FK creation. Fix: (1) ensure '${aum_app}' in INSTALLED_APPS; (2) mkdir -p ${aum_app}/migrations && touch ${aum_app}/migrations/__init__.py; (3) makemigrations --noinput ${aum_app}; (4) migrate ${aum_app}."
+        else
+          show_out="${show_out}\n--- AUTH_USER_MODEL APP '${aum_app}' FOUND in showmigrations lines:\n${show_aum_hits}"
+        fi
+      fi
+      # Part C2: auto-parse ProgrammingError UndefinedTable from fresh_tb → if "relation X does not exist", pull
+      # relation name and derive likely app_label by Django table naming convention (applabel_modelname or
+      # applabel_*). This lets us pre-populate the retry menu's MIGRATE_SPECIFIC_APP_FIRST field.
+      local undef_rel="" undef_app_guess=""
+      undef_rel=$( printf '%s\n' "$fresh_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
+      if [ -n "${undef_rel}" ]; then
+        # Relation name pattern: "auth_app_user" = app_label "auth_app" OR "app_modelname". Guess first two non-underscore segments joined, or first segment.
+        undef_app_guess=$(printf '%s' "$undef_rel" | awk -F'_' '{
+          if (NF >= 2) {
+            # Try: common pattern {app}_{model} → app_label = first segment. But custom multi-word app labels like
+            # "core_accounts_user" have app_label = "core_accounts" (first 2 segments joined by _). We can't know
+            # for sure, so emit both guesses separated by /, caller will offer both.
+            if (NF > 2) { print $1"_"$2"/"$1 } else { print $1 }
+          } else { print $0 }
+        }' 2>/dev/null || true)
+      fi
       # Part D: list EXACT env that was used for migrate bash -c (for env leak debugging: APP_DIR empty? DJANGO_SETTINGS_MODULE defaulted?).
       local venv_pv=""
       venv_pv=$("$APP_DIR/.venv/bin/python" -c 'import sys;print(sys.version)' 2>/dev/null || echo "UNKNOWN")
@@ -3424,23 +3605,69 @@ PY
       fi
       printf "  \033[1;33m[FRESH DIRECT traceback (migrate rerun OUTSIDE spinner, no redirection — should match actual error):]\033[0m\n" >&2
       printf '%s\n' "$fresh_tb" | sed 's#^#    #' >&2
+      if [ -n "${undef_rel}" ]; then
+        printf "  \033[1;35m[ProgrammingError UNDEFINEDTABLE DETECTED]: relation = '%s' → likely app_label guess = '%s'. This is a MISSING migration (table not created yet). See retry menu fields below for direct fix.\033[0m\n" "${undef_rel}" "${undef_app_guess}" >&2
+      fi
       printf "  \033[1;33m[Cause (A) PROBE: django.setup() standalone check rc=%d]:\033[0m\n" "$dsetup_rc" >&2
       printf '%s\n' "$dsetup_out" | sed 's#^#    #' >&2
-      printf "  \033[1;33m[Cause (D) PROBE: manage.py showmigrations tail]:\033[0m\n" >&2
-      printf '%s\n' "$show_out" | sed 's#^#    #' >&2
+      printf "  \033[1;33m[Cause (D) PROBE: manage.py showmigrations (HEAD+TAIL) — custom apps appear FIRST; check top for MISSING auth_app/your_user_app]:\033[0m\n" >&2
+      printf '%b\n' "$show_out" | sed 's#^#    #' >&2
       # Cleanup temp before next iteration / before retry prompt.
       rm -f "$mig_fresh_tmp" 2>/dev/null || true
       if [ "$mig_attempt" -lt "$mig_max" ]; then
-        # Retry menu: user can fix DB creds / DJANGO_SETTINGS_MODULE right here!
+        # Build sentinel field defaults for retry menu. These are READ DIRECTLY by the logic after prompt_edit_multiple:
+        #   MIGRATE_SPECIFIC_APP_FIRST  — if non-empty: run `makemigrations <app>` then `migrate <app>` SINGLE-APP BEFORE full migrate.
+        #                                 For UndefinedTable relation "auth_app_user" → default "auth_app".
+        #   MAKEMIGRATIONS_ALL_PENDING  — if "y": run `makemigrations --noinput` (no args = all apps) BEFORE retrying migrate.
+        #   FAKE_MIGRATE_PARTIAL        — if "y": for classic "contenttypes-only" partial-applied state → run fake migrations.
+        local default_app_first=""
+        if [ -n "${undef_app_guess}" ]; then
+          default_app_first="${undef_app_guess%%/*}"
+        elif [ -n "${aum_app:-}" ]; then
+          default_app_first="${aum_app}"
+        fi
+        local default_mmk_all="y"
+        if [ -n "${default_app_first}" ]; then default_mmk_all="n"; fi
+        local default_fake="n"
+        if [ "${pm_partial_state:-0}" -eq 1 ]; then default_fake="n"; fi
+        # Write sentinel fields into ENV_FILE so prompt_edit_multiple can pick them up with defaults.
+        if [ -n "${default_app_first}" ]; then echo "MIGRATE_SPECIFIC_APP_FIRST=${default_app_first}" >> "$ENV_FILE" 2>/dev/null || true; fi
+        echo "MAKEMIGRATIONS_ALL_PENDING=${default_mmk_all}" >> "$ENV_FILE" 2>/dev/null || true
+        echo "FAKE_MIGRATE_PARTIAL=${default_fake}" >> "$ENV_FILE" 2>/dev/null || true
         prompt_edit_multiple \
-          "manage.py migrate FAILED attempt $mig_attempt/$mig_max — edit a field to fix it before we retry:" \
-          "DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
+          "manage.py migrate FAILED attempt $mig_attempt/$mig_max — edit a field to fix it before we retry (fields 8-10 are the DIRECT fix for ProgrammingError/UndefinedTable/missing-migration bugs):" \
+          "DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR MIGRATE_SPECIFIC_APP_FIRST MAKEMIGRATIONS_ALL_PENDING FAKE_MIGRATE_PARTIAL" \
           "Retry manage.py migrate with (possibly edited) values NOW?" \
           "y"
         # Re-sync migrate command string + subshell env after edit menu wrote new values.
         set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
         export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
         mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate"
+        # ── Retry-menu SENTINEL ACTIONS (run PRE-retry of migrate, inside spinner so user sees progress) ──
+        # Sentinel 1: MAKEMIGRATIONS_ALL_PENDING=y → run makemigrations --noinput.
+        local mmk_all_yn=${MAKEMIGRATIONS_ALL_PENDING:-n}
+        if [ "${mmk_all_yn}" = "y" ] || [ "${mmk_all_yn}" = "Y" ]; then
+          _run_with_spinner "(pre-retry sentinel) manage.py makemigrations --noinput (create all pending migration files for all apps — fixes missing migration files root cause)" bash -c \
+            "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput" || true
+        fi
+        # Sentinel 2: MIGRATE_SPECIFIC_APP_FIRST non-empty → makemigrations <app> + migrate <app> SINGLE-APP FIRST.
+        local spec_app=${MIGRATE_SPECIFIC_APP_FIRST:-}
+        if [ -n "${spec_app}" ]; then
+          local _mmk_rc=0 _mig_rc=0
+          _run_with_spinner "(pre-retry sentinel) manage.py makemigrations --noinput ${spec_app}" bash -c \
+            "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput '${spec_app}'" || _mmk_rc=$?
+          _run_with_spinner "(pre-retry sentinel) manage.py migrate ${spec_app} (single-app migrate FIRST — creates ${spec_app} tables before full migrate)" bash -c \
+            "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate '${spec_app}'" || _mig_rc=$?
+          if [ "$_mig_rc" -eq 0 ] && [ "$_mmk_rc" -eq 0 ]; then
+            _ok "Sentinel migrate ${spec_app} OK — ${spec_app} tables now exist. Full migrate retry will now cleanly resolve FK references."
+          fi
+        fi
+        # Sentinel 3: FAKE_MIGRATE_PARTIAL=y → fake-apply all 0001/0002 migrations that are already actually in DB.
+        local fake_yn=${FAKE_MIGRATE_PARTIAL:-n}
+        if [ "${fake_yn}" = "y" ] || [ "${fake_yn}" = "Y" ]; then
+          _run_with_spinner "(pre-retry sentinel) manage.py migrate --fake-initial (classic partial-state fix: if migration already applied to DB, mark them in django_migrations without re-running CREATE TABLE)" bash -c \
+            "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate --fake-initial" || true
+        fi
       else
         # 3rd and final fail: hard die with the categorized list + evidence summary so user has it for copy-paste.
         _die "\
@@ -3491,6 +3718,31 @@ Full categorized causes IN ORDER (matching the numbered evidence blocks above):
         (1) The git-pushed migration files themselves have syntax errors / Raise / RunPython bugs → run makemigrations standalone debug command.
         (2) Conflicting migration names (two 0001_initial.py from different branches) → auto --merge ran but may need manual intervention: cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --merge
         (3) Custom app_config.ready() in INSTALLED_APPS that modifies ORM state at import-time before migrations loader can read migrations dirs → inspect traceback above for app.ready.
+
+  (H) **ProgrammingError UndefinedTable during admin.0001_initial — relation auth_app_user does not exist (THE EXACT CRASH).
+      YOUR BANNER EVIDENCE WALKTHROUGH — 100% reproducible:
+        (1) FRESH DIRECT traceback ends with: django.db.utils.ProgrammingError: relation =auth_app_user does not exist
+            while Applying admin.0001_initial (or another app with FK to custom user).
+        (2) Cause (D) PROBE showmigrations (HEAD + explicit grep): AUTH_USER_MODEL APP =auth_app= NOT FOUND in showmigrations (no app label line at all) — this is the SMOKING GUN.
+        (3) Cause (A) django.setup() PROBE = rc=0 OK (RED HERRING! django.setup() never imports migrations loader or URLconfs — so never sees the missing table till migrate's check phase runs urlconf → views → ForeignKey resolution).
+        (4) Pre-migrate SAFETY-2 state detection banner printed: ONLY contenttypes.0001_initial = [X] applied = partial applied state from the run before crash at admin.0001 FK creation.
+      ROOT CAUSE TRIPLE WHAMMY (one or all present):
+        (H.1) MISSING migrations/__init__.py package marker in the custom user app directory. Django migrations loader REQUIRES app/migrations/__init__.py (even if ZERO BYTES EMPTY) — it is the Python package marker; without it showmigrations does not list the app at all even though it IS in INSTALLED_APPS. The INSTALLED_APPS line reads the app config fine, but migrations loader sees no migrations/ package so skips.
+        (H.2) 0001_initial.py NEVER COMMITTED to git. Dev ran makemigrations locally producing 0001_initial.py with CreateModel auth_app_user but forgot git add auth_app/migrations/*.py → repo clone has 0 files.
+        (H.3) DEPENDENCY ORDERING BUG. Even if (H.1)+(H.2) are OK → Django migration resolver applies admin.0001 BEFORE auth_app.0001 if auth_app's class Migration: does not declare run_before = [('admin', '0001_initial')]. Classic Django trap #1 for custom user models.
+      COPY-PASTE STEP-BY-STEP FIX (in order, stop on first non-zero rc):
+        1. ENSURE migrations/__init__.py EXISTS (ZERO BYTES EMPTY OK — required Python package marker):
+           mkdir -p '$APP_DIR/auth_app/migrations' && touch '$APP_DIR/auth_app/migrations/__init__.py'
+        2. CREATE 0001_initial.py for auth_app:
+           cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --noinput auth_app
+        3. RUN SINGLE-APP MIGRATE auth_app FIRST (creates table auth_app_user BEFORE admin.0001 FK REFERENCES it):
+           cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate auth_app
+        4. FINALLY RUN FULL MIGRATE:
+           $mig_cmd_fresh
+      PREVENTION: Installer now runs a 2-layer pre-migrate safety net BEFORE the 3-attempt migrate loop:
+        (SAFETY-1) AUTH_USER_MODEL probe right before migrate loop: reads settings.AUTH_USER_MODEL. If app label != auth (custom user), runs migrate=SINGLE-APP FIRST with auto-makemigrations fallback if migration files missing, then full 3-attempt retry banner for just the user app if that fails.
+        (SAFETY-2) PARTIAL-APPLIED STATE detection: only contenttypes.0001 = [X] applied. This is always the result of a previous run that crashed at admin.0001 FK creation. On next fail the retry menu sentinel fields are pre-populated correctly.
+        (SAFETY-3) RETRY MENU FIELDS 8-10: MIGRATE_SPECIFIC_APP_FIRST (auto-populated =auth_app= by parsing UndefinedTable relation name in traceback), MAKEMIGRATIONS_ALL_PENDING (default y if no app_first, else n), FAKE_MIGRATE_PARTIAL for --fake-initial. All fixable DIRECTLY in-menu. No exit required.
 
 COPY-PASTE REPRODUCE (SINGLE LINE):
   $mig_cmd_fresh
