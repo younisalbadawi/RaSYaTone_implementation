@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0400-env-sanitizer-paren-fix"
+SCRIPT_VERSION_BUILD="2026-08-06T0500-quoted-circular-sentinel-stderr-fix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -61,6 +61,11 @@ if [ -n "${ENV_FILE:-}" ] && [ -f "${ENV_FILE}" ] && [ -r "${ENV_FILE}" ] && [ -
         CIRCULAR_APPS=*|CIRCULAR_APPLY_2STEP=*)
           _early_k="${_early_line%%=*}"
           _early_v="${_early_line#*=}"
+          # Strip surrounding SINGLE or DOUBLE quotes if present (both accepted on read).
+          case "$_early_v" in
+            "'"*"'") _early_v="${_early_v#\'}"; _early_v="${_early_v%\'}" ;;
+            '"'*'"') _early_v="${_early_v#\"}"; _early_v="${_early_v%\"}" ;;
+          esac
           _early_ok=0
           if [ "$_early_k" = "CIRCULAR_APPS" ]; then
             if [ -z "$_early_v" ]; then _early_ok=1
@@ -71,11 +76,21 @@ if [ -n "${ENV_FILE:-}" ] && [ -f "${ENV_FILE}" ] && [ -r "${ENV_FILE}" ] && [ -
             case "$_early_v" in y|Y|n|N|'') _early_ok=1 ;; *) _early_ok=0 ;; esac
           fi
           if [ "$_early_ok" -eq 1 ]; then
-            printf '%s\n' "$_early_line" >> "$_early_san_tmp"
+            # Write with SINGLE-QUOTED value (Bash source requires spaces in value quoted).
+            case "$_early_k" in
+              CIRCULAR_APPS)         printf 'CIRCULAR_APPS='\''%s'\''\n' "$_early_v" >> "$_early_san_tmp" ;;
+              CIRCULAR_APPLY_2STEP)  printf 'CIRCULAR_APPLY_2STEP='\''%s'\''\n' "$_early_v" >> "$_early_san_tmp" ;;
+            esac
+            # Detect rewrite even if only quoting style changed (valid but unquoted → quoted).
+            case "$_early_line" in
+              "CIRCULAR_APPS='"*"'")  : already quoted correctly ;;
+              "CIRCULAR_APPLY_2STEP='"*"'") : already quoted correctly ;;
+              *) _early_changed=1 ;;
+            esac
           else
             case "$_early_k" in
-              CIRCULAR_APPS) printf 'CIRCULAR_APPS=\n' >> "$_early_san_tmp" ;;
-              CIRCULAR_APPLY_2STEP) printf 'CIRCULAR_APPLY_2STEP=n\n' >> "$_early_san_tmp" ;;
+              CIRCULAR_APPS)         printf 'CIRCULAR_APPS='\'''\''\n' >> "$_early_san_tmp" ;;
+              CIRCULAR_APPLY_2STEP)  printf 'CIRCULAR_APPLY_2STEP='\''n'\''\n' >> "$_early_san_tmp" ;;
             esac
             _early_changed=1
           fi
@@ -86,7 +101,7 @@ if [ -n "${ENV_FILE:-}" ] && [ -f "${ENV_FILE}" ] && [ -r "${ENV_FILE}" ] && [ -
     if [ "$_early_changed" -eq 1 ]; then
       chmod --reference="$ENV_FILE" "$_early_san_tmp" 2>/dev/null || true
       mv -f "$_early_san_tmp" "$ENV_FILE" 2>/dev/null || { cat "$_early_san_tmp" > "$ENV_FILE"; rm -f "$_early_san_tmp"; }
-      printf "\033[1;33m[WARN] EARLY BOOT ENV SANITIZER: removed invalid CIRCULAR_* sentinel entries from %s (open-paren/garbage caused bash source syntax error). Rewritten to valid empty defaults. Next sourcing will succeed.\033[0m\n" "$ENV_FILE" >&2
+      printf "\033[1;33m[WARN] EARLY BOOT ENV SANITIZER: removed invalid CIRCULAR_* sentinel entries from %s (open-paren/garbage caused bash source syntax error). Rewritten to valid empty quoted defaults. Next sourcing will succeed.\033[0m\n" "$ENV_FILE" >&2
     else
       rm -f "$_early_san_tmp"
     fi
@@ -386,22 +401,13 @@ _resolve_circular_dep() {
   [ -z "${_rcd_venv_py}" ] || [ ! -x "${_rcd_venv_py}" ] && return 0
   local _rcd_base_env="cd '${_rcd_app_dir}' && PYTHONPATH='${_rcd_app_dir}' DJANGO_SETTINGS_MODULE='${_rcd_settings}' '${_rcd_venv_py}'"
   local _rcd_out="" _rcd_rc=0
-  _rcd_out=$( PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - <<'PY' 2>&1 || true
+  set +e
+  _rcd_out=$( PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - <<'PY'
 import os, sys
 try:
     import django; django.setup()
     from django.db.migrations.loader import MigrationLoader
     from django.db.migrations.exceptions import CircularDependencyError
-    # PRIMARY LOADER — use None for connection (EXACTLY as Django's own makemigrations.py:140
-    # does in user traceback: `MigrationLoader(None, ignore_no_migrations=True)`). This
-    # means NO DB CONNECTION REQUIRED — migration graph is built 100% from files on disk
-    # (INSTALLED_APPS migrations dirs). This works even when:
-    #   (a) DB does not exist yet (fresh install, first migrations ever)
-    #   (b) DB_HOST / DB_PASSWORD wrong
-    #   (c) PostgreSQL not started / socket missing
-    # ALL of which cause `connections["default"]` → OperationalError → GRAPH_CHECK_SKIP
-    # (old bug) → cycle not detected → dep chain makemigrations auth_app crashes with
-    # CircularDependencyError because it ALSO uses this None-connection loader.
     try:
         loader = MigrationLoader(None, ignore_no_migrations=True)
         print("GRAPH_OK")
@@ -444,8 +450,7 @@ except CircularDependencyError as e:
     else:
         print("CIRCULAR_PARSE_FAIL:%s" % raw)
     sys.exit(2)
-except Exception as ex:
-    # Fallback: try connection-based loader (legacy, for edge cases).
+except Exception:
     try:
         from django.db import connections
         from django.db.migrations.loader import MigrationLoader
@@ -473,12 +478,20 @@ except Exception as ex:
         else:
             print("CIRCULAR_PARSE_FAIL:%s" % raw)
         sys.exit(2)
-    except Exception:
-        print("GRAPH_CHECK_SKIP:%s" % type(ex).__name__)
+    except Exception as ex2:
+        print("GRAPH_CHECK_SKIP:%s" % type(ex2).__name__)
         sys.exit(3)
 PY
 )
   _rcd_rc=$?
+  set -e
+  # ── CRITICAL: extract LAST non-empty line ONLY from stdout (ignore python warnings mixed in). ──
+  #   Python startup warnings (DeprecationWarning, urllib3 InsecurePlatformWarning etc.) go to stdout
+  #   and make the whole string NOT match the CIRCULAR:* / GRAPH_OK glob. Filtering the final line from
+  #   stdout guarantees we only parse the sentinel output written by Python last print().
+  if [ -n "${_rcd_out}" ]; then
+    _rcd_out=$(printf '%s\n' "$_rcd_out" | grep -vE '^[[:space:]]*$' | tail -n 1 || true)
+  fi
   local _pa="" _pb=""
   case "$_rcd_out" in
     CIRCULAR:*|CIRCULAR:*)
@@ -488,11 +501,14 @@ PY
   esac
   if [ -z "$_pa" ] || [ -z "$_pb" ] || [ ! -d "${_rcd_app_dir}/$_pa" ] || [ ! -d "${_rcd_app_dir}/$_pb" ]; then
     # No cycle detected OR unreadable check.
-    if printf '%s' "$_rcd_out" | grep -qE '^GRAPH_OK$|^GRAPH_OK_FALLBACK_CONN$'; then
-      _ok "[$_rcd_label] Django migration graph OK: no CircularDependencyError (all Migration.dependencies form a valid DAG)."
-    else
-      _info "[$_rcd_label] Django migration graph check skipped (output=$_rcd_out rc=$_rcd_rc). Safe no-op; cycle will be caught by migrate banners if exists."
-    fi
+    case "$_rcd_out" in
+      GRAPH_OK|GRAPH_OK_FALLBACK_CONN)
+        _ok "[$_rcd_label] Django migration graph OK: no CircularDependencyError (all Migration.dependencies form a valid DAG)."
+        ;;
+      *)
+        _info "[$_rcd_label] Django migration graph check skipped (output=$_rcd_out rc=$_rcd_rc). Safe no-op; cycle will be caught by migrate banners if exists."
+        ;;
+    esac
     return 0
   fi
   # Cycle detected. Run 2-step split.
@@ -609,7 +625,6 @@ _sanitize_env_file_circular_sentinels() {
   local _s_k="" _s_v="" _s_changed=0
   local _s_valid_ca=1
   while IFS= read -r _s_line || [ -n "${_s_line}" ]; do
-    # Skip comment lines, empty lines, export lines not containing "=".
     case "$_s_line" in
       ''|\#*) printf '%s\n' "$_s_line" >> "$_s_tmp"; continue ;;
     esac
@@ -617,9 +632,12 @@ _sanitize_env_file_circular_sentinels() {
       CIRCULAR_APPS=*|CIRCULAR_APPLY_2STEP=*)
         _s_k="${_s_line%%=*}"
         _s_v="${_s_line#*=}"
+        case "$_s_v" in
+          "'"*"'") _s_v="${_s_v#\'}"; _s_v="${_s_v%\'}" ;;
+          '"'*'"') _s_v="${_s_v#\"}"; _s_v="${_s_v%\"}" ;;
+        esac
         _s_valid_ca=0
         if [ "$_s_k" = "CIRCULAR_APPS" ]; then
-          # Valid: empty OR exactly two POSIX words separated by exactly one single space.
           if [ -z "$_s_v" ]; then
             _s_valid_ca=1
           elif printf '%s' "$_s_v" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]* [a-zA-Z_][a-zA-Z0-9_]*$'; then
@@ -631,12 +649,19 @@ _sanitize_env_file_circular_sentinels() {
           case "$_s_v" in y|Y|n|N|'') _s_valid_ca=1 ;; *) _s_valid_ca=0 ;; esac
         fi
         if [ "$_s_valid_ca" -eq 1 ]; then
-          printf '%s\n' "$_s_line" >> "$_s_tmp"
-        else
-          # Invalid: replace with valid empty default so next source succeeds.
           case "$_s_k" in
-            CIRCULAR_APPS) printf 'CIRCULAR_APPS=\n' >> "$_s_tmp" ;;
-            CIRCULAR_APPLY_2STEP) printf 'CIRCULAR_APPLY_2STEP=n\n' >> "$_s_tmp" ;;
+            CIRCULAR_APPS)         printf 'CIRCULAR_APPS='\''%s'\''\n' "$_s_v" >> "$_s_tmp" ;;
+            CIRCULAR_APPLY_2STEP)  printf 'CIRCULAR_APPLY_2STEP='\''%s'\''\n' "$_s_v" >> "$_s_tmp" ;;
+          esac
+          case "$_s_line" in
+            "CIRCULAR_APPS='"*"'")  : ;;
+            "CIRCULAR_APPLY_2STEP='"*"'") : ;;
+            *) _s_changed=1 ;;
+          esac
+        else
+          case "$_s_k" in
+            CIRCULAR_APPS)         printf 'CIRCULAR_APPS='\'''\''\n' >> "$_s_tmp" ;;
+            CIRCULAR_APPLY_2STEP)  printf 'CIRCULAR_APPLY_2STEP='\''n'\''\n' >> "$_s_tmp" ;;
           esac
           _s_changed=1
         fi
@@ -645,10 +670,9 @@ _sanitize_env_file_circular_sentinels() {
     esac
   done < "$_s_ef"
   if [ "$_s_changed" -eq 1 ]; then
-    # Atomic replace (mv preserves permissions if in same fs).
     chmod --reference="$_s_ef" "$_s_tmp" 2>/dev/null || true
     mv -f "$_s_tmp" "$_s_ef" 2>/dev/null || { cat "$_s_tmp" > "$_s_ef"; rm -f "$_s_tmp"; }
-    _warn "ENV_FILE sanitized: removed invalid CIRCULAR_* sentinel entries (last run wrote garbage with open paren/colon to env file → caused bash source syntax error). Entries rewritten to valid empty defaults."
+    _warn "ENV_FILE sanitized: removed invalid CIRCULAR_* sentinel entries (last run wrote unquoted/garbage entries → bash source syntax error or empty readback). Entries rewritten to valid single-quoted defaults."
   else
     rm -f "$_s_tmp"
   fi
@@ -4477,16 +4501,15 @@ PY
                 _valid_ca=$(_validate_circular_apps_value "${_circ_apps}" || true)
                 grep -q "^CIRCULAR_APPS=" "$ENV_FILE" 2>/dev/null && sed -i "/^CIRCULAR_APPS=/d" "$ENV_FILE" 2>/dev/null || true
                 if [ -n "${_valid_ca}" ]; then
-                  echo "CIRCULAR_APPS=${_valid_ca}" >> "$ENV_FILE" 2>/dev/null || true
-                  grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=y" >> "$ENV_FILE" 2>/dev/null || true
+                  echo "CIRCULAR_APPS='${_valid_ca}'" >> "$ENV_FILE" 2>/dev/null || true
+                  grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP='y'" >> "$ENV_FILE" 2>/dev/null || true
                 else
-                  # _circ_apps contains garbage characters (Bash regex source line 'raise CircularDependencyError(' picked last run) → write EMPTY defaults.
-                  echo "CIRCULAR_APPS=" >> "$ENV_FILE" 2>/dev/null || true
-                  grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=n" >> "$ENV_FILE" 2>/dev/null || true
+                  echo "CIRCULAR_APPS=''" >> "$ENV_FILE" 2>/dev/null || true
+                  grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP='n'" >> "$ENV_FILE" 2>/dev/null || true
                 fi
               else
-                grep -q "^CIRCULAR_APPS=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPS=" >> "$ENV_FILE" 2>/dev/null || true
-                grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=n" >> "$ENV_FILE" 2>/dev/null || true
+                grep -q "^CIRCULAR_APPS=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPS=''" >> "$ENV_FILE" 2>/dev/null || true
+                grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP='n'" >> "$ENV_FILE" 2>/dev/null || true
               fi
             } || true
             prompt_edit_multiple \
@@ -4500,7 +4523,9 @@ PY
             # ── CAUSE (I): CIRCULAR_APPLY_2STEP sentinel = y → run the 2-step split auto-fix. ──
             local circ_do="${CIRCULAR_APPLY_2STEP:-n}"
             local circ_apps="${CIRCULAR_APPS:-}"
-            if [ "${circ_do}" = "y" ] || [ "${circ_do}" = "Y" ] && [ -n "${circ_apps}" ]; then
+            circ_do="${circ_do#\'}"; circ_do="${circ_do%\'}"; circ_do="${circ_do#\"}"; circ_do="${circ_do%\"}"
+            circ_apps="${circ_apps#\'}"; circ_apps="${circ_apps%\'}"; circ_apps="${circ_apps#\"}"; circ_apps="${circ_apps%\"}"
+            if { [ "${circ_do}" = "y" ] || [ "${circ_do}" = "Y" ]; } && [ -n "${circ_apps}" ]; then
               _section "CAUSE (I) AUTO-FIX: CircularDependencyError detected (CIRCULAR_APPS=${circ_apps}). Running 2-step split auto-resolver."
               _info "Calling reusable circular dep resolver (labeled 'cause-i-menu'). Backup dir: /tmp/rasyatone_cause-i-menu_circular_backup_$$/"
               set +e
