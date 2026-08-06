@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1230-delete-orphan-find"
+SCRIPT_VERSION_BUILD="2026-08-06T1300-undefinedcolumn-heal"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -856,6 +856,49 @@ PY
       fi
     fi
     if [ -z "${_rma_rel}" ]; then
+      local _rma_uc_line=""
+      _rma_uc_line="$( printf '%s' "${_rma_tail}" | grep -E 'UndefinedColumn|django\.db\.utils\.ProgrammingError: column|psycopg2\.errors\.UndefinedColumn' 2>/dev/null | head -n 1 || true )"
+      if [ -z "${_rma_uc_line}" ]; then
+        _rma_uc_line="$( grep -E 'UndefinedColumn|django\.db\.utils\.ProgrammingError: column|psycopg2\.errors\.UndefinedColumn' "${_rma_tb_log}" 2>/dev/null | head -n 1 || true )"
+      fi
+      if [ -n "${_rma_uc_line}" ]; then
+        local _rma_apps_line=""
+        local _rma_apps=""
+        _rma_apps_line="$( grep -oE \"Your models in app\\(s\\):[^\\n]+\" \"${_rma_tb_log}\" 2>/dev/null | head -n 1 || true )"
+        if [ -n \"${_rma_apps_line}\" ]; then
+          _rma_apps=\"$( printf '%s' \"${_rma_apps_line}\" | grep -oE \"'[a-zA-Z0-9_]+'\" 2>/dev/null | sed -E \"s/^'//; s/'$//\" | tr '\\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )\"
+        fi
+        if [ -z \"${_rma_apps}\" ]; then
+          _rma_apps=\"${_rma_label:-}\"
+        fi
+        local _rma_fix_list=\"\"
+        local _ra
+        for _ra in ${_rma_apps}; do
+          [ -z \"${_ra}\" ] && continue
+          if [ -z \"${_rma_fix_list}\" ]; then
+            _rma_fix_list=\"${_ra}\"
+          elif [[ \" ${_rma_fix_list} \" == *\" ${_ra} \"* ]]; then
+            continue
+          else
+            _rma_fix_list=\"${_rma_fix_list} ${_ra}\"
+          fi
+        done
+        if [ -z \"${_rma_fix_list}\" ]; then
+          _info \"UndefinedTable autoheal round ${_rma_round}: UndefinedColumn detected but could not infer any app labels to heal. Falling back.\"
+          return \"$_rma_rc\"
+        fi
+        _warn \"UndefinedTable autoheal round ${_rma_round}: UndefinedColumn detected (schema drift; migrations missing/outdated). Auto-running makemigrations+migrate for: [${_rma_fix_list}].\"
+        local _rf
+        for _rf in ${_rma_fix_list}; do
+          set +e
+          _run_with_spinner \"(autoheal r${_rma_round} → makemig '${_rf}' for UndefinedColumn) manage.py makemigrations --noinput '${_rf}'\" bash -c \
+            \"${_rma_base_env} manage.py makemigrations --noinput '${_rf}'\" || true
+          _run_migrate_autoheal \"${_rma_app_dir}\" \"${_rma_settings}\" \"${_rma_venv_py}\" \"${_rma_base_env}\" \"${_rf}\" || true
+          set -e
+        done
+        _rma_round=$(( _rma_round + 1 ))
+        continue
+      fi
       _info "UndefinedTable autoheal round ${_rma_round}: opened newest migrate log (${_rma_tb_log}, tail=${_rma_tail_bytes}b) — NO 'relation X does not exist' or NodeNotFoundError pattern match. Different error category (password/connection/circular-dep/schema). Cannot auto-heal via UndefinedTable/NodeNotFound path; return rc=${_rma_rc} so retry banner handles other classes."
       return "$_rma_rc"
     fi
@@ -4851,6 +4894,53 @@ PY
           done
           _dyn_queue="${_dyn_queue_clean}"
           continue
+        fi
+        local _dyn_uc=""
+        _dyn_uc="$( printf '%s\n' "$_dyn_tb" | grep -E 'UndefinedColumn|django\.db\.utils\.ProgrammingError: column|psycopg2\.errors\.UndefinedColumn' 2>/dev/null | head -n 1 || true )"
+        if [ -n "${_dyn_uc}" ]; then
+          local _dyn_apps_line="" _dyn_apps_raw="" _dyn_apps_list="" _a2=""
+          _dyn_apps_line="$( printf '%s\n' "$_dyn_tb" | grep -oE "Your models in app\\(s\\):[^\n]+" 2>/dev/null | head -n 1 || true )"
+          if [ -n "${_dyn_apps_line}" ]; then
+            _dyn_apps_raw="$( printf '%s' "${_dyn_apps_line}" | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | sed -E "s/^'//; s/'$//" | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
+          fi
+          if [ -z "${_dyn_apps_raw}" ]; then
+            _dyn_apps_raw="${_dyn_next}"
+          fi
+          for _a2 in ${_dyn_apps_raw}; do
+            [ -z "${_a2}" ] && continue
+            if [ -n "${_dyn_known_apps}" ] && [[ " ${_dyn_known_apps} " != *" ${_a2} "* ]]; then
+              continue
+            fi
+            if [ -z "${_dyn_apps_list}" ]; then
+              _dyn_apps_list="${_a2}"
+            elif [[ " ${_dyn_apps_list} " == *" ${_a2} "* ]]; then
+              continue
+            else
+              _dyn_apps_list="${_dyn_apps_list} ${_a2}"
+            fi
+          done
+          if [ -n "${_dyn_apps_list}" ]; then
+            _warn "migrate ${_dyn_next} FAILED: UndefinedColumn detected (schema drift; migrations missing/outdated). Auto-running makemigrations for: [${_dyn_apps_list}] then retrying via queue."
+            local _pref="" _a3=""
+            for _a3 in ${_dyn_apps_list}; do
+              set +e
+              _run_with_spinner "manage.py makemigrations ${_a3} (autoheal — UndefinedColumn)" bash -c \
+                "${_dyn_base_env} manage.py makemigrations --noinput '${_a3}'" || true
+              set -e
+              if [ "${_a3}" != "${_dyn_next}" ]; then
+                local _seen=0 _t
+                for _t in $_dyn_queue; do [ "$_t" = "${_a3}" ] && _seen=1; done
+                for _t in $_dyn_applied; do [ "$_t" = "${_a3}" ] && _seen=2; done
+                if [ "$_seen" -eq 0 ]; then
+                  [ -z "${_pref}" ] && _pref="${_a3}" || _pref="${_pref} ${_a3}"
+                fi
+              fi
+            done
+            if [ -n "${_pref}" ]; then
+              _dyn_queue="${_pref} ${_dyn_next} ${_dyn_rest}"
+            fi
+            continue
+          fi
         fi
         _dyn_rel=$( printf '%s\n' "$_dyn_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
         if [ -z "${_dyn_rel}" ]; then
