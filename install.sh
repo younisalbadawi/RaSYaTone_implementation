@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0800-verbose-probe-no-2devnull"
+SCRIPT_VERSION_BUILD="2026-08-06T0830-percent-b-format-nl-escapes"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -123,11 +123,11 @@ MIN_PYTHON_MINOR=10
 declare -g PYTHON_BIN=""
 
 # --- tiny helpers -----------------------------------------------------------
-_ok()   { printf "  \033[92m[ OK ]\033[0m %s\n" "$*"; }
-_nok()  { printf "  \033[91m[FAIL]\033[0m %s\n" "$*"; return 1; }
-_warn() { printf "  \033[93m[WARN]\033[0m %s\n" "$*"; }
+_ok()   { printf "  \033[92m[ OK ]\033[0m %b\n" "$*"; }
+_nok()  { printf "  \033[91m[FAIL]\033[0m %b\n" "$*"; return 1; }
+_warn() { printf "  \033[93m[WARN]\033[0m %b\n" "$*"; }
 _info() { local fmt="$1"; shift; printf "  \033[96m[INFO]\033[0m ${fmt}\n" "$@"; }
-_die()  { printf "\n\033[91mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
+_die()  { printf "\n\033[91mERROR:\033[0m %b\n" "$*" >&2; exit 1; }
 _section(){ printf "\n\033[1;97m=== %s ===\033[0m\n" "$*"; }
 
 # Dynamic CREATE ROLE + CREATE DATABASE + SELECT 1 one-shot auto-fixer for when psql credential test crashes
