@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1330-undefinedcolumn-syntaxfix"
+SCRIPT_VERSION_BUILD="2026-08-06T1400-undefinedcolumn-eof-fix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -866,7 +866,7 @@ PY
         local _rma_apps=""
         _rma_apps_line="$( grep -oE "Your models in app\\(s\\):.*" "${_rma_tb_log}" 2>/dev/null | head -n 1 || true )"
         if [ -n "${_rma_apps_line}" ]; then
-          _rma_apps="$( printf '%s' "${_rma_apps_line}" | grep -oE \"'[a-zA-Z0-9_]+'\" 2>/dev/null | tr -d \"'\" | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
+          _rma_apps="$( printf '%s' "${_rma_apps_line}" | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | tr -d "'" | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
         fi
         if [ -z "${_rma_apps}" ]; then
           _rma_apps="${_rma_label:-}"
