@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1130-stop-no-progress-retries"
+SCRIPT_VERSION_BUILD="2026-08-06T1200-delete-orphan-first"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -780,43 +780,63 @@ _run_migrate_autoheal() {
         _info "UndefinedTable autoheal round ${_rma_round}: graph NodeNotFoundError detected. Referencer='${_rma_node_referencer}' missing_parent_app='${_rma_node_missing_app}'. Auto-healing missing app first."
         local _rma_self_node=0
         local _rma_deleted_orphan=0
-        # Sanity: if the "missing parent" is the SAME app we are already trying to migrate, recursive autoheal would
-        # just call itself again without changing state. Skip recursive self-call; orphan cleanup below may still fix graph.
-        if [ -n "${_rma_label}" ] && [ "${_rma_node_missing_app}" = "${_rma_label}" ]; then
-          _rma_self_node=1
-          _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError missing parent '${_rma_node_missing_app}' IS the current migrate target. Skipping recursive self-heal to avoid endless same-label recursion; will rely on orphan cleanup + next bounded retry."
-        else
-        # First: try makemigrations + migrate the missing parent app directly via autoheal (recursive).
-          set +e
-          _run_with_spinner "(autoheal r${_rma_round} → makemig missing parent '${_rma_node_missing_app}') manage.py makemigrations --noinput '${_rma_node_missing_app}'" bash -c \
-            "${_rma_base_env} manage.py makemigrations --noinput '${_rma_node_missing_app}'" || true
-          _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rma_node_missing_app}" || true
-          set -e
-        fi
-        # FALLBACK: if the referencer migration is a half-generated PARTIAL (0002+ with missing dependency from interrupted prior run)
-        # and is NOT applied in DB (no [X] line), deleting it is safe — Django will regenerate cleanly on next makemigrations all.
         local _ref_app="" _ref_name=""
         if [[ "${_rma_node_referencer}" == *.* ]]; then
           _ref_app="${_rma_node_referencer%%.*}"
           _ref_name="${_rma_node_referencer#*.}"
         fi
         if [ -n "${_ref_app}" ] && [ -n "${_ref_name}" ]; then
-          local _ref_file="${_rma_app_dir}/${_ref_app}/migrations/${_ref_name}.py"
-          if [ -f "${_ref_file}" ]; then
+          local _ref_file1="${_rma_app_dir}/${_ref_app}/migrations/${_ref_name}.py"
+          local _ref_file2=""
+          local _ref_app_path=""
+          set +e
+          _ref_app_path="$( PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" - "${_ref_app}" <<'PY' 2>/dev/null
+import django, sys
+django.setup()
+from django.apps import apps
+print(apps.get_app_config(sys.argv[1]).path)
+PY
+)"
+          set -e
+          _ref_app_path="$( printf '%s' "${_ref_app_path}" | tr -d '\r\n' || true )"
+          if [ -n "${_ref_app_path}" ]; then
+            _ref_file2="${_ref_app_path}/migrations/${_ref_name}.py"
+          fi
+          local _ref_file=""
+          if [ -f "${_ref_file1}" ]; then
+            _ref_file="${_ref_file1}"
+          elif [ -n "${_ref_file2}" ] && [ -f "${_ref_file2}" ]; then
+            _ref_file="${_ref_file2}"
+          fi
+          if [ -n "${_ref_file}" ]; then
             local _applied=0
             if PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" manage.py showmigrations "${_ref_app}" 2>/dev/null | grep -qE "^\[X\][[:space:]]+${_ref_name}" >/dev/null 2>&1; then
               _applied=1
             fi
             if [ "$_applied" -eq 0 ]; then
-              _warn "UndefinedTable autoheal round ${_rma_round}: referencer '${_ref_app}.${_ref_name}' is NOT applied in DB and references missing parent. Deleting orphan half-generated partial file: ${_ref_file} (will be recreated cleanly on next makemigrations)."
+              _warn "UndefinedTable autoheal round ${_rma_round}: deleting orphan referencer migration '${_ref_app}.${_ref_name}' to unblock migration graph: ${_ref_file}"
               rm -f "${_ref_file}" 2>/dev/null || true
-              _rma_deleted_orphan=1
-              set +e
-              _run_with_spinner "(autoheal r${_rma_round} → regen graphs cleanly) manage.py makemigrations --noinput" bash -c \
-                "${_rma_base_env} manage.py makemigrations --noinput" || true
-              set -e
+              if [ ! -f "${_ref_file}" ]; then
+                _rma_deleted_orphan=1
+                set +e
+                _run_with_spinner "(autoheal r${_rma_round} → regen graphs cleanly) manage.py makemigrations --noinput" bash -c \
+                  "${_rma_base_env} manage.py makemigrations --noinput" || true
+                set -e
+              fi
             fi
           fi
+        fi
+        # Sanity: if the "missing parent" is the SAME app we are already trying to migrate, recursive autoheal would
+        # just call itself again without changing state. Skip recursive self-call; orphan cleanup below may still fix graph.
+        if [ -n "${_rma_label}" ] && [ "${_rma_node_missing_app}" = "${_rma_label}" ]; then
+          _rma_self_node=1
+          _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError missing parent '${_rma_node_missing_app}' IS the current migrate target. Skipping recursive self-heal to avoid endless same-label recursion; will rely on orphan cleanup + next bounded retry."
+        else
+          set +e
+          _run_with_spinner "(autoheal r${_rma_round} → makemig missing parent '${_rma_node_missing_app}') manage.py makemigrations --noinput '${_rma_node_missing_app}'" bash -c \
+            "${_rma_base_env} manage.py makemigrations --noinput '${_rma_node_missing_app}'" || true
+          _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rma_node_missing_app}" || true
+          set -e
         fi
         if [ "$_rma_self_node" -eq 1 ] && [ "$_rma_deleted_orphan" -eq 0 ]; then
           _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError self-target produced NO state change (no orphan file deleted). Stopping autoheal early and falling back to retry banner instead of repeating the same error."
