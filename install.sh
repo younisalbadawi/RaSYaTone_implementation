@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0600-pre-safety1-dir-guard-parse-fix"
+SCRIPT_VERSION_BUILD="2026-08-06T0700-dynamic-undefinedtable-autoheal"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -648,20 +648,140 @@ print("POST_EDIT_OK: stripped cross-app dep references to %s from %s" % (target_
 PY
   fi
   _info "[$_rcd_label] Step 3/4: migrate $_cA.0001_initial (cycle-free; no $_cB dependency in Migration.dependencies)."
-  _run_with_spinner "($_rcd_label step 3) migrate $_cA (user tables created in DB)" bash -c \
-    "${_rcd_base_env} manage.py migrate '${_cA}'" || true
+  set +e
+  _run_migrate_autoheal "${_rcd_app_dir}" "${_rcd_settings}" "${_rcd_venv_py}" "${_rcd_base_env}" "${_cA}" || true
+  set -e
   _info "[$_rcd_label] Step 4a/4: regenerate $_cB 0001 — since $_cA.0001 EXISTS in disk graph + DB, dependencies list ($_cA,0001_initial) = valid DAG (no cycle)."
   _run_with_spinner "($_rcd_label step 4a) makemigrations $_cB (2nd of pair; valid DAG dep)" bash -c \
     "${_rcd_base_env} manage.py makemigrations --noinput '${_cB}'" || true
   _info "[$_rcd_label] Step 4b/4: migrate $_cB + final catch-all makemigrations (re-adds stripped FK as $_cA.0002) + migrate all."
-  _run_with_spinner "($_rcd_label step 4b) migrate $_cB" bash -c \
-    "${_rcd_base_env} manage.py migrate '${_cB}'" || true
+  set +e
+  _run_migrate_autoheal "${_rcd_app_dir}" "${_rcd_settings}" "${_rcd_venv_py}" "${_rcd_base_env}" "${_cB}" || true
+  set -e
   _run_with_spinner "($_rcd_label step 4c) makemigrations all (re-adds stripped cross FK as $_cA.0002)" bash -c \
     "${_rcd_base_env} manage.py makemigrations --noinput" || true
-  _run_with_spinner "($_rcd_label step 4d) migrate all (0002 FK + all pending apps applied)" bash -c \
-    "${_rcd_base_env} manage.py migrate" || true
+  set +e
+  _run_migrate_autoheal "${_rcd_app_dir}" "${_rcd_settings}" "${_rcd_venv_py}" "${_rcd_base_env}" "" || true
+  set -e
   _ok "[$_rcd_label] AUTO-SPLIT complete for [$_cA] ↔ [$_cB]. Backup at: $_bkdir. Proceeding to normal migrate flow."
   return 0
+}
+# ── GENERIC UndefinedTable (relation "x_y" does not exist) AUTO-HEAL WRAPPER for `manage.py migrate` ──
+#   THE DYNAMIC FIX FOR ANY MODEL the user asked about.
+#   Works for ANY app, ANY model, ANY transitive dependency chain — not just auth_app/companies/hr.
+#
+#   How it detects the missing app DYNAMICALLY (no hardcoded app names):
+#     1. Call `manage.py migrate <label>` via spinner. If rc=0 → return 0 immediately.
+#     2. If rc≠0, grep the spinner's captured stderr for the EXACT Postgres error pattern:
+#           relation "underscore_delimited_table" does not exist
+#        e.g. `relation "hr_employee" does not exist`, `relation "core_foo_bar_baz"` does not exist.
+#     3. For the table name, enumerate every UNDERSCORE-SPLIT PREFIX (longest-first) from it.
+#        For table "hr_employee", try labels in order: "hr_employee", "hr".
+#        For table "sales_order_item", try: "sales_order_item", "sales_order", "sales".
+#     4. Query Django's ACTUAL apps registry via Python `apps.get_app_configs()` — NO bash guessing.
+#        If any prefix matches an installed app label → THAT is the missing dependency app.
+#        (Django sets `db_table = app_label_model_name` by default, so first underscore pieces = label.)
+#     5. Run: makemigrations <found_app> → migrate <found_app> (via spinner, nested wrapped for safety).
+#     6. Retry ORIGINAL migrate. If still UndefinedTable on DIFFERENT table → loop.
+#     7. Hard cap 5 rounds. If 5 rounds hit and still failing OR no prefix matches any installed app
+#        → cannot auto-heal → return original rc so user's retry banners run.
+#
+#   Invocation: _run_migrate_autoheal _rma_app_dir _rma_settings _rma_venv_py _rma_base_env _rma_label
+#     _rma_label: either a single app label (e.g. 'auth_app', 'hr') OR the empty string to mean
+#                 'migrate' (all apps — catch-all).
+_run_migrate_autoheal() {
+  local _rma_app_dir="$1"
+  local _rma_settings="$2"
+  local _rma_venv_py="$3"
+  local _rma_base_env="$4"
+  local _rma_label="${5:-}"
+  [ -z "${_rma_app_dir}" ] || [ ! -d "${_rma_app_dir}" ] && return 1
+  [ -z "${_rma_venv_py}" ] || [ ! -x "${_rma_venv_py}" ] && return 1
+  local _rma_target=""
+  if [ -n "${_rma_label}" ]; then
+    _rma_target="'${_rma_label}'"
+  fi
+  local _rma_round=0
+  local _rma_rc=1
+  local _rma_rel=""
+  local _rma_tb_log=""
+  local _rma_done_label=""
+  local _rma_log_pattern="autoheal-r${_rma_round}"
+  while [ "$_rma_round" -lt 5 ]; do
+    set +e
+    if [ -n "${_rma_label}" ]; then
+      _run_with_spinner "(autoheal round $_rma_round) manage.py migrate ${_rma_label}" bash -c \
+        "${_rma_base_env} manage.py migrate '${_rma_label}'"
+      _rma_rc=$?
+    else
+      _run_with_spinner "(autoheal round $_rma_round) manage.py migrate (all apps)" bash -c \
+        "${_rma_base_env} manage.py migrate"
+      _rma_rc=$?
+    fi
+    set -e
+    if [ "$_rma_rc" -eq 0 ]; then
+      [ "$_rma_round" -gt 0 ] && _ok "UndefinedTable auto-heal succeeded after $_rma_round rounds (last resolved dep: ${_rma_done_label:-<none>})." || true
+      return 0
+    fi
+    # ── Find most recent spinner log for `manage.py migrate …` ──
+    _rma_tb_log=""
+    local _rma_cand=""
+    for _rma_cand in /tmp/rasyatone_spin_*_manage_py_migrate*.log; do
+      [ -n "${_rma_cand}" ] && [ -f "${_rma_cand}" ] && _rma_tb_log="${_rma_cand}" || true
+    done
+    if [ -z "${_rma_tb_log}" ] || [ ! -f "${_rma_tb_log}" ]; then
+      _info "UndefinedTable autoheal: migrate rc=${_rma_rc} but no migrate spinner log readable. Cannot auto-heal → failing."
+      return "$_rma_rc"
+    fi
+    _rma_rel=""
+    _rma_rel=$( tail -n 200 "${_rma_tb_log}" 2>/dev/null | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
+    if [ -z "${_rma_rel}" ]; then
+      _info "UndefinedTable autoheal round ${_rma_round}: no 'relation X does not exist' in last log → different error category, cannot auto-heal (rc=${_rma_rc})."
+      return "$_rma_rc"
+    fi
+    # ── Enumerate LONGEST-FIRST underscore-prefix candidates → match against Django apps registry. ──
+    #    Python returns EMPTY string on no match, OR the exact app label (from apps.get_app_config(label).label).
+    local _rma_match=""
+    _rma_match=$( PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" - "${_rma_rel}" <<'PY' 2>/dev/null || true
+import django, sys
+try:
+    django.setup()
+    from django.apps import apps
+    table = sys.argv[1]
+    parts = table.split("_")
+    # Longest-prefix-first: for N parts, try join(parts[0..N-1]), then 0..N-2, ..., down to 0..0
+    for i in range(len(parts), 0, -1):
+        cand = "_".join(parts[:i])
+        try:
+            cfg = apps.get_app_config(cand)
+            print(cfg.label)
+            sys.exit(0)
+        except LookupError:
+            continue
+except Exception:
+    pass
+PY
+)
+    _rma_match=$(printf '%s' "${_rma_match}" | tr -d '[:space:]\r\n' || true)
+    if [ -z "${_rma_match}" ]; then
+      _warn "UndefinedTable autoheal round ${_rma_round}: table '${_rma_rel}' — no underscore-prefix matches any installed app. (Longest-match search against Django apps registry failed.) Falling back to 3-attempt retry banner."
+      return "$_rma_rc"
+    fi
+    if [ "${_rma_match}" = "${_rma_label:-}" ]; then
+      _warn "UndefinedTable autoheal round ${_rma_round}: table '${_rma_rel}' → match app '${_rma_match}' IS the migrate target we just ran. Cannot auto-heal a target against itself (circular: UndefinedTable within its own migration). Failing back to manual retry banner."
+      return "$_rma_rc"
+    fi
+    _rma_done_label="${_rma_match}"
+    _warn "UndefinedTable autoheal round ${_rma_round}: relation '${_rma_rel}' does not exist → MATCHED installed app label '${_rma_match}' (longest underscore-prefix vs apps registry). Auto-running: makemigrations + migrate '${_rma_match}' BEFORE retrying target migrate."
+    set +e
+    _run_with_spinner "(autoheal r${_rma_round} → makemig '${_rma_match}') manage.py makemigrations --noinput '${_rma_match}'" bash -c \
+      "${_rma_base_env} manage.py makemigrations --noinput '${_rma_match}'" || true
+    _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rma_match}" || true
+    set -e
+    _rma_round=$(( _rma_round + 1 ))
+  done
+  _warn "UndefinedTable autoheal: hit max 5 rounds; still failing. (Last resolved dep: ${_rma_done_label:-<none>}; last missing table: ${_rma_rel:-<none>}.) Failing back to manual retry banner."
+  return "$_rma_rc"
 }
 # ── ENV_FILE CIRCULAR SENTINEL SANITIZER (runs BEFORE every `set -a; . "$ENV_FILE"`) ──
 #   Fixes the EXACT user crash: last run wrote garbage CIRCULAR_APPS=raiseCircularDependencyError(
@@ -4398,7 +4518,9 @@ PY
         } 2>/dev/null || true
         local _dyn_next_cmd="${_dyn_base_env} manage.py migrate '${_dyn_next}'"
         _dyn_rc=0
-        _run_with_spinner "(auth-user dep chain iteration $_dyn_iter/$_dyn_max_iter) manage.py migrate ${_dyn_next} (app in dependency order)" bash -c "$_dyn_next_cmd" || _dyn_rc=$?
+        set +e
+        _run_migrate_autoheal "$APP_DIR" "${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" "${_dyn_base_env}" "${_dyn_next}" || _dyn_rc=$?
+        set -e
         if [ "$_dyn_rc" -eq 0 ]; then
           _ok "migrate ${_dyn_next} OK (iteration $_dyn_iter). Added to applied set."
           _dyn_applied="${_dyn_applied} ${_dyn_next}"; _dyn_applied=${_dyn_applied# }; _dyn_applied=${_dyn_applied% }
@@ -4492,7 +4614,9 @@ PY
         while [ "$aum_att" -lt "$aum_max" ] && [ "$aum_ok" -ne 1 ]; do
           aum_att=$(( aum_att + 1 ))
           aum_frc=0
-          _run_with_spinner "manage.py migrate ${aum_app} (attempt $aum_att/$aum_max — custom user app)" bash -c "$aum_cmd" || aum_frc=$?
+          set +e
+          _run_migrate_autoheal "$APP_DIR" "${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" "${_dyn_base_env}" "${aum_app}" || aum_frc=$?
+          set -e
           if [ "$aum_frc" -eq 0 ]; then aum_ok=1; break; fi
           local aum_tb=""
           aum_tb=$( bash -c "$aum_cmd" 2>&1 | tail -n 80 || true )
@@ -4508,7 +4632,12 @@ PY
           printf "  \033[1;33m[STAGE 1 graph deps:]\033[0m %s\n" "${_stage1_deps:-<none discovered>}" >&2
           printf "  \033[1;33m[STAGE 2 applied:]\033[0m %s\n  \033[1;33m[STAGE 2 final queue:]\033[0m %s\n" "${_dyn_applied:-<none>}" "${_dyn_queue:-<empty>}" >&2
           # ── CAUSE (I): CircularDependencyError auto-extract + banner (if present in traceback). ──
-          local _circ_line="" _circ_pair_raw="" _circ_app1="" _circ_app2=""
+          #   NOTE: _circ_apps MUST be declared OUTSIDE the if/then block. Your exact Contabo rerun crashed:
+          #     line 4557: _circ_apps: unbound variable
+          #   because _circ_apps was declared INSIDE `if [ -n "${_circ_line}" ]; then … fi` scope,
+          #   and when traceback contained NO CircularDep (e.g. UndefinedTable hr_employee), the if
+          #   never fired, but later L4557 ran `if [ -n "${_circ_apps}" ]; then` → nounset under set -u.
+          local _circ_line="" _circ_pair_raw="" _circ_app1="" _circ_app2="" _circ_apps="" _circ_cp=""
           _circ_line=$(printf '%s\n' "$aum_tb" | grep -E 'CircularDependencyError:.*0001_initial' 2>/dev/null | head -n 1 || true)
           if [ -z "${_circ_line}" ]; then
             _circ_line=$(printf '%s\n' "$aum_tb" | grep -E '[a-zA-Z_][a-zA-Z0-9_]*\.0001_initial.*[a-zA-Z_][a-zA-Z0-9_]*\.0001_initial' 2>/dev/null | head -n 1 || true)
@@ -4517,7 +4646,6 @@ PY
             _circ_pair_raw=$(printf '%s' "${_circ_line}" | sed -E 's/.*CircularDependencyError:\s*//' || true)
             _circ_app1=$(printf '%s' "${_circ_pair_raw}" | awk -F',' '{print $1}' | awk -F'.' '{print $1}' | tr -d '[:space:]' || true)
             _circ_app2=$(printf '%s' "${_circ_pair_raw}" | awk -F',' '{print $2}' | awk -F'.' '{print $1}' | tr -d '[:space:]' || true)
-            local _circ_apps=""
             # ORDER GUARANTEE: AUTH_USER_MODEL app (${aum_app}) is ALWAYS first word in CIRCULAR_APPS
             #   so menu-based CIRCULAR_APPLY_2STEP correctly sets cA = user app, cB = other app.
             if [ "${_circ_app2}" = "${aum_app}" ]; then
@@ -4533,7 +4661,6 @@ PY
             printf "  Step 2 (add FK back): RE-ADD the ForeignKey you removed to %s models.py, run makemigrations again → 0002_add_fk for %s, then migrate (no cycle now since 0001 already applied to both).\n" "${_circ_app2}" "${_circ_app2}" >&2
             printf "  SIMPLER CORRECT FIX (preferred permanent Django idiom): change %s Company FK from ForeignKey('%s.User') → ForeignKey(settings.AUTH_USER_MODEL) AND in Migration.dependencies add run_before = [('%s', '0001_initial')] to %s 0001; or in your custom user model class definition ensure Auth_USER_MODEL is set before migrations are made — then delete both 0001 files and makemigrations fresh.\n" "${_circ_app2}" "${_circ_app1}" "${_circ_app1}" "${_circ_app2}" >&2
             printf "  COPY-PASTE SHELL FIX (deletes auto-gen bad 0001 files, regenerates with swappable AUTH_USER_MODEL FK in %s; user hits Enter):\n" "${_circ_app2}" >&2
-            local _circ_cp=""
             _circ_cp=$(printf 'cd %s && \\\n  for APP in %s %s; do\n    rm -f ${APP}/migrations/0001_initial.py 2>/dev/null || true\n    mkdir -p ${APP}/migrations && touch ${APP}/migrations/__init__.py 2>/dev/null || true\n  done && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py makemigrations --noinput %s && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py migrate %s && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py makemigrations --noinput %s && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py migrate %s && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py makemigrations --noinput %s 2>/dev/null || true && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py migrate %s 2>/dev/null || true && \\\n  PYTHONPATH="%s" DJANGO_SETTINGS_MODULE="%s" "%s/.venv/bin/python" manage.py migrate\n' "$APP_DIR" "${_circ_app1}" "${_circ_app2}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" "${_circ_app1}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" "${_circ_app1}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" "${_circ_app2}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" "${_circ_app2}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" "${_circ_app1}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" "${_circ_app2}" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR" || true)
             printf '%s\n' "$_circ_cp" | sed 's/^/    /' >&2
           fi
@@ -4600,8 +4727,9 @@ PY
             if [ -n "${dep_first}" ]; then
               _run_with_spinner "(pre-retry) manage.py makemigrations --noinput ${dep_first} (dependency chain)" bash -c \
                 "${_dyn_base_env} manage.py makemigrations --noinput '${dep_first}'" || true
-              _run_with_spinner "(pre-retry) manage.py migrate ${dep_first} (dependency FIRST)" bash -c \
-                "${_dyn_base_env} manage.py migrate '${dep_first}'" || true
+              set +e
+              _run_migrate_autoheal "$APP_DIR" "${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" "${_dyn_base_env}" "${dep_first}" || true
+              set -e
             fi
             aum_cmd="${_dyn_base_env} manage.py migrate '${aum_app}'"
           else
@@ -4709,7 +4837,9 @@ DIAGNOSTIC CONTEXT:
       mig_attempt=$(( mig_attempt + 1 ))
       mig_spin_log=""
       mig_rc=0
-      _run_with_spinner "manage.py migrate (attempt $mig_attempt/$mig_max) — apply DB migrations" bash -c "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate" || mig_rc=$?
+      set +e
+      _run_migrate_autoheal "$APP_DIR" "${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" "cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'" "" || mig_rc=$?
+      set -e
       # Locate most recent _run_with_spinner migrate log file (newest by mtime matching label pattern).
       # _run_with_spinner writes to /tmp/rasyatone_spin_<pid>_<label>.log with <label> sanitized — glob newest matching migrate file.
       local _gl
