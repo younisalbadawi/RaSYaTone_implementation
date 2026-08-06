@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0500-quoted-circular-sentinel-stderr-fix"
+SCRIPT_VERSION_BUILD="2026-08-06T0600-pre-safety1-dir-guard-parse-fix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -492,38 +492,95 @@ PY
   if [ -n "${_rcd_out}" ]; then
     _rcd_out=$(printf '%s\n' "$_rcd_out" | grep -vE '^[[:space:]]*$' | tail -n 1 || true)
   fi
+  # Strip carriage returns / control chars from probe output (Windows line endings, stray ^M, etc.).
+  _rcd_out=$(printf '%s' "${_rcd_out}" | tr -d '\r\001-\010\013\014\016-\037\177' || true)
   local _pa="" _pb=""
   case "$_rcd_out" in
-    CIRCULAR:*|CIRCULAR:*)
+    CIRCULAR:*)
       _pa=${_rcd_out#CIRCULAR:}; _pb=${_pa#*|}; _pa=${_pa%%|*}
       _pa=$(printf '%s' "$_pa" | tr -d '[:space:]'); _pb=$(printf '%s' "$_pb" | tr -d '[:space:]')
       ;;
   esac
-  if [ -z "$_pa" ] || [ -z "$_pb" ] || [ ! -d "${_rcd_app_dir}/$_pa" ] || [ ! -d "${_rcd_app_dir}/$_pb" ]; then
-    # No cycle detected OR unreadable check.
+  # ── Resolve ACTUAL app directory paths via Django's apps.get_app_config(label).path API. ──
+  #   Bash heuristic "$APP_DIR/label" FAILS for common Django layouts: nested apps,
+  #   INSTALLED_APPS = 'pkg.auth_app' (dotted module path), app labels that differ from dir name, etc.
+  #   MigrationLoader uses AppConfig.path; we must match THAT behavior — not bash-guess.
+  local _pa_dir="" _pb_dir=""
+  if [ -n "${_pa}" ]; then
+    _pa_dir=$( PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - "${_pa}" <<'PY' 2>/dev/null || true
+import django, sys
+try:
+    django.setup()
+    from django.apps import apps
+    print(apps.get_app_config(sys.argv[1]).path)
+except Exception: pass
+PY
+)
+    _pa_dir=$(printf '%s' "${_pa_dir}" | tr -d '[:space:]\r\n' || true)
+  fi
+  if [ -n "${_pb}" ]; then
+    _pb_dir=$( PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - "${_pb}" <<'PY' 2>/dev/null || true
+import django, sys
+try:
+    django.setup()
+    from django.apps import apps
+    print(apps.get_app_config(sys.argv[1]).path)
+except Exception: pass
+PY
+)
+    _pb_dir=$(printf '%s' "${_pb_dir}" | tr -d '[:space:]\r\n' || true)
+  fi
+  [ -z "${_pa_dir}" ] && _pa_dir="${_rcd_app_dir}/$_pa"
+  [ -z "${_pb_dir}" ] && _pb_dir="${_rcd_app_dir}/$_pb"
+  # ── VERBOSE per-clause guard (4 clauses) + OVERRIDE if probe explicitly said CIRCULAR:*. ──
+  #   On your Contabo rerun the bash-heuristic L502 [ -d APP_DIR/auth_app ] VETOED the split even
+  #   though Python probe had already found both apps via MigrationLoader(None). This guard now
+  #   prints EXACTLY which clause would have vetoed, and OVERRIDES if probe output = CIRCULAR:*.
+  local _cl1=0 _cl2=0 _cl3=0 _cl4=0 _veto=0 _probe_says_cycle=0
+  [ -z "$_pa" ] && _cl1=1 || true
+  [ -z "$_pb" ] && _cl2=1 || true
+  [ -n "${_pa_dir}" ] && [ ! -d "${_pa_dir}" ] && _cl3=1 || true
+  [ -n "${_pb_dir}" ] && [ ! -d "${_pb_dir}" ] && _cl4=1 || true
+  case "$_rcd_out" in CIRCULAR:*) _probe_says_cycle=1 ;; esac
+  if [ "$_cl1" -eq 1 ] || [ "$_cl2" -eq 1 ]; then
+    _veto=1
+  elif [ "$_probe_says_cycle" -eq 1 ]; then
+    _veto=0
+    [ "$_cl3" -eq 1 ] && _warn "[$_rcd_label] Guard clause-3 would have vetoed (no dir for app [$_pa] guess=$_pa_dir). OVERRIDDEN because probe output=CIRCULAR:*; proceeding with Python-resolved paths anyway." || true
+    [ "$_cl4" -eq 1 ] && _warn "[$_rcd_label] Guard clause-4 would have vetoed (no dir for app [$_pb] guess=$_pb_dir). OVERRIDDEN because probe output=CIRCULAR:*; proceeding with Python-resolved paths anyway." || true
+  elif [ "$_cl3" -eq 1 ] || [ "$_cl4" -eq 1 ]; then
+    _veto=1
+  fi
+  if [ "$_veto" -eq 1 ]; then
+    local _cl_reasons=""
+    [ "$_cl1" -eq 1 ] && _cl_reasons="$_cl_reasons cl1=(pair-appA EMPTY)"
+    [ "$_cl2" -eq 1 ] && _cl_reasons="$_cl_reasons cl2=(pair-appB EMPTY)"
+    [ "$_cl3" -eq 1 ] && _cl_reasons="$_cl_reasons cl3=(dir-not-exist appA=$_pa_dir)"
+    [ "$_cl4" -eq 1 ] && _cl_reasons="$_cl_reasons cl4=(dir-not-exist appB=$_pb_dir)"
     case "$_rcd_out" in
       GRAPH_OK|GRAPH_OK_FALLBACK_CONN)
         _ok "[$_rcd_label] Django migration graph OK: no CircularDependencyError (all Migration.dependencies form a valid DAG)."
         ;;
       *)
-        _info "[$_rcd_label] Django migration graph check skipped (output=$_rcd_out rc=$_rcd_rc). Safe no-op; cycle will be caught by migrate banners if exists."
+        _info "[$_rcd_label] Django migration graph check skipped (output=$_rcd_out rc=$_rcd_rc reasons=[$_cl_reasons ]). Safe no-op; cycle will be caught by migrate banners if exists."
         ;;
     esac
     return 0
   fi
   # Cycle detected. Run 2-step split.
   local _bkdir="/tmp/rasyatone_${_rcd_label}_circular_backup_$$"
-  _warn "[$_rcd_label] CircularDependencyError DETECTED between apps [$_pa] ↔ [$_pb] (cross-FK in both 0001_initial.py Migration.dependencies). Running AUTO-SPLIT 2-step fix now (NO USER INTERACTION NEEDED)."
+  _warn "[$_rcd_label] CircularDependencyError DETECTED between apps [$_pa] ↔ [$_pb] (appA_dir=$_pa_dir appB_dir=$_pb_dir). Running AUTO-SPLIT 2-step fix now (NO USER INTERACTION NEEDED)."
   _info "[$_rcd_label] Step 0/4: BACKUP existing 0001_initial.py files to $_bkdir (rollback manually if needed)."
   mkdir -p "$_bkdir/$_pa/migrations" "$_bkdir/$_pb/migrations" 2>/dev/null || true
-  cp -f "${_rcd_app_dir}/$_pa/migrations/0001_initial.py" "$_bkdir/$_pa/migrations/" 2>/dev/null || true
-  cp -f "${_rcd_app_dir}/$_pb/migrations/0001_initial.py" "$_bkdir/$_pb/migrations/" 2>/dev/null || true
+  cp -f "${_pa_dir}/migrations/0001_initial.py" "$_bkdir/$_pa/migrations/" 2>/dev/null || true
+  cp -f "${_pb_dir}/migrations/0001_initial.py" "$_bkdir/$_pb/migrations/" 2>/dev/null || true
   _info "[$_rcd_label] Step 1/4: DELETE both auto-generated bad 0001_initial.py files (cross-FK → cycle)."
-  rm -f "${_rcd_app_dir}/$_pa/migrations/0001_initial.py" "${_rcd_app_dir}/$_pb/migrations/0001_initial.py" 2>/dev/null || true
-  mkdir -p "${_rcd_app_dir}/$_pa/migrations" "${_rcd_app_dir}/$_pb/migrations" 2>/dev/null || true
-  touch "${_rcd_app_dir}/$_pa/migrations/__init__.py" "${_rcd_app_dir}/$_pb/migrations/__init__.py" 2>/dev/null || true
+  rm -f "${_pa_dir}/migrations/0001_initial.py" "${_pb_dir}/migrations/0001_initial.py" 2>/dev/null || true
+  mkdir -p "${_pa_dir}/migrations" "${_pb_dir}/migrations" 2>/dev/null || true
+  touch "${_pa_dir}/migrations/__init__.py" "${_pb_dir}/migrations/__init__.py" 2>/dev/null || true
   # Guarantee cA = AUTH_USER_MODEL app (always first). Python catch has already ordered this but double-check via settings bash sentinel.
   local _cA="$_pa" _cB="$_pb"
+  local _cA_dir="${_pa_dir}" _cB_dir="${_pb_dir}"
   local _aum_guess=""
   _aum_guess=$( PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - <<'PY' 2>/dev/null || true
 import django, sys
@@ -540,13 +597,14 @@ PY
   if [ -n "${_aum_guess}" ]; then
     if [ "${_cB}" = "${_aum_guess}" ]; then
       local _t="$_cA"; _cA="$_cB"; _cB="$_t"
+      local _td="$_cA_dir"; _cA_dir="$_cB_dir"; _cB_dir="$_td"
     fi
   fi
   _info "[$_rcd_label] Step 2/4: regenerate cA ($_cA) 0001 → Python post-edit will STRIP $_cB dep/comments cross FK for cycle safety."
   _run_with_spinner "($_rcd_label step 2) makemigrations $_cA (1st of pair; post-edit dep strip next)" bash -c \
     "${_rcd_base_env} manage.py makemigrations --noinput '${_cA}'" || true
-  if [ -f "${_rcd_app_dir}/$_cA/migrations/0001_initial.py" ]; then
-    PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - "${_rcd_app_dir}/$_cA/migrations/0001_initial.py" "${_cB}" <<'PY' || true
+  if [ -f "${_cA_dir}/migrations/0001_initial.py" ]; then
+    PYTHONPATH="${_rcd_app_dir}" DJANGO_SETTINGS_MODULE="${_rcd_settings}" "${_rcd_venv_py}" - "${_cA_dir}/migrations/0001_initial.py" "${_cB}" <<'PY' || true
 import sys, os
 path, target_app = sys.argv[1], sys.argv[2]
 with open(path, "r", encoding="utf-8") as f:
