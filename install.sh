@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1200-delete-orphan-first"
+SCRIPT_VERSION_BUILD="2026-08-06T1230-delete-orphan-find"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -788,6 +788,7 @@ _run_migrate_autoheal() {
         if [ -n "${_ref_app}" ] && [ -n "${_ref_name}" ]; then
           local _ref_file1="${_rma_app_dir}/${_ref_app}/migrations/${_ref_name}.py"
           local _ref_file2=""
+          local _ref_file3=""
           local _ref_app_path=""
           set +e
           _ref_app_path="$( PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" - "${_ref_app}" <<'PY' 2>/dev/null
@@ -807,6 +808,12 @@ PY
             _ref_file="${_ref_file1}"
           elif [ -n "${_ref_file2}" ] && [ -f "${_ref_file2}" ]; then
             _ref_file="${_ref_file2}"
+          else
+            _ref_file3="$( find "${_rma_app_dir}" -maxdepth 6 -type f -path "*/${_ref_app}/migrations/${_ref_name}.py" -print -quit 2>/dev/null || true )"
+            _ref_file3="$( printf '%s' "${_ref_file3}" | tr -d '\r\n' || true )"
+            if [ -n "${_ref_file3}" ] && [ -f "${_ref_file3}" ]; then
+              _ref_file="${_ref_file3}"
+            fi
           fi
           if [ -n "${_ref_file}" ]; then
             local _applied=0
@@ -824,6 +831,8 @@ PY
                 set -e
               fi
             fi
+          else
+            _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError referencer '${_ref_app}.${_ref_name}' but could not locate migration file to delete. Tried: ${_ref_file1} ; ${_ref_file2:-<no app path>} ; find-match=${_ref_file3:-<none>}. Graph may remain broken."
           fi
         fi
         # Sanity: if the "missing parent" is the SAME app we are already trying to migrate, recursive autoheal would
