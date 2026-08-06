@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0830-percent-b-format-nl-escapes"
+SCRIPT_VERSION_BUILD="2026-08-06T0900-nodenotfound-graph-heal"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -749,7 +749,55 @@ _run_migrate_autoheal() {
       _rma_rel=$( grep -oE 'relation "[^"]+" does not exist' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
     fi
     if [ -z "${_rma_rel}" ]; then
-      _info "UndefinedTable autoheal round ${_rma_round}: opened newest migrate log (${_rma_tb_log}, tail=${_rma_tail_bytes}b) — NO 'relation X does not exist' pattern match. Different error category (password/connection/circular-dep/schema). Cannot auto-heal via UndefinedTable path; return rc=${_rma_rc} so retry banner handles other classes."
+      # ── CLASS B: NodeNotFoundError (migration graph DummyNode: later-numbered migration references a missing earlier-numbered sibling).
+      #    Pattern: NodeNotFoundError: Migration X.Y dependencies reference nonexistent parent node ('APP', 'NNNN_initial')
+      #    Example: NodeNotFoundError: Migration auth_app.0002_initial dependencies reference nonexistent parent node ('companies', '0001_initial')
+      local _rma_node_missing_app="" _rma_node_referencer=""
+      _rma_node_referencer="$( grep -oE 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E 's/^NodeNotFoundError: Migration //; s/ dependencies reference nonexistent parent node$//' || true )"
+      _rma_node_missing_app="$( grep -oE "reference nonexistent parent node \('[a-zA-Z0-9_]+', '" "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E "s/^reference nonexistent parent node '\\('//; s/', '//; s/'$//" || true )"
+      if [ -z "${_rma_node_missing_app}" ]; then
+        # Try FULL log for node pattern
+        _rma_node_referencer="$( grep -oE 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E 's/^NodeNotFoundError: Migration //; s/ dependencies reference nonexistent parent node$//' || true )"
+        _rma_node_missing_app="$( grep -oE "reference nonexistent parent node \('[a-zA-Z0-9_]+', '" "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E "s/^reference nonexistent parent node '\\('//; s/', '//; s/'$//" || true )"
+      fi
+      if [ -n "${_rma_node_missing_app}" ]; then
+        _info "UndefinedTable autoheal round ${_rma_round}: graph NodeNotFoundError detected. Referencer='${_rma_node_referencer}' missing_parent_app='${_rma_node_missing_app}'. Auto-healing missing app first."
+        # First: try makemigrations + migrate the missing parent app directly via autoheal (recursive).
+        set +e
+        _run_with_spinner "(autoheal r${_rma_round} → makemig missing parent '${_rma_node_missing_app}') manage.py makemigrations --noinput '${_rma_node_missing_app}'" bash -c \
+          "${_rma_base_env} manage.py makemigrations --noinput '${_rma_node_missing_app}'" || true
+        _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rma_node_missing_app}" || true
+        set -e
+        # FALLBACK: if the referencer migration is a half-generated PARTIAL (0002+ with missing dependency from interrupted prior run)
+        # and is NOT applied in DB (no [X] line), deleting it is safe — Django will regenerate cleanly on next makemigrations all.
+        local _ref_app="" _ref_name=""
+        if [[ "${_rma_node_referencer}" == *.* ]]; then
+          _ref_app="${_rma_node_referencer%%.*}"
+          _ref_name="${_rma_node_referencer#*.}"
+        fi
+        if [ -n "${_ref_app}" ] && [ -n "${_ref_name}" ]; then
+          local _ref_file="${_rma_app_dir}/${_ref_app}/migrations/${_ref_name}.py"
+          if [ -f "${_ref_file}" ]; then
+            local _applied=0
+            if PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" manage.py showmigrations "${_ref_app}" 2>/dev/null | grep -qE "^\[X\][[:space:]]+${_ref_name}" >/dev/null 2>&1; then
+              _applied=1
+            fi
+            if [ "$_applied" -eq 0 ]; then
+              _warn "UndefinedTable autoheal round ${_rma_round}: referencer '${_ref_app}.${_ref_name}' is NOT applied in DB and references missing parent. Deleting orphan half-generated partial file: ${_ref_file} (will be recreated cleanly on next makemigrations)."
+              rm -f "${_ref_file}" 2>/dev/null || true
+              set +e
+              _run_with_spinner "(autoheal r${_rma_round} → regen graphs cleanly) manage.py makemigrations --noinput" bash -c \
+                "${_rma_base_env} manage.py makemigrations --noinput" || true
+              set -e
+            fi
+          fi
+        fi
+        _rma_round=$(( _rma_round + 1 ))
+        continue
+      fi
+    fi
+    if [ -z "${_rma_rel}" ]; then
+      _info "UndefinedTable autoheal round ${_rma_round}: opened newest migrate log (${_rma_tb_log}, tail=${_rma_tail_bytes}b) — NO 'relation X does not exist' or NodeNotFoundError pattern match. Different error category (password/connection/circular-dep/schema). Cannot auto-heal via UndefinedTable/NodeNotFound path; return rc=${_rma_rc} so retry banner handles other classes."
       return "$_rma_rc"
     fi
     # ── Enumerate LONGEST-FIRST underscore-prefix candidates → match against Django apps registry. ──
@@ -4567,10 +4615,19 @@ PY
         local _mmk_fallback_rc=0
         {
           local _has_mk=0
-          if PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py showmigrations "$_dyn_next" >/dev/null 2>&1 ; then
-            local _sm_head
-            _sm_head=$( cd "$APP_DIR" && PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py showmigrations "$_dyn_next" 2>&1 | head -n 3 || true )
-            if printf '%s\n' "$_sm_head" | grep -q '\[ \] 0001\|0001_initial\|App .* does not have migrations'; then _has_mk=1; fi
+          local _sm_head="" _sm_rc=0
+          # NOTE: showmigrations / makemigrations / migrate can ALL CRASH with NodeNotFoundError before doing anything
+          # if the filesystem migration graph already contains a DummyNode (orphan later-numbered migration referencing missing earlier sibling).
+          # We capture rc; non-zero means graph is broken → treat as "needs makemigrations + cleanup".
+          set +e
+          _sm_head=$( cd "$APP_DIR" && PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py showmigrations "$_dyn_next" 2>&1 | head -n 3 )
+          _sm_rc=$?
+          set -e
+          if [ "$_sm_rc" -eq 0 ] && printf '%s\n' "$_sm_head" | grep -q '\[ \] 0001\|0001_initial\|App .* does not have migrations'; then
+            _has_mk=1
+          elif [ "$_sm_rc" -ne 0 ] && printf '%s\n' "$_sm_head" | grep -qE 'NodeNotFoundError|DummyNode|reference nonexistent parent'; then
+            # Graph already broken (orphan migration file) — force makemigrations run to fix it.
+            _has_mk=1
           fi
           if [ "$_has_mk" -ne 1 ]; then
             _info "App '${_dyn_next}' has NO migration files yet (${aum_app} dependency chain). Auto-running: makemigrations ${_dyn_next}."
@@ -4599,10 +4656,59 @@ PY
           _warn "migrate ${_dyn_next} FAILED: CircularDependencyError detected. Raw circular pair = [${_dyn_circ#CircularDependencyError: }]. CAUSE: both apps' 0001_initial migration files contain ForeignKey fields pointing AT EACH OTHER (auth_app.User → companies.Company AND companies.Company → auth_app.User) — Django graph sees a DAG cycle: auth_app.0001 depends on companies.0001 which depends on auth_app.0001. AUTO-FIX NOT AVAILABLE in STAGE 2; falling back to 3-attempt retry banner with DIRECT circular-dep copy-paste resolution template (CAUSE I in banner)."
           break
         fi
+        # ── Check for NodeNotFoundError (orphan migration file with missing parent dependency): ──
+        #    Pattern: NodeNotFoundError: Migration APP.NAME dependencies reference nonexistent parent node ('MISSING_APP', 'NNNN_initial')
+        local _dyn_node_miss="" _dyn_node_ref=""
+        _dyn_node_ref="$( printf '%s\n' "$_dyn_tb" | grep -oE 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' 2>/dev/null | head -n 1 | sed -E 's/^NodeNotFoundError: Migration //; s/ dependencies reference nonexistent parent node$//' || true )"
+        _dyn_node_miss="$( printf '%s\n' "$_dyn_tb" | grep -oE "reference nonexistent parent node \('[a-zA-Z0-9_]+', '" 2>/dev/null | head -n 1 | sed -E "s/^reference nonexistent parent node '\\('//; s/', '//; s/'$//" || true )"
+        if [ -n "${_dyn_node_miss}" ]; then
+          # Heal same as autoheal wrapper: auto-run makemigrations on missing app FIRST, then DELETE orphan referencer if not applied.
+          _warn "migrate ${_dyn_next} FAILED: NodeNotFoundError graph broken. Referencer='${_dyn_node_ref}' missing_parent_app='${_dyn_node_miss}'. Auto-healing in STAGE 2: migrate missing parent app, then retry current target."
+          local _ref_app="" _ref_name=""
+          if [[ "${_dyn_node_ref}" == *.* ]]; then
+            _ref_app="${_dyn_node_ref%%.*}"
+            _ref_name="${_dyn_node_ref#*.}"
+          fi
+          if [ -n "${_ref_app}" ] && [ -n "${_ref_name}" ]; then
+            local _ref_file="${APP_DIR}/${_ref_app}/migrations/${_ref_name}.py"
+            if [ -f "${_ref_file}" ]; then
+              local _applied=0
+              if PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" manage.py showmigrations "${_ref_app}" 2>/dev/null | grep -qE "^\[X\][[:space:]]+${_ref_name}" >/dev/null 2>&1; then
+                _applied=1
+              fi
+              if [ "$_applied" -eq 0 ]; then
+                _warn "STAGE 2: referencer file '${_ref_app}.${_ref_name}' NOT applied in DB — it's a half-generated partial from interrupted install. Deleting orphan: ${_ref_file}"
+                rm -f "${_ref_file}" 2>/dev/null || true
+              fi
+            fi
+          fi
+          # Ensure missing parent app is migrated BEFORE retrying target (prepend to queue).
+          local _picked_dep="${_dyn_node_miss}"
+          local _dup=0
+          for _a in $_dyn_queue; do [ "$_a" = "${_picked_dep}" ] && _dup=1; done
+          for _a in $_dyn_applied; do [ "$_a" = "${_picked_dep}" ] && _dup=2; done
+          if [ "$_dup" -eq 0 ]; then
+            _info "STAGE 2: prepending missing parent app '${_picked_dep}' to migration queue (will run BEFORE '${_dyn_next}')."
+            _dyn_queue="${_picked_dep} ${_dyn_next} ${_dyn_rest}"
+          elif [ "$_dup" -eq 1 ]; then
+            local _new_q="" _w
+            for _w in $_dyn_queue; do
+              if [ "$_w" = "${_picked_dep}" ]; then
+                _new_q="${_w} ${_dyn_next}"
+              elif [ "$_w" != "${_dyn_next}" ]; then
+                [ -z "${_new_q}" ] && _new_q="${_w}" || _new_q="${_new_q} ${_w}"
+              fi
+            done
+            _dyn_queue="${_new_q} ${_dyn_rest}"
+          else
+            continue
+          fi
+          continue
+        fi
         _dyn_rel=$( printf '%s\n' "$_dyn_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
         if [ -z "${_dyn_rel}" ]; then
           # Not a dependency error — break out of STAGE 2 into 3-attempt retry banner with prompt_edit_multiple.
-          _warn "migrate ${_dyn_next} FAILED (rc=$_dyn_rc) BUT error is NOT UndefinedTable — leaving STAGE 2 and entering full 3-attempt retry loop for ${aum_app} with evidence banner."
+          _warn "migrate ${_dyn_next} FAILED (rc=$_dyn_rc) BUT error is NOT any auto-healable class (UndefinedTable/CircularDep/NodeNotFound). Leaving STAGE 2 and entering full 3-attempt retry loop for ${aum_app} with evidence banner."
           break
         fi
         # UndefinedTable hit! Guess app_label from relation name (same as main migrate banner).
