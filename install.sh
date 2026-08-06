@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0300-none-conn-loader-fix"
+SCRIPT_VERSION_BUILD="2026-08-06T0400-env-sanitizer-paren-fix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -42,6 +42,57 @@ umask 022
 # --- global defaults --------------------------------------------------------
 ENV_DIR="/etc/rasyatone/static"
 ENV_FILE="${ENV_DIR}/rasyatone.env"
+# ── CRITICAL BOOT SAFETY: ONE-TIME ENV SANITIZER (runs BEFORE ANY `set -a; . "$ENV_FILE"`) ──
+#   Fixes the EXACT user bug: previous run wrote garbage CIRCULAR_APPS=raiseCircularDependencyError(
+#   (open paren unquoted) → THIS run first `source` throws:
+#     /etc/rasyatone/static/rasyatone.env: line 17: syntax error near unexpected token `('
+#   which aborts Bash source parser BEFORE reading DB_PASSWORD, DJANGO_SETTINGS_MODULE, etc.
+#   -> every subsequent migration/install step crashes with empty/nounset DB_PASSWORD errors.
+#   This sanitizer runs IMMEDIATELY when ENV_FILE is set (BEFORE function definitions would be
+#   available, so we inline the same 12-line loop check for CIRCULAR_* invalid key=value lines).
+if [ -n "${ENV_FILE:-}" ] && [ -f "${ENV_FILE}" ] && [ -r "${ENV_FILE}" ] && [ -w "${ENV_FILE}" ]; then
+  _early_san_tmp=""
+  _early_san_tmp=$(mktemp /tmp/rasyatone_env_early_sanitize_$$.XXXXXX 2>/dev/null || true)
+  if [ -n "${_early_san_tmp}" ]; then
+    _early_changed=0
+    while IFS= read -r _early_line || [ -n "${_early_line}" ]; do
+      case "$_early_line" in ''|\#*) printf '%s\n' "$_early_line" >> "$_early_san_tmp"; continue ;; esac
+      case "$_early_line" in
+        CIRCULAR_APPS=*|CIRCULAR_APPLY_2STEP=*)
+          _early_k="${_early_line%%=*}"
+          _early_v="${_early_line#*=}"
+          _early_ok=0
+          if [ "$_early_k" = "CIRCULAR_APPS" ]; then
+            if [ -z "$_early_v" ]; then _early_ok=1
+            elif printf '%s' "$_early_v" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]* [a-zA-Z_][a-zA-Z0-9_]*$'; then _early_ok=1
+            else _early_ok=0
+            fi
+          else
+            case "$_early_v" in y|Y|n|N|'') _early_ok=1 ;; *) _early_ok=0 ;; esac
+          fi
+          if [ "$_early_ok" -eq 1 ]; then
+            printf '%s\n' "$_early_line" >> "$_early_san_tmp"
+          else
+            case "$_early_k" in
+              CIRCULAR_APPS) printf 'CIRCULAR_APPS=\n' >> "$_early_san_tmp" ;;
+              CIRCULAR_APPLY_2STEP) printf 'CIRCULAR_APPLY_2STEP=n\n' >> "$_early_san_tmp" ;;
+            esac
+            _early_changed=1
+          fi
+          ;;
+        *) printf '%s\n' "$_early_line" >> "$_early_san_tmp" ;;
+      esac
+    done < "$ENV_FILE"
+    if [ "$_early_changed" -eq 1 ]; then
+      chmod --reference="$ENV_FILE" "$_early_san_tmp" 2>/dev/null || true
+      mv -f "$_early_san_tmp" "$ENV_FILE" 2>/dev/null || { cat "$_early_san_tmp" > "$ENV_FILE"; rm -f "$_early_san_tmp"; }
+      printf "\033[1;33m[WARN] EARLY BOOT ENV SANITIZER: removed invalid CIRCULAR_* sentinel entries from %s (open-paren/garbage caused bash source syntax error). Rewritten to valid empty defaults. Next sourcing will succeed.\033[0m\n" "$ENV_FILE" >&2
+    else
+      rm -f "$_early_san_tmp"
+    fi
+  fi
+  unset _early_san_tmp _early_changed _early_line _early_k _early_v _early_ok
+fi
 DEF_DB_NAME="rasyatone_db"
 DEF_DB_USER="rasyatone_db_user"
 DEF_DB_HOST="localhost"
@@ -536,6 +587,88 @@ PY
   _run_with_spinner "($_rcd_label step 4d) migrate all (0002 FK + all pending apps applied)" bash -c \
     "${_rcd_base_env} manage.py migrate" || true
   _ok "[$_rcd_label] AUTO-SPLIT complete for [$_cA] ↔ [$_cB]. Backup at: $_bkdir. Proceeding to normal migrate flow."
+  return 0
+}
+# ── ENV_FILE CIRCULAR SENTINEL SANITIZER (runs BEFORE every `set -a; . "$ENV_FILE"`) ──
+#   Fixes the EXACT user crash: last run wrote garbage CIRCULAR_APPS=raiseCircularDependencyError(
+#   (open paren unquoted) to /etc/rasyatone/static/rasyatone.env line 17. THIS run's `set -a; . env`
+#   tried to source it → syntax error near unexpected token `(' → ALL subsequent reads of DB_PASSWORD,
+#   DJANGO_SETTINGS_MODULE, etc. failed (parser aborted on invalid shell syntax).
+#
+#   Two-layer safety:
+#     1. Strip any lines where KEY=CIRCULAR_APPS or CIRCULAR_APPLY_2STEP contain INVALID CHARS
+#        (anything not POSIX shell word = [a-zA-Z0-9_] plus single space separator for CIRCULAR_APPS).
+#     2. For CIRCULAR_APPLY_2STEP: must be exactly y / Y / n / N / empty.
+#   Writes sanitized copy to /tmp tmpfile, then mv atomic (since sed -i may leave partial writes).
+_sanitize_env_file_circular_sentinels() {
+  local _s_ef="${1:-$ENV_FILE}"
+  [ -z "${_s_ef}" ] || [ ! -f "${_s_ef}" ] && return 0
+  local _s_tmp=""
+  _s_tmp=$(mktemp /tmp/rasyatone_env_sanitize_$$.XXXXXX 2>/dev/null || true)
+  [ -z "${_s_tmp}" ] && return 0
+  local _s_k="" _s_v="" _s_changed=0
+  local _s_valid_ca=1
+  while IFS= read -r _s_line || [ -n "${_s_line}" ]; do
+    # Skip comment lines, empty lines, export lines not containing "=".
+    case "$_s_line" in
+      ''|\#*) printf '%s\n' "$_s_line" >> "$_s_tmp"; continue ;;
+    esac
+    case "$_s_line" in
+      CIRCULAR_APPS=*|CIRCULAR_APPLY_2STEP=*)
+        _s_k="${_s_line%%=*}"
+        _s_v="${_s_line#*=}"
+        _s_valid_ca=0
+        if [ "$_s_k" = "CIRCULAR_APPS" ]; then
+          # Valid: empty OR exactly two POSIX words separated by exactly one single space.
+          if [ -z "$_s_v" ]; then
+            _s_valid_ca=1
+          elif printf '%s' "$_s_v" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]* [a-zA-Z_][a-zA-Z0-9_]*$'; then
+            _s_valid_ca=1
+          else
+            _s_valid_ca=0
+          fi
+        elif [ "$_s_k" = "CIRCULAR_APPLY_2STEP" ]; then
+          case "$_s_v" in y|Y|n|N|'') _s_valid_ca=1 ;; *) _s_valid_ca=0 ;; esac
+        fi
+        if [ "$_s_valid_ca" -eq 1 ]; then
+          printf '%s\n' "$_s_line" >> "$_s_tmp"
+        else
+          # Invalid: replace with valid empty default so next source succeeds.
+          case "$_s_k" in
+            CIRCULAR_APPS) printf 'CIRCULAR_APPS=\n' >> "$_s_tmp" ;;
+            CIRCULAR_APPLY_2STEP) printf 'CIRCULAR_APPLY_2STEP=n\n' >> "$_s_tmp" ;;
+          esac
+          _s_changed=1
+        fi
+        ;;
+      *) printf '%s\n' "$_s_line" >> "$_s_tmp" ;;
+    esac
+  done < "$_s_ef"
+  if [ "$_s_changed" -eq 1 ]; then
+    # Atomic replace (mv preserves permissions if in same fs).
+    chmod --reference="$_s_ef" "$_s_tmp" 2>/dev/null || true
+    mv -f "$_s_tmp" "$_s_ef" 2>/dev/null || { cat "$_s_tmp" > "$_s_ef"; rm -f "$_s_tmp"; }
+    _warn "ENV_FILE sanitized: removed invalid CIRCULAR_* sentinel entries (last run wrote garbage with open paren/colon to env file → caused bash source syntax error). Entries rewritten to valid empty defaults."
+  else
+    rm -f "$_s_tmp"
+  fi
+  return 0
+}
+# ── Validate CIRCULAR_APPS value BEFORE writing it to ENV_FILE. ──
+#   Args: $1 = candidate value (the _circ_apps bash var about to be written).
+#   Echoes normalized valid value on stdout: either empty string or "word1 word2" (exactly two POSIX words).
+#   Caller: _valid_ca=$(_validate_circular_apps_value "$_circ_apps"); CIRCULAR_APPS="$_valid_ca" >> ENV_FILE.
+_validate_circular_apps_value() {
+  local _in="${1:-}"
+  # Trim leading/trailing whitespace + collapse internal multi-space to single space.
+  _in=$(printf '%s' "$_in" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' || true)
+  [ -z "$_in" ] && { printf ''; return 0; }
+  if printf '%s' "$_in" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]* [a-zA-Z_][a-zA-Z0-9_]*$'; then
+    printf '%s' "$_in"
+    return 0
+  fi
+  # Invalid → empty.
+  printf ''
   return 0
 }
 
@@ -1219,6 +1352,7 @@ PY
       printf '%s\n' "$new_line" | sudo tee -a "$ENV_FILE" >/dev/null 2>/dev/null || true
     fi
     _ok "Wrote DJANGO_SETTINGS_MODULE='${chosen}' into ENV_FILE=$ENV_FILE (replace-or-append)."
+    _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
     set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
     _ok "ENV reloaded from $ENV_FILE. DJANGO_SETTINGS_MODULE now=${DJANGO_SETTINGS_MODULE} (shell + subprocess env)."
   else
@@ -1739,6 +1873,7 @@ load_env_file() {
   APP_DIR="$DEF_APP_DIR"; GIT_URL=""; GIT_BRANCH="$DEF_GIT_BRANCH"
   DJANGO_SETTINGS_MODULE="$DEF_DJANGO_SETTINGS_MODULE"; GUNICORN_BIND="$DEF_GUNICORN_BIND"; SERVICE_NAME="$DEF_SERVICE"
   if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
+    _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
     set -a; . "$ENV_FILE" || true; set +a
     DB_NAME="${DB_NAME:-$DEF_DB_NAME}"; DB_USER="${DB_USER:-$DEF_DB_USER}"
     DB_HOST="${DB_HOST:-$DEF_DB_HOST}"; DB_PORT="${DB_PORT:-$DEF_DB_PORT}"
@@ -1998,6 +2133,7 @@ precheck_app_prereqs() {
           if [ -n "${ENV_FILE:-}" ]; then
             grep -q "^DB_SUPERUSER_USER=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_USER='postgres'" >> "$ENV_FILE"
             grep -q "^DB_SUPERUSER_PASSWORD=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_PASSWORD=''" >> "$ENV_FILE"
+            _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
             set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
           fi
           prompt_edit_multiple \
@@ -2837,6 +2973,7 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   _ok "Python runtime locked: ${PYTHON_BIN} $("$PYTHON_BIN" --version 2>&1 | head -n1) — venv+pip modules verified"
 
   _section "Validate DB connectivity (DB_PASSWORD from $ENV_FILE)"
+  _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
   set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
   if command -v psql >/dev/null 2>&1; then
     local dbprobe_attempt=0 dbprobe_max=3 dbprobe_done=0
@@ -2906,6 +3043,7 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
           if [ -n "${ENV_FILE:-}" ]; then
             grep -q "^DB_SUPERUSER_USER=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_USER='postgres'" >> "$ENV_FILE"
             grep -q "^DB_SUPERUSER_PASSWORD=" "$ENV_FILE" 2>/dev/null || echo "DB_SUPERUSER_PASSWORD=''" >> "$ENV_FILE"
+            _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
             set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
           fi
           prompt_edit_multiple \
@@ -2931,6 +3069,7 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
               fi
             done
             # Reload from ENV so DB_* vars used inside git clone block (if any) are in sync with what's on disk.
+            _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
             set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
           fi
         else
@@ -3711,6 +3850,7 @@ PY
   _section "Run Django collectstatic + migrate"
   (
     cd "$APP_DIR"
+    _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
     set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
     export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
     # Same set -u safety for nested activate inside subshell
@@ -3823,6 +3963,7 @@ EOBANNER
           "Retry django.setup() precheck with (possibly edited) values?" \
           "y"
         # If user re-edited DB_* / DJANGO_SETTINGS_MODULE → must reload ENV into THIS subshell
+        _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
         set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
         export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
       else
@@ -3961,6 +4102,7 @@ PY
             "DJANGO_SETTINGS_MODULE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR" \
             "Retry makemigrations with (possibly edited) values NOW?" \
             "y"
+          _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
           set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
           export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
           mmk_cmd_check="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py makemigrations --check --dry-run --verbosity 1"
@@ -4331,9 +4473,17 @@ PY
               fi
               # ── CAUSE (I): if CircularDependencyError detected → pre-populate CIRCULAR_APPS sentinel + defaults. ──
               if [ -n "${_circ_apps}" ]; then
+                local _valid_ca=""
+                _valid_ca=$(_validate_circular_apps_value "${_circ_apps}" || true)
                 grep -q "^CIRCULAR_APPS=" "$ENV_FILE" 2>/dev/null && sed -i "/^CIRCULAR_APPS=/d" "$ENV_FILE" 2>/dev/null || true
-                echo "CIRCULAR_APPS=${_circ_apps}" >> "$ENV_FILE" 2>/dev/null || true
-                grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=y" >> "$ENV_FILE" 2>/dev/null || true
+                if [ -n "${_valid_ca}" ]; then
+                  echo "CIRCULAR_APPS=${_valid_ca}" >> "$ENV_FILE" 2>/dev/null || true
+                  grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=y" >> "$ENV_FILE" 2>/dev/null || true
+                else
+                  # _circ_apps contains garbage characters (Bash regex source line 'raise CircularDependencyError(' picked last run) → write EMPTY defaults.
+                  echo "CIRCULAR_APPS=" >> "$ENV_FILE" 2>/dev/null || true
+                  grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=n" >> "$ENV_FILE" 2>/dev/null || true
+                fi
               else
                 grep -q "^CIRCULAR_APPS=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPS=" >> "$ENV_FILE" 2>/dev/null || true
                 grep -q "^CIRCULAR_APPLY_2STEP=" "$ENV_FILE" 2>/dev/null || echo "CIRCULAR_APPLY_2STEP=n" >> "$ENV_FILE" 2>/dev/null || true
@@ -4344,6 +4494,7 @@ PY
               "DJANGO_SETTINGS_MODULE MAKEMIGRATIONS_APP MIGRATE_DEPENDENCY_FIRST DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT APP_DIR CIRCULAR_APPS CIRCULAR_APPLY_2STEP" \
               "Retry migrate ${aum_app} with edited values?" \
               "y"
+            _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
             set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
             export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
             # ── CAUSE (I): CIRCULAR_APPLY_2STEP sentinel = y → run the 2-step split auto-fix. ──
@@ -4597,6 +4748,7 @@ PY
           "Retry manage.py migrate with (possibly edited) values NOW?" \
           "y"
         # Re-sync migrate command string + subshell env after edit menu wrote new values.
+        _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
         set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
         export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
         mig_cmd_fresh="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python' manage.py migrate"
