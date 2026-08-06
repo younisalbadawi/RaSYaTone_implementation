@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0200-unconditional-circular-check"
+SCRIPT_VERSION_BUILD="2026-08-06T0300-none-conn-loader-fix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -339,13 +339,41 @@ _resolve_circular_dep() {
 import os, sys
 try:
     import django; django.setup()
-    from django.db import connections
     from django.db.migrations.loader import MigrationLoader
     from django.db.migrations.exceptions import CircularDependencyError
-    conn = connections["default"]
-    loader = MigrationLoader(conn, ignore_no_migrations=True)
-    print("GRAPH_OK")
-    sys.exit(0)
+    # PRIMARY LOADER — use None for connection (EXACTLY as Django's own makemigrations.py:140
+    # does in user traceback: `MigrationLoader(None, ignore_no_migrations=True)`). This
+    # means NO DB CONNECTION REQUIRED — migration graph is built 100% from files on disk
+    # (INSTALLED_APPS migrations dirs). This works even when:
+    #   (a) DB does not exist yet (fresh install, first migrations ever)
+    #   (b) DB_HOST / DB_PASSWORD wrong
+    #   (c) PostgreSQL not started / socket missing
+    # ALL of which cause `connections["default"]` → OperationalError → GRAPH_CHECK_SKIP
+    # (old bug) → cycle not detected → dep chain makemigrations auth_app crashes with
+    # CircularDependencyError because it ALSO uses this None-connection loader.
+    try:
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        print("GRAPH_OK")
+        sys.exit(0)
+    except CircularDependencyError as e:
+        import re
+        raw = str(e)
+        m = re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.0001_initial\b", raw)
+        if len(m) >= 2:
+            a, b = m[0], m[1]
+            try:
+                from django.conf import settings
+                aum = getattr(settings, "AUTH_USER_MODEL", "auth.User")
+                aum_al = aum.partition(".")[0]
+                if aum_al != "auth":
+                    if b == aum_al:
+                        a, b = b, a
+            except Exception:
+                pass
+            print("CIRCULAR:%s|%s" % (a, b))
+        else:
+            print("CIRCULAR_PARSE_FAIL:%s" % raw)
+        sys.exit(2)
 except CircularDependencyError as e:
     import re
     raw = str(e)
@@ -366,8 +394,37 @@ except CircularDependencyError as e:
         print("CIRCULAR_PARSE_FAIL:%s" % raw)
     sys.exit(2)
 except Exception as ex:
-    print("GRAPH_CHECK_SKIP:%s" % type(ex).__name__)
-    sys.exit(3)
+    # Fallback: try connection-based loader (legacy, for edge cases).
+    try:
+        from django.db import connections
+        from django.db.migrations.loader import MigrationLoader
+        from django.db.migrations.exceptions import CircularDependencyError
+        conn = connections["default"]
+        loader = MigrationLoader(conn, ignore_no_migrations=True)
+        print("GRAPH_OK_FALLBACK_CONN")
+        sys.exit(0)
+    except CircularDependencyError as e:
+        import re
+        raw = str(e)
+        m = re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.0001_initial\b", raw)
+        if len(m) >= 2:
+            a, b = m[0], m[1]
+            try:
+                from django.conf import settings
+                aum = getattr(settings, "AUTH_USER_MODEL", "auth.User")
+                aum_al = aum.partition(".")[0]
+                if aum_al != "auth":
+                    if b == aum_al:
+                        a, b = b, a
+            except Exception:
+                pass
+            print("CIRCULAR:%s|%s" % (a, b))
+        else:
+            print("CIRCULAR_PARSE_FAIL:%s" % raw)
+        sys.exit(2)
+    except Exception:
+        print("GRAPH_CHECK_SKIP:%s" % type(ex).__name__)
+        sys.exit(3)
 PY
 )
   _rcd_rc=$?
@@ -380,7 +437,7 @@ PY
   esac
   if [ -z "$_pa" ] || [ -z "$_pb" ] || [ ! -d "${_rcd_app_dir}/$_pa" ] || [ ! -d "${_rcd_app_dir}/$_pb" ]; then
     # No cycle detected OR unreadable check.
-    if printf '%s' "$_rcd_out" | grep -q '^GRAPH_OK$'; then
+    if printf '%s' "$_rcd_out" | grep -qE '^GRAPH_OK$|^GRAPH_OK_FALLBACK_CONN$'; then
       _ok "[$_rcd_label] Django migration graph OK: no CircularDependencyError (all Migration.dependencies form a valid DAG)."
     else
       _info "[$_rcd_label] Django migration graph check skipped (output=$_rcd_out rc=$_rcd_rc). Safe no-op; cycle will be caught by migrate banners if exists."
@@ -4228,7 +4285,10 @@ PY
           printf "  \033[1;33m[STAGE 2 applied:]\033[0m %s\n  \033[1;33m[STAGE 2 final queue:]\033[0m %s\n" "${_dyn_applied:-<none>}" "${_dyn_queue:-<empty>}" >&2
           # ── CAUSE (I): CircularDependencyError auto-extract + banner (if present in traceback). ──
           local _circ_line="" _circ_pair_raw="" _circ_app1="" _circ_app2=""
-          _circ_line=$(printf '%s\n' "$aum_tb" | grep -E 'CircularDependencyError' 2>/dev/null | head -n 1 || true)
+          _circ_line=$(printf '%s\n' "$aum_tb" | grep -E 'CircularDependencyError:.*0001_initial' 2>/dev/null | head -n 1 || true)
+          if [ -z "${_circ_line}" ]; then
+            _circ_line=$(printf '%s\n' "$aum_tb" | grep -E '[a-zA-Z_][a-zA-Z0-9_]*\.0001_initial.*[a-zA-Z_][a-zA-Z0-9_]*\.0001_initial' 2>/dev/null | head -n 1 || true)
+          fi
           if [ -n "${_circ_line}" ]; then
             _circ_pair_raw=$(printf '%s' "${_circ_line}" | sed -E 's/.*CircularDependencyError:\s*//' || true)
             _circ_app1=$(printf '%s' "${_circ_pair_raw}" | awk -F',' '{print $1}' | awk -F'.' '{print $1}' | tr -d '[:space:]' || true)
@@ -4314,7 +4374,10 @@ PY
             rm -f "$aum_fresh"
             # ── Re-extract CircularDependencyError pair from aum_tb (die block scope; _circ_apps was local to inner if) ──
             local _dc_line="" _dc_pair_raw="" _dc_app1="" _dc_app2="" _dc_apps="<none detected>"
-            _dc_line=$(printf '%s\n' "$aum_tb" | grep -E 'CircularDependencyError' 2>/dev/null | head -n 1 || true)
+            _dc_line=$(printf '%s\n' "$aum_tb" | grep -E 'CircularDependencyError:.*0001_initial' 2>/dev/null | head -n 1 || true)
+            if [ -z "${_dc_line}" ]; then
+              _dc_line=$(printf '%s\n' "$aum_tb" | grep -E '[a-zA-Z_][a-zA-Z0-9_]*\.0001_initial.*[a-zA-Z_][a-zA-Z0-9_]*\.0001_initial' 2>/dev/null | head -n 1 || true)
+            fi
             if [ -n "${_dc_line}" ]; then
               _dc_pair_raw=$(printf '%s' "${_dc_line}" | sed -E 's/.*CircularDependencyError:\s*//' || true)
               _dc_app1=$(printf '%s' "${_dc_pair_raw}" | awk -F',' '{print $1}' | awk -F'.' '{print $1}' | tr -d '[:space:]' || true)
