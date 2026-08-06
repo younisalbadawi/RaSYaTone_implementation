@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0730-autoheal-logorder-stage1dedupe"
+SCRIPT_VERSION_BUILD="2026-08-06T0800-verbose-probe-no-2devnull"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -753,33 +753,61 @@ _run_migrate_autoheal() {
       return "$_rma_rc"
     fi
     # ── Enumerate LONGEST-FIRST underscore-prefix candidates → match against Django apps registry. ──
-    #    Python returns EMPTY string on no match, OR the exact app label (from apps.get_app_config(label).label).
+    #    Python returns EMPTY string on no match (after trim), OR exact app label.
+    #    CRITICAL: do NOT swallow stderr blindly! django.setup() can fail with ImportError/DatabaseError
+    #    — if we hide those, we get false "no match found" banners.
+    #    We split stdout (label) vs stderr (tracebacks). If stdout empty AND stderr non-empty → treat as probe ERROR (not no-match) and tell user.
     local _rma_match=""
-    _rma_match=$( PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" - "${_rma_rel}" <<'PY' 2>/dev/null || true
+    local _rma_probe_stderr="/tmp/rasyatone_rma_probe_stderr_$$.log"
+    local _rma_probe_stdout="/tmp/rasyatone_rma_probe_stdout_$$.log"
+    : > "$_rma_probe_stderr" 2>/dev/null || true
+    : > "$_rma_probe_stdout" 2>/dev/null || true
+    set +e
+    PYTHONPATH="${_rma_app_dir}" DJANGO_SETTINGS_MODULE="${_rma_settings}" "${_rma_venv_py}" - "${_rma_rel}" <<'PY' >"$_rma_probe_stdout" 2>"$_rma_probe_stderr"
 import django, sys
 try:
     django.setup()
     from django.apps import apps
     table = sys.argv[1]
     parts = table.split("_")
-    # Longest-prefix-first: for N parts, try join(parts[0..N-1]), then 0..N-2, ..., down to 0..0
+    found_label = ""
+    # Longest-prefix-first candidate search against AppConfig.label (the official dep key)
     for i in range(len(parts), 0, -1):
         cand = "_".join(parts[:i])
         try:
             cfg = apps.get_app_config(cand)
-            print(cfg.label)
-            sys.exit(0)
+            found_label = cfg.label
+            break
         except LookupError:
             continue
-except Exception:
-    pass
+    if found_label:
+        print(found_label)
+        sys.exit(0)
+    else:
+        sys.exit(2)  # exit 2 = no match found (clean), stderr empty
+except Exception as _e:
+    # Probe ERROR: django.setup failed or similar. Print traceback for user debugging, exit 1.
+    import traceback
+    sys.stderr.write("RMA_PROBE_EXCEPTION: %s\n" % str(_e))
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
 PY
-)
-    _rma_match=$(printf '%s' "${_rma_match}" | tr -d '[:space:]\r\n' || true)
+    local _rma_probe_rc=$?
+    set -e
+    _rma_match="$( tr -d '[:space:]\r\n' < "$_rma_probe_stdout" 2>/dev/null || printf '' )"
+    local _rma_probe_err_lines="$( wc -l < "$_rma_probe_stderr" 2>/dev/null | tr -d '[:space:]' || printf '0' )"
     if [ -z "${_rma_match}" ]; then
-      _warn "UndefinedTable autoheal round ${_rma_round}: table '${_rma_rel}' — no underscore-prefix matches any installed app. (Longest-match search against Django apps registry failed.) Falling back to 3-attempt retry banner."
+      if [ "$_rma_probe_rc" -eq 1 ] || [ "$_rma_probe_err_lines" -gt 0 ]; then
+        local _err_snip=""
+        _err_snip="$( tail -n 12 "$_rma_probe_stderr" 2>/dev/null | sed 's/^/      | /' || true )"
+        _warn "UndefinedTable autoheal round ${_rma_round}: table '${_rma_rel}' — Python apps.get_app_config PROBE FAILED (django.setup crashed; not a 'no app matches' problem). Probe stderr (last 12 lines):\n${_err_snip}\n    Falling back to manual retry banner — you likely need to fix settings/import errors in ${DJANGO_SETTINGS_MODULE} before migration probes can work."
+      else
+        _warn "UndefinedTable autoheal round ${_rma_round}: table '${_rma_rel}' — no underscore-prefix matches any installed app. (Longest-match search against Django apps registry failed cleanly; probe returned rc=${_rma_probe_rc}.) Falling back to 3-attempt retry banner."
+      fi
+      rm -f "$_rma_probe_stdout" "$_rma_probe_stderr" 2>/dev/null || true
       return "$_rma_rc"
     fi
+    rm -f "$_rma_probe_stdout" "$_rma_probe_stderr" 2>/dev/null || true
     if [ "${_rma_match}" = "${_rma_label:-}" ]; then
       _warn "UndefinedTable autoheal round ${_rma_round}: table '${_rma_rel}' → match app '${_rma_match}' IS the migrate target we just ran. Cannot auto-heal a target against itself (circular: UndefinedTable within its own migration). Failing back to manual retry banner."
       return "$_rma_rc"
@@ -4492,16 +4520,20 @@ except Exception as _e:
 PY
 )
       if [ -n "${_stage1_deps}" ]; then
-        # ── Filter: remove target app label from stage1 deps (dedupe), remove blanks, preserve dependency order ──
+        # ── Filter stage1 deps: (1) strip target app label removed; (2) dedupe preserve order; (3) remove whitespace trimmed.
+        #    Pure POSIX string ops — no associative arrays, works on Bash 3.2+. Needle-in-haystack: " $_s1_filtered " contains " $_s1_tok ".
         local _s1_filtered="" _s1_tok=""
-        local -A _s1_seen=()
         for _s1_tok in ${_stage1_deps}; do
           _s1_tok=$(printf '%s' "${_s1_tok}" | tr -d '[:space:]\r\n' || true)
           [ -z "${_s1_tok}" ] && continue
           [ "${_s1_tok}" = "${aum_app}" ] && continue
-          if [ -z "${_s1_seen[${_s1_tok}]+x}" ]; then
-            _s1_seen[${_s1_tok}]=1
-            [ -z "${_s1_filtered}" ] && _s1_filtered="${_s1_tok}" || _s1_filtered="${_s1_filtered} ${_s1_tok}"
+          # Dedupe: is token already in filtered list?
+          if [ -z "${_s1_filtered}" ]; then
+            _s1_filtered="${_s1_tok}"
+          elif [[ " ${_s1_filtered} " == *" ${_s1_tok} "* ]]; then
+            continue
+          else
+            _s1_filtered="${_s1_filtered} ${_s1_tok}"
           fi
         done
         _stage1_deps="${_s1_filtered}"
@@ -4588,12 +4620,58 @@ PY
         local _cand
         for _cand in "$_dep_candidate" "$_fallback_dep"; do
           [ -z "$_cand" ] && continue
-          # Quick check: does INSTALLED_APPS know an app with this label? (python probe, tolerant of failure).
+          # Quick check: does INSTALLED_APPS know an app with this label? (python probe, tolerant — but keep stderr to diagnose probe crashes).
           local _found=0
-          if PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" -c "import django,sys; django.setup(); from django.apps import apps; sys.exit(0 if apps.is_installed(sys.argv[1]) else 1)" "$_cand" 2>/dev/null; then
-            _found=1
+          local _probe_stderr="/tmp/rasyatone_stage2_probe_stderr_$$.log"
+          local _probe_stdout="/tmp/rasyatone_stage2_probe_stdout_$$.log"
+          : > "$_probe_stderr" 2>/dev/null || true
+          : > "$_probe_stdout" 2>/dev/null || true
+          set +e
+          PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - "$_cand" >"$_probe_stdout" 2>"$_probe_stderr" <<'PY'
+import django, sys
+try:
+    django.setup()
+    from django.apps import apps
+    label = sys.argv[1]
+    # (a) try strict get_app_config(label) first — AppConfig.label official lookup
+    try:
+        cfg = apps.get_app_config(label)
+        print(cfg.label)
+        sys.exit(0)
+    except LookupError:
+        pass
+    # (b) fallback: iterate all installed apps and check their LABELS / dotted paths
+    #      (handles cases where label registered with non-default name in AppConfig)
+    for cfg in apps.get_app_configs():
+        lc = cfg.label
+        ld = cfg.name  # full dotted module name e.g. 'core.hr'
+        if ld and (ld == label or ld.endswith('.' + label)):
+            print(lc)
+            sys.exit(0)
+        if lc == label:
+            print(lc)
+            sys.exit(0)
+    sys.exit(2)  # exit 2 = clean no match, stderr empty
+except Exception as _e:
+    import traceback
+    sys.stderr.write("STAGE2_PROBE_EXCEPTION: %s\n" % str(_e))
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+PY
+          local _probe_rc=$?
+          set -e
+          local _probe_res=""
+          _probe_res="$( tr -d '[:space:]\r\n' < "$_probe_stdout" 2>/dev/null || printf '' )"
+          if [ "$_probe_rc" -eq 0 ] && [ -n "$_probe_res" ]; then
+            _picked_dep="$_probe_res"
+            rm -f "$_probe_stderr" "$_probe_stdout" 2>/dev/null || true
+            break
+          elif [ "$_probe_rc" -eq 1 ]; then
+            local _err_snip=""
+            _err_snip="$( tail -n 10 "$_probe_stderr" 2>/dev/null | sed 's/^/      | /' || true )"
+            _warn "STAGE 2: UndefinedTable table '${_dyn_rel}' candidate app '${_cand}' — apps.is_installed PROBE FAILED (django.setup crashed; missing setting or import error). Probe stderr (last 10 lines):\n${_err_snip}\n    Will try other candidates / fall back."
           fi
-          if [ "$_found" -eq 1 ]; then _picked_dep="$_cand"; break; fi
+          rm -f "$_probe_stderr" "$_probe_stdout" 2>/dev/null || true
         done
         if [ -z "${_picked_dep}" ]; then
           _warn "STAGE 2: UndefinedTable relation '${_dyn_rel}' → guess '${_dyn_guess}' not installed in INSTALLED_APPS. Can't resolve dependency dynamically → falling to 3-attempt retry banner."
