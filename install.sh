@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1430-nonnullable-stop"
+SCRIPT_VERSION_BUILD="2026-08-06T1500-nonnullable-hardstop"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -901,8 +901,7 @@ PY
             if [ -n "${_mm_log}" ] && grep -Eq "impossible to add a non-nullable field without specifying a default|non-nullable field" "${_mm_log}" 2>/dev/null; then
               local _mm_tail=""
               _mm_tail="$( tail -n 3 "${_mm_log}" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
-              _warn "UndefinedTable autoheal round ${_rma_round}: makemigrations '${_rf}' requires a default/null for a new non-nullable field. Cannot auto-heal safely. ${_mm_tail}"
-              return "$_rma_rc"
+              _die "makemigrations '${_rf}' requires a default/null for a new non-nullable field. Fix the Django model/migration (set null=True or provide a default/data migration), then rerun. ${_mm_tail}"
             fi
             _warn "UndefinedTable autoheal round ${_rma_round}: makemigrations '${_rf}' failed (rc=${_mm_rc}). Cannot auto-heal further; falling back to retry banner."
             return "$_rma_rc"
@@ -4947,9 +4946,7 @@ PY
                 if [ -n "${_mm2_log}" ] && grep -Eq "impossible to add a non-nullable field without specifying a default|non-nullable field" "${_mm2_log}" 2>/dev/null; then
                   local _mm2_tail=""
                   _mm2_tail="$( tail -n 3 "${_mm2_log}" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
-                  _warn "migrate ${_dyn_next} FAILED: makemigrations '${_a3}' requires a default/null for a new non-nullable field. Cannot auto-heal safely. ${_mm2_tail}"
-                  set -e
-                  break
+                  _die "makemigrations '${_a3}' requires a default/null for a new non-nullable field. Fix the Django model/migration (set null=True or provide a default/data migration), then rerun. ${_mm2_tail}"
                 fi
                 _warn "migrate ${_dyn_next} FAILED: makemigrations '${_a3}' failed (rc=${_mm2_rc}). Cannot auto-heal further."
                 set -e
