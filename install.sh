@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1400-undefinedcolumn-eof-fix"
+SCRIPT_VERSION_BUILD="2026-08-06T1430-nonnullable-stop"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -893,7 +893,20 @@ PY
         for _rf in ${_rma_fix_list}; do
           set +e
           _run_with_spinner "(autoheal r${_rma_round} → makemig '${_rf}' for UndefinedColumn) manage.py makemigrations --noinput '${_rf}'" bash -c \
-            "${_rma_base_env} manage.py makemigrations --noinput '${_rf}'" || true
+            "${_rma_base_env} manage.py makemigrations --noinput '${_rf}'"
+          local _mm_rc=$?
+          if [ "${_mm_rc}" -ne 0 ]; then
+            local _mm_log=""
+            _mm_log="$( ls -1t /tmp/rasyatone_spin_*makemig*${_rf}*.log /tmp/rasyatone_spin_*makemigrations*${_rf}*.log 2>/dev/null | head -n 1 || true )"
+            if [ -n "${_mm_log}" ] && grep -Eq "impossible to add a non-nullable field without specifying a default|non-nullable field" "${_mm_log}" 2>/dev/null; then
+              local _mm_tail=""
+              _mm_tail="$( tail -n 3 "${_mm_log}" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
+              _warn "UndefinedTable autoheal round ${_rma_round}: makemigrations '${_rf}' requires a default/null for a new non-nullable field. Cannot auto-heal safely. ${_mm_tail}"
+              return "$_rma_rc"
+            fi
+            _warn "UndefinedTable autoheal round ${_rma_round}: makemigrations '${_rf}' failed (rc=${_mm_rc}). Cannot auto-heal further; falling back to retry banner."
+            return "$_rma_rc"
+          fi
           _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rf}" || true
           set -e
         done
@@ -4926,7 +4939,22 @@ PY
             for _a3 in ${_dyn_apps_list}; do
               set +e
               _run_with_spinner "manage.py makemigrations ${_a3} (autoheal — UndefinedColumn)" bash -c \
-                "${_dyn_base_env} manage.py makemigrations --noinput '${_a3}'" || true
+                "${_dyn_base_env} manage.py makemigrations --noinput '${_a3}'"
+              local _mm2_rc=$?
+              if [ "${_mm2_rc}" -ne 0 ]; then
+                local _mm2_log=""
+                _mm2_log="$( ls -1t /tmp/rasyatone_spin_*makemig*${_a3}*.log /tmp/rasyatone_spin_*makemigrations*${_a3}*.log 2>/dev/null | head -n 1 || true )"
+                if [ -n "${_mm2_log}" ] && grep -Eq "impossible to add a non-nullable field without specifying a default|non-nullable field" "${_mm2_log}" 2>/dev/null; then
+                  local _mm2_tail=""
+                  _mm2_tail="$( tail -n 3 "${_mm2_log}" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
+                  _warn "migrate ${_dyn_next} FAILED: makemigrations '${_a3}' requires a default/null for a new non-nullable field. Cannot auto-heal safely. ${_mm2_tail}"
+                  set -e
+                  break
+                fi
+                _warn "migrate ${_dyn_next} FAILED: makemigrations '${_a3}' failed (rc=${_mm2_rc}). Cannot auto-heal further."
+                set -e
+                break
+              fi
               set -e
               if [ "${_a3}" != "${_dyn_next}" ]; then
                 local _seen=0 _t
@@ -4937,6 +4965,9 @@ PY
                 fi
               fi
             done
+            if [ "${_mm2_rc:-0}" -ne 0 ]; then
+              break
+            fi
             if [ -n "${_pref}" ]; then
               _dyn_queue="${_pref} ${_dyn_next} ${_dyn_rest}"
             fi
