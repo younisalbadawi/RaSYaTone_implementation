@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0900-nodenotfound-graph-heal"
+SCRIPT_VERSION_BUILD="2026-08-06T1000-parse-queue-bulletproof"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -749,16 +749,32 @@ _run_migrate_autoheal() {
       _rma_rel=$( grep -oE 'relation "[^"]+" does not exist' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
     fi
     if [ -z "${_rma_rel}" ]; then
-      # ── CLASS B: NodeNotFoundError (migration graph DummyNode: later-numbered migration references a missing earlier-numbered sibling).
-      #    Pattern: NodeNotFoundError: Migration X.Y dependencies reference nonexistent parent node ('APP', 'NNNN_initial')
-      #    Example: NodeNotFoundError: Migration auth_app.0002_initial dependencies reference nonexistent parent node ('companies', '0001_initial')
-      local _rma_node_missing_app="" _rma_node_referencer=""
-      _rma_node_referencer="$( grep -oE 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E 's/^NodeNotFoundError: Migration //; s/ dependencies reference nonexistent parent node$//' || true )"
-      _rma_node_missing_app="$( grep -oE "reference nonexistent parent node \('[a-zA-Z0-9_]+', '" "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E "s/^reference nonexistent parent node '\\('//; s/', '//; s/'$//" || true )"
+      # ── CLASS B: NodeNotFoundError (migration graph DummyNode).
+      #    Extract referencer (APP.NAME) cleanly; then for missing parent app label, find the FIRST single-quoted
+      #    valid Django identifier on the NodeNotFoundError line (it corresponds to the parent app label in tuple
+      #    ('PARENT_LABEL', '0001_initial')). Never needs interpretation of paren vs quote ordering.
+      local _rma_node_missing_app="" _rma_node_referencer="" _rma_node_line=""
+      _rma_node_line="$( grep -E 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' "${_rma_tb_log}" 2>/dev/null | head -n 1 || true )"
+      if [ -z "${_rma_node_line}" ]; then
+        _rma_node_line="$( printf '%s' "${_rma_tail}" | grep -E 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' 2>/dev/null | head -n 1 || true )"
+      fi
+      if [ -n "${_rma_node_line}" ]; then
+        # Referencer: APP.NAME (the migration file that declares the faulty dep)
+        _rma_node_referencer="$( printf '%s' "${_rma_node_line}" | grep -oE 'Migration [^ ]+ dependencies' 2>/dev/null | head -n 1 | sed -E 's/^Migration //; s/ dependencies$//' || true )"
+        # Parent app label: FIRST single-quoted [A-Za-z0-9_]+ token inside the tuple (matches ('companies', '0001_initial') → 'companies')
+        _rma_node_missing_app="$( printf '%s' "${_rma_node_line}" | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | head -n 1 | sed -E "s/^'//; s/'$//" || true )"
+      fi
+      # STRICT VALIDATION — Django app labels are strictly [a-zA-Z0-9_]+. If extraction fails parse, skip.
+      if [ -n "${_rma_node_missing_app}" ] && ! printf '%s' "${_rma_node_missing_app}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+        _info "UndefinedTable autoheal round ${_rma_round}: extracted NodeNotFoundError missing_app='${_rma_node_missing_app}' fails [a-zA-Z0-9_]+ validation (parse failure). Ignoring — will not auto-heal with invalid label."
+        _rma_node_missing_app=""
+      fi
       if [ -z "${_rma_node_missing_app}" ]; then
-        # Try FULL log for node pattern
-        _rma_node_referencer="$( grep -oE 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E 's/^NodeNotFoundError: Migration //; s/ dependencies reference nonexistent parent node$//' || true )"
-        _rma_node_missing_app="$( grep -oE "reference nonexistent parent node \('[a-zA-Z0-9_]+', '" "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed -E "s/^reference nonexistent parent node '\\('//; s/', '//; s/'$//" || true )"
+        # Secondary try: try FULL file for the first single-quoted valid id AFTER the phrase 'parent node'
+        _rma_node_missing_app="$( sed -n '/parent node/,$p' "${_rma_tb_log}" 2>/dev/null | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | head -n 1 | sed -E "s/^'//; s/'$//" || true )"
+        if [ -n "${_rma_node_missing_app}" ] && ! printf '%s' "${_rma_node_missing_app}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+          _rma_node_missing_app=""
+        fi
       fi
       if [ -n "${_rma_node_missing_app}" ]; then
         _info "UndefinedTable autoheal round ${_rma_round}: graph NodeNotFoundError detected. Referencer='${_rma_node_referencer}' missing_parent_app='${_rma_node_missing_app}'. Auto-healing missing app first."
@@ -4657,10 +4673,39 @@ PY
           break
         fi
         # ── Check for NodeNotFoundError (orphan migration file with missing parent dependency): ──
-        #    Pattern: NodeNotFoundError: Migration APP.NAME dependencies reference nonexistent parent node ('MISSING_APP', 'NNNN_initial')
-        local _dyn_node_miss="" _dyn_node_ref=""
-        _dyn_node_ref="$( printf '%s\n' "$_dyn_tb" | grep -oE 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' 2>/dev/null | head -n 1 | sed -E 's/^NodeNotFoundError: Migration //; s/ dependencies reference nonexistent parent node$//' || true )"
-        _dyn_node_miss="$( printf '%s\n' "$_dyn_tb" | grep -oE "reference nonexistent parent node \('[a-zA-Z0-9_]+', '" 2>/dev/null | head -n 1 | sed -E "s/^reference nonexistent parent node '\\('//; s/', '//; s/'$//" || true )"
+        #    Extract FIRST single-quoted valid Django identifier after 'parent node' (the tuple ('LABEL', 'NNNN_initial')).
+        #    No paren/quote order reasoning needed.
+        local _dyn_node_miss="" _dyn_node_ref="" _dyn_node_line=""
+        _dyn_node_line="$( printf '%s\n' "$_dyn_tb" | grep -E 'NodeNotFoundError: Migration [^ ]+ dependencies reference nonexistent parent node' 2>/dev/null | head -n 1 || true )"
+        if [ -n "${_dyn_node_line}" ]; then
+          _dyn_node_ref="$( printf '%s' "${_dyn_node_line}" | grep -oE 'Migration [^ ]+ dependencies' 2>/dev/null | head -n 1 | sed -E 's/^Migration //; s/ dependencies$//' || true )"
+          _dyn_node_miss="$( printf '%s' "${_dyn_node_line}" | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | head -n 1 | sed -E "s/^'//; s/'$//" || true )"
+        fi
+        if [ -z "${_dyn_node_miss}" ]; then
+          _dyn_node_miss="$( printf '%s\n' "$_dyn_tb" | sed -n '/parent node/,$p' 2>/dev/null | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | head -n 1 | sed -E "s/^'//; s/'$//" || true )"
+        fi
+        # STRICT VALIDATION: if parse produced invalid chars, skip entirely — no queue mutation.
+        if [ -n "${_dyn_node_miss}" ] && ! printf '%s' "${_dyn_node_miss}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+          _info "STAGE 2: extracted missing app='${_dyn_node_miss}' failed label-char validation — ignore."
+          _dyn_node_miss=""
+        fi
+        # ── SANITIZE QUEUE: rebuild token-by-token, DROP any token that has non [a-zA-Z0-9_] chars (defense-in-depth). ──
+        #    This strips any accidentally-added multi-word junk tokens (like 'reference' from parse failures) so the
+        #    next for-loop iteration of the queue sees only valid app-label words.
+        local _dyn_queue_clean="" _tok
+        for _tok in $_dyn_queue; do
+          if printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+            [ -z "${_dyn_queue_clean}" ] && _dyn_queue_clean="${_tok}" || _dyn_queue_clean="${_dyn_queue_clean} ${_tok}"
+          fi
+        done
+        _dyn_queue="${_dyn_queue_clean}"
+        local _dyn_applied_clean=""
+        for _tok in $_dyn_applied; do
+          if printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+            [ -z "${_dyn_applied_clean}" ] && _dyn_applied_clean="${_tok}" || _dyn_applied_clean="${_dyn_applied_clean} ${_tok}"
+          fi
+        done
+        _dyn_applied="${_dyn_applied_clean}"
         if [ -n "${_dyn_node_miss}" ]; then
           # Heal same as autoheal wrapper: auto-run makemigrations on missing app FIRST, then DELETE orphan referencer if not applied.
           _warn "migrate ${_dyn_next} FAILED: NodeNotFoundError graph broken. Referencer='${_dyn_node_ref}' missing_parent_app='${_dyn_node_miss}'. Auto-healing in STAGE 2: migrate missing parent app, then retry current target."
@@ -4684,6 +4729,11 @@ PY
           fi
           # Ensure missing parent app is migrated BEFORE retrying target (prepend to queue).
           local _picked_dep="${_dyn_node_miss}"
+          # DOUBLE VALIDATION before queue mutation: any parse failure now → skip without touching queue.
+          if ! printf '%s' "${_picked_dep}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+            _info "STAGE 2: picked dep='${_picked_dep}' failed final validation before queue rebuild — skipping queue mutation."
+            break
+          fi
           local _dup=0
           for _a in $_dyn_queue; do [ "$_a" = "${_picked_dep}" ] && _dup=1; done
           for _a in $_dyn_applied; do [ "$_a" = "${_picked_dep}" ] && _dup=2; done
@@ -4703,6 +4753,14 @@ PY
           else
             continue
           fi
+          # ── SANITIZE queue AGAIN after rebuild (defense-in-depth: strip any accidentally word-split tokens). ──
+          _dyn_queue_clean=""
+          for _tok in $_dyn_queue; do
+            if printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+              [ -z "${_dyn_queue_clean}" ] && _dyn_queue_clean="${_tok}" || _dyn_queue_clean="${_dyn_queue_clean} ${_tok}"
+            fi
+          done
+          _dyn_queue="${_dyn_queue_clean}"
           continue
         fi
         _dyn_rel=$( printf '%s\n' "$_dyn_tb" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
