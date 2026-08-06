@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1030-installed-app-whitelist"
+SCRIPT_VERSION_BUILD="2026-08-06T1100-stop-self-recursion"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -778,12 +778,18 @@ _run_migrate_autoheal() {
       fi
       if [ -n "${_rma_node_missing_app}" ]; then
         _info "UndefinedTable autoheal round ${_rma_round}: graph NodeNotFoundError detected. Referencer='${_rma_node_referencer}' missing_parent_app='${_rma_node_missing_app}'. Auto-healing missing app first."
+        # Sanity: if the "missing parent" is the SAME app we are already trying to migrate, recursive autoheal would
+        # just call itself again without changing state. Skip recursive self-call; orphan cleanup below may still fix graph.
+        if [ -n "${_rma_label}" ] && [ "${_rma_node_missing_app}" = "${_rma_label}" ]; then
+          _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError missing parent '${_rma_node_missing_app}' IS the current migrate target. Skipping recursive self-heal to avoid endless same-label recursion; will rely on orphan cleanup + next bounded retry."
+        else
         # First: try makemigrations + migrate the missing parent app directly via autoheal (recursive).
-        set +e
-        _run_with_spinner "(autoheal r${_rma_round} → makemig missing parent '${_rma_node_missing_app}') manage.py makemigrations --noinput '${_rma_node_missing_app}'" bash -c \
-          "${_rma_base_env} manage.py makemigrations --noinput '${_rma_node_missing_app}'" || true
-        _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rma_node_missing_app}" || true
-        set -e
+          set +e
+          _run_with_spinner "(autoheal r${_rma_round} → makemig missing parent '${_rma_node_missing_app}') manage.py makemigrations --noinput '${_rma_node_missing_app}'" bash -c \
+            "${_rma_base_env} manage.py makemigrations --noinput '${_rma_node_missing_app}'" || true
+          _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rma_node_missing_app}" || true
+          set -e
+        fi
         # FALLBACK: if the referencer migration is a half-generated PARTIAL (0002+ with missing dependency from interrupted prior run)
         # and is NOT applied in DB (no [X] line), deleting it is safe — Django will regenerate cleanly on next makemigrations all.
         local _ref_app="" _ref_name=""
@@ -4755,6 +4761,12 @@ PY
           fi
           # Ensure missing parent app is migrated BEFORE retrying target (prepend to queue).
           local _picked_dep="${_dyn_node_miss}"
+          # Sanity: if the missing parent is the SAME app as the current target, queue mutation would just requeue the
+          # same app as its own dependency. Orphan deletion above may already have fixed the graph; retry current target once.
+          if [ "${_picked_dep}" = "${_dyn_next}" ]; then
+            _warn "STAGE 2: NodeNotFoundError missing parent '${_picked_dep}' IS the current target '${_dyn_next}'. Skipping self-dependency queue mutation; will retry current target with bounded iteration loop."
+            continue
+          fi
           # DOUBLE VALIDATION before queue mutation: any parse failure now → skip without touching queue.
           if [ -n "${_dyn_known_apps}" ]; then
             if [[ " ${_dyn_known_apps} " != *" ${_picked_dep} "* ]]; then
