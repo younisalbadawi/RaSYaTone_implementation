@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1100-stop-self-recursion"
+SCRIPT_VERSION_BUILD="2026-08-06T1130-stop-no-progress-retries"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -778,9 +778,12 @@ _run_migrate_autoheal() {
       fi
       if [ -n "${_rma_node_missing_app}" ]; then
         _info "UndefinedTable autoheal round ${_rma_round}: graph NodeNotFoundError detected. Referencer='${_rma_node_referencer}' missing_parent_app='${_rma_node_missing_app}'. Auto-healing missing app first."
+        local _rma_self_node=0
+        local _rma_deleted_orphan=0
         # Sanity: if the "missing parent" is the SAME app we are already trying to migrate, recursive autoheal would
         # just call itself again without changing state. Skip recursive self-call; orphan cleanup below may still fix graph.
         if [ -n "${_rma_label}" ] && [ "${_rma_node_missing_app}" = "${_rma_label}" ]; then
+          _rma_self_node=1
           _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError missing parent '${_rma_node_missing_app}' IS the current migrate target. Skipping recursive self-heal to avoid endless same-label recursion; will rely on orphan cleanup + next bounded retry."
         else
         # First: try makemigrations + migrate the missing parent app directly via autoheal (recursive).
@@ -807,12 +810,17 @@ _run_migrate_autoheal() {
             if [ "$_applied" -eq 0 ]; then
               _warn "UndefinedTable autoheal round ${_rma_round}: referencer '${_ref_app}.${_ref_name}' is NOT applied in DB and references missing parent. Deleting orphan half-generated partial file: ${_ref_file} (will be recreated cleanly on next makemigrations)."
               rm -f "${_ref_file}" 2>/dev/null || true
+              _rma_deleted_orphan=1
               set +e
               _run_with_spinner "(autoheal r${_rma_round} → regen graphs cleanly) manage.py makemigrations --noinput" bash -c \
                 "${_rma_base_env} manage.py makemigrations --noinput" || true
               set -e
             fi
           fi
+        fi
+        if [ "$_rma_self_node" -eq 1 ] && [ "$_rma_deleted_orphan" -eq 0 ]; then
+          _warn "UndefinedTable autoheal round ${_rma_round}: NodeNotFoundError self-target produced NO state change (no orphan file deleted). Stopping autoheal early and falling back to retry banner instead of repeating the same error."
+          return "$_rma_rc"
         fi
         _rma_round=$(( _rma_round + 1 ))
         continue
@@ -4741,6 +4749,7 @@ PY
         if [ -n "${_dyn_node_miss}" ]; then
           # Heal same as autoheal wrapper: auto-run makemigrations on missing app FIRST, then DELETE orphan referencer if not applied.
           _warn "migrate ${_dyn_next} FAILED: NodeNotFoundError graph broken. Referencer='${_dyn_node_ref}' missing_parent_app='${_dyn_node_miss}'. Auto-healing in STAGE 2: migrate missing parent app, then retry current target."
+          local _dyn_deleted_orphan=0
           local _ref_app="" _ref_name=""
           if [[ "${_dyn_node_ref}" == *.* ]]; then
             _ref_app="${_dyn_node_ref%%.*}"
@@ -4756,6 +4765,7 @@ PY
               if [ "$_applied" -eq 0 ]; then
                 _warn "STAGE 2: referencer file '${_ref_app}.${_ref_name}' NOT applied in DB — it's a half-generated partial from interrupted install. Deleting orphan: ${_ref_file}"
                 rm -f "${_ref_file}" 2>/dev/null || true
+                _dyn_deleted_orphan=1
               fi
             fi
           fi
@@ -4764,8 +4774,12 @@ PY
           # Sanity: if the missing parent is the SAME app as the current target, queue mutation would just requeue the
           # same app as its own dependency. Orphan deletion above may already have fixed the graph; retry current target once.
           if [ "${_picked_dep}" = "${_dyn_next}" ]; then
-            _warn "STAGE 2: NodeNotFoundError missing parent '${_picked_dep}' IS the current target '${_dyn_next}'. Skipping self-dependency queue mutation; will retry current target with bounded iteration loop."
-            continue
+            if [ "$_dyn_deleted_orphan" -eq 1 ]; then
+              _warn "STAGE 2: NodeNotFoundError missing parent '${_picked_dep}' IS the current target '${_dyn_next}', but orphan cleanup changed state. Retrying current target once in bounded loop."
+              continue
+            fi
+            _warn "STAGE 2: NodeNotFoundError missing parent '${_picked_dep}' IS the current target '${_dyn_next}' and orphan cleanup made NO state change. Breaking to retry banner instead of repeating the same error."
+            break
           fi
           # DOUBLE VALIDATION before queue mutation: any parse failure now → skip without touching queue.
           if [ -n "${_dyn_known_apps}" ]; then
