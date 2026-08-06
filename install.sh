@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1300-undefinedcolumn-heal"
+SCRIPT_VERSION_BUILD="2026-08-06T1330-undefinedcolumn-syntaxfix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -864,36 +864,37 @@ PY
       if [ -n "${_rma_uc_line}" ]; then
         local _rma_apps_line=""
         local _rma_apps=""
-        _rma_apps_line="$( grep -oE \"Your models in app\\(s\\):[^\\n]+\" \"${_rma_tb_log}\" 2>/dev/null | head -n 1 || true )"
-        if [ -n \"${_rma_apps_line}\" ]; then
-          _rma_apps=\"$( printf '%s' \"${_rma_apps_line}\" | grep -oE \"'[a-zA-Z0-9_]+'\" 2>/dev/null | sed -E \"s/^'//; s/'$//\" | tr '\\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )\"
+        _rma_apps_line="$( grep -oE "Your models in app\\(s\\):.*" "${_rma_tb_log}" 2>/dev/null | head -n 1 || true )"
+        if [ -n "${_rma_apps_line}" ]; then
+          _rma_apps="$( printf '%s' "${_rma_apps_line}" | grep -oE \"'[a-zA-Z0-9_]+'\" 2>/dev/null | tr -d \"'\" | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ //; s/ $//' || true )"
         fi
-        if [ -z \"${_rma_apps}\" ]; then
-          _rma_apps=\"${_rma_label:-}\"
+        if [ -z "${_rma_apps}" ]; then
+          _rma_apps="${_rma_label:-}"
         fi
-        local _rma_fix_list=\"\"
+        local _rma_fix_list=""
         local _ra
         for _ra in ${_rma_apps}; do
-          [ -z \"${_ra}\" ] && continue
-          if [ -z \"${_rma_fix_list}\" ]; then
-            _rma_fix_list=\"${_ra}\"
-          elif [[ \" ${_rma_fix_list} \" == *\" ${_ra} \"* ]]; then
+          _ra="$( printf '%s' "${_ra}" | tr -d '[:space:]\r\n' || true )"
+          [ -z "${_ra}" ] && continue
+          if [ -z "${_rma_fix_list}" ]; then
+            _rma_fix_list="${_ra}"
+          elif [[ " ${_rma_fix_list} " == *" ${_ra} "* ]]; then
             continue
           else
-            _rma_fix_list=\"${_rma_fix_list} ${_ra}\"
+            _rma_fix_list="${_rma_fix_list} ${_ra}"
           fi
         done
-        if [ -z \"${_rma_fix_list}\" ]; then
-          _info \"UndefinedTable autoheal round ${_rma_round}: UndefinedColumn detected but could not infer any app labels to heal. Falling back.\"
-          return \"$_rma_rc\"
+        if [ -z "${_rma_fix_list}" ]; then
+          _info "UndefinedTable autoheal round ${_rma_round}: UndefinedColumn detected but could not infer any app labels to heal. Falling back."
+          return "$_rma_rc"
         fi
-        _warn \"UndefinedTable autoheal round ${_rma_round}: UndefinedColumn detected (schema drift; migrations missing/outdated). Auto-running makemigrations+migrate for: [${_rma_fix_list}].\"
+        _warn "UndefinedTable autoheal round ${_rma_round}: UndefinedColumn detected (schema drift; migrations missing/outdated). Auto-running makemigrations+migrate for: [${_rma_fix_list}]."
         local _rf
         for _rf in ${_rma_fix_list}; do
           set +e
-          _run_with_spinner \"(autoheal r${_rma_round} → makemig '${_rf}' for UndefinedColumn) manage.py makemigrations --noinput '${_rf}'\" bash -c \
-            \"${_rma_base_env} manage.py makemigrations --noinput '${_rf}'\" || true
-          _run_migrate_autoheal \"${_rma_app_dir}\" \"${_rma_settings}\" \"${_rma_venv_py}\" \"${_rma_base_env}\" \"${_rf}\" || true
+          _run_with_spinner "(autoheal r${_rma_round} → makemig '${_rf}' for UndefinedColumn) manage.py makemigrations --noinput '${_rf}'" bash -c \
+            "${_rma_base_env} manage.py makemigrations --noinput '${_rf}'" || true
+          _run_migrate_autoheal "${_rma_app_dir}" "${_rma_settings}" "${_rma_venv_py}" "${_rma_base_env}" "${_rf}" || true
           set -e
         done
         _rma_round=$(( _rma_round + 1 ))
