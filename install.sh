@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0700-dynamic-undefinedtable-autoheal"
+SCRIPT_VERSION_BUILD="2026-08-06T0730-autoheal-logorder-stage1dedupe"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -724,19 +724,32 @@ _run_migrate_autoheal() {
       return 0
     fi
     # ── Find most recent spinner log for `manage.py migrate …` ──
+    # Use `ls -1t` (newest-by-mtime first — the ONLY reliable way to find the LAST failed migrate)
+    # vs naive glob which is filename-lexicographic order (can select an OLD log with no error lines).
     _rma_tb_log=""
     local _rma_cand=""
-    for _rma_cand in /tmp/rasyatone_spin_*_manage_py_migrate*.log; do
-      [ -n "${_rma_cand}" ] && [ -f "${_rma_cand}" ] && _rma_tb_log="${_rma_cand}" || true
-    done
+    while IFS= read -r _rma_cand; do
+      [ -z "${_rma_cand}" ] && continue
+      [ -f "${_rma_cand}" ] || continue
+      _rma_tb_log="${_rma_cand}"
+      break
+    done < <(ls -1t /tmp/rasyatone_spin_*_manage_py_migrate*.log 2>/dev/null || true)
     if [ -z "${_rma_tb_log}" ] || [ ! -f "${_rma_tb_log}" ]; then
       _info "UndefinedTable autoheal: migrate rc=${_rma_rc} but no migrate spinner log readable. Cannot auto-heal → failing."
       return "$_rma_rc"
     fi
+    local _rma_tail=""
+    _rma_tail="$( tail -n 200 "${_rma_tb_log}" 2>/dev/null || true )"
+    local _rma_tail_bytes=0
+    _rma_tail_bytes=$( printf '%s' "${_rma_tail}" | wc -c | tr -d '[:space:]' || printf '0' )
     _rma_rel=""
-    _rma_rel=$( tail -n 200 "${_rma_tb_log}" 2>/dev/null | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
+    _rma_rel=$( printf '%s' "${_rma_tail}" | grep -oE 'relation "[^"]+" does not exist' 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
     if [ -z "${_rma_rel}" ]; then
-      _info "UndefinedTable autoheal round ${_rma_round}: no 'relation X does not exist' in last log → different error category, cannot auto-heal (rc=${_rma_rc})."
+      # Also try FULL log (not just last 200 lines) — sometimes the UndefinedTable traceback is higher up.
+      _rma_rel=$( grep -oE 'relation "[^"]+" does not exist' "${_rma_tb_log}" 2>/dev/null | head -n 1 | sed 's/^relation "//; s/" does not exist$//' || true )
+    fi
+    if [ -z "${_rma_rel}" ]; then
+      _info "UndefinedTable autoheal round ${_rma_round}: opened newest migrate log (${_rma_tb_log}, tail=${_rma_tail_bytes}b) — NO 'relation X does not exist' pattern match. Different error category (password/connection/circular-dep/schema). Cannot auto-heal via UndefinedTable path; return rc=${_rma_rc} so retry banner handles other classes."
       return "$_rma_rc"
     fi
     # ── Enumerate LONGEST-FIRST underscore-prefix candidates → match against Django apps registry. ──
@@ -4479,9 +4492,26 @@ except Exception as _e:
 PY
 )
       if [ -n "${_stage1_deps}" ]; then
-        _info "STAGE 1 graph introspection: ${aum_app} 0001 transitive dependencies (non-builtin) = [${_stage1_deps}]. Will run these BEFORE ${aum_app}."
-        # Prepend dependencies in order to queue. STAGE 1 output is in dependency order (dep first) → queue = [deps order] + aum_app.
-        _dyn_queue="${_stage1_deps} ${aum_app}"
+        # ── Filter: remove target app label from stage1 deps (dedupe), remove blanks, preserve dependency order ──
+        local _s1_filtered="" _s1_tok=""
+        local -A _s1_seen=()
+        for _s1_tok in ${_stage1_deps}; do
+          _s1_tok=$(printf '%s' "${_s1_tok}" | tr -d '[:space:]\r\n' || true)
+          [ -z "${_s1_tok}" ] && continue
+          [ "${_s1_tok}" = "${aum_app}" ] && continue
+          if [ -z "${_s1_seen[${_s1_tok}]+x}" ]; then
+            _s1_seen[${_s1_tok}]=1
+            [ -z "${_s1_filtered}" ] && _s1_filtered="${_s1_tok}" || _s1_filtered="${_s1_filtered} ${_s1_tok}"
+          fi
+        done
+        _stage1_deps="${_s1_filtered}"
+        _info "STAGE 1 graph introspection: ${aum_app} 0001 transitive dependencies (non-builtin, deduped) = [${_stage1_deps}]. Will run these BEFORE ${aum_app}."
+        # Build queue: [deps order dep-first] + aum_app.
+        if [ -n "${_stage1_deps}" ]; then
+          _dyn_queue="${_stage1_deps} ${aum_app}"
+        else
+          _dyn_queue="${aum_app}"
+        fi
       else
         _info "STAGE 1 graph introspection: no transitive deps discoverable (0001 missing? falling back to STAGE 2 UndefinedTable-driven discovery)."
       fi
