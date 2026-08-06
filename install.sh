@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1000-parse-queue-bulletproof"
+SCRIPT_VERSION_BUILD="2026-08-06T1030-installed-app-whitelist"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -4507,6 +4507,19 @@ PY
       local _dyn_max_iter=8 _dyn_iter=0 _dyn_rc=0 _dyn_tb="" _dyn_rel="" _dyn_guess=""
       local _dyn_queue="${aum_app}"   # queue: next app to try. Starts with aum_app; dependencies are PREPENDED as discovered.
       local _dyn_done=0
+      local _dyn_known_apps=""
+      _dyn_known_apps=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>/dev/null || true
+import sys
+try:
+    import django
+    django.setup()
+    from django.apps import apps
+    labels = sorted({cfg.label for cfg in apps.get_app_configs() if getattr(cfg, "label", None)})
+    print(" ".join(labels))
+except Exception:
+    sys.exit(0)
+PY
+)
       # ── STAGE 1: proactive graph introspection BEFORE any migrate attempt.
       local _stage1_deps=""
       _stage1_deps=$( TARGET_AUM_APP="${aum_app}" PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>/dev/null || true
@@ -4685,25 +4698,38 @@ PY
           _dyn_node_miss="$( printf '%s\n' "$_dyn_tb" | sed -n '/parent node/,$p' 2>/dev/null | grep -oE "'[a-zA-Z0-9_]+'" 2>/dev/null | head -n 1 | sed -E "s/^'//; s/'$//" || true )"
         fi
         # STRICT VALIDATION: if parse produced invalid chars, skip entirely — no queue mutation.
-        if [ -n "${_dyn_node_miss}" ] && ! printf '%s' "${_dyn_node_miss}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
-          _info "STAGE 2: extracted missing app='${_dyn_node_miss}' failed label-char validation — ignore."
-          _dyn_node_miss=""
+        if [ -n "${_dyn_node_miss}" ]; then
+          if [ -n "${_dyn_known_apps}" ]; then
+            if [[ " ${_dyn_known_apps} " != *" ${_dyn_node_miss} "* ]]; then
+              _info "STAGE 2: extracted missing app='${_dyn_node_miss}' is not a real installed app label — ignore."
+              _dyn_node_miss=""
+            fi
+          elif ! printf '%s' "${_dyn_node_miss}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+            _info "STAGE 2: extracted missing app='${_dyn_node_miss}' failed label-char validation — ignore."
+            _dyn_node_miss=""
+          fi
         fi
         # ── SANITIZE QUEUE: rebuild token-by-token, DROP any token that has non [a-zA-Z0-9_] chars (defense-in-depth). ──
-        #    This strips any accidentally-added multi-word junk tokens (like 'reference' from parse failures) so the
-        #    next for-loop iteration of the queue sees only valid app-label words.
+        #    If we know the installed app labels, keep ONLY those. This strips accidentally-added junk tokens like
+        #    'reference nonexistent parent node companies' that bash word-split into plain words.
         local _dyn_queue_clean="" _tok
         for _tok in $_dyn_queue; do
-          if printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
-            [ -z "${_dyn_queue_clean}" ] && _dyn_queue_clean="${_tok}" || _dyn_queue_clean="${_dyn_queue_clean} ${_tok}"
+          if [ -n "${_dyn_known_apps}" ]; then
+            [[ " ${_dyn_known_apps} " == *" ${_tok} "* ]] || continue
+          elif ! printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+            continue
           fi
+          [ -z "${_dyn_queue_clean}" ] && _dyn_queue_clean="${_tok}" || _dyn_queue_clean="${_dyn_queue_clean} ${_tok}"
         done
         _dyn_queue="${_dyn_queue_clean}"
         local _dyn_applied_clean=""
         for _tok in $_dyn_applied; do
-          if printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
-            [ -z "${_dyn_applied_clean}" ] && _dyn_applied_clean="${_tok}" || _dyn_applied_clean="${_dyn_applied_clean} ${_tok}"
+          if [ -n "${_dyn_known_apps}" ]; then
+            [[ " ${_dyn_known_apps} " == *" ${_tok} "* ]] || continue
+          elif ! printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+            continue
           fi
+          [ -z "${_dyn_applied_clean}" ] && _dyn_applied_clean="${_tok}" || _dyn_applied_clean="${_dyn_applied_clean} ${_tok}"
         done
         _dyn_applied="${_dyn_applied_clean}"
         if [ -n "${_dyn_node_miss}" ]; then
@@ -4730,7 +4756,12 @@ PY
           # Ensure missing parent app is migrated BEFORE retrying target (prepend to queue).
           local _picked_dep="${_dyn_node_miss}"
           # DOUBLE VALIDATION before queue mutation: any parse failure now → skip without touching queue.
-          if ! printf '%s' "${_picked_dep}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+          if [ -n "${_dyn_known_apps}" ]; then
+            if [[ " ${_dyn_known_apps} " != *" ${_picked_dep} "* ]]; then
+              _info "STAGE 2: picked dep='${_picked_dep}' is not a real installed app label — skipping queue mutation."
+              break
+            fi
+          elif ! printf '%s' "${_picked_dep}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
             _info "STAGE 2: picked dep='${_picked_dep}' failed final validation before queue rebuild — skipping queue mutation."
             break
           fi
@@ -4756,9 +4787,12 @@ PY
           # ── SANITIZE queue AGAIN after rebuild (defense-in-depth: strip any accidentally word-split tokens). ──
           _dyn_queue_clean=""
           for _tok in $_dyn_queue; do
-            if printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
-              [ -z "${_dyn_queue_clean}" ] && _dyn_queue_clean="${_tok}" || _dyn_queue_clean="${_dyn_queue_clean} ${_tok}"
+            if [ -n "${_dyn_known_apps}" ]; then
+              [[ " ${_dyn_known_apps} " == *" ${_tok} "* ]] || continue
+            elif ! printf '%s' "${_tok}" | grep -Eq '^[a-zA-Z0-9_]+$'; then
+              continue
             fi
+            [ -z "${_dyn_queue_clean}" ] && _dyn_queue_clean="${_tok}" || _dyn_queue_clean="${_dyn_queue_clean} ${_tok}"
           done
           _dyn_queue="${_dyn_queue_clean}"
           continue
