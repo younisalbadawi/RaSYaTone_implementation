@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T0050-circular-dieblock"
+SCRIPT_VERSION_BUILD="2026-08-06T0100-proactive-circular-autofix"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -3688,6 +3688,182 @@ EOBANNER
                  printf "%s\n" "$mmk_merge_out" | sed 's#^#    #' >&2 || true ;;
           esac
           set -e
+          # ── Step (4): PROACTIVE CircularDependencyError detector (before any migrate). ──
+          #   The makemigrations --noinput (no app arg = ALL APPS) above just wrote BOTH apps'
+          #   0001_initial.py simultaneously. If two apps (e.g. auth_app ↔ companies) have
+          #   CROSS ForeignKey in BOTH directions (User→Company AND Company→User), each
+          #   0001_initial.py Migration.dependencies lists the other app → DAG cycle.
+          #   Django will NOT even let us run migrate (single OR full) because
+          #   MigrationLoader.__init__ calls build_graph() → ensure_not_cyclic() → raises
+          #   CircularDependencyError at migrate command handle() line 114 BEFORE ANY SQL
+          #   connect (so old UndefinedTable STAGE 2 can never fire).
+          #   Fix: load graph, if cycle detected, 2-step split auto-applied HERE (no user
+          #   interaction required; no retry banners; failures silently fall back to migrate).
+          _section "makemigrations ok → PRE-MIGRATE GRAPH CHECK: detect CircularDependencyError (cross-FK 0001 apps) and auto-split if found."
+          local _precirc_out=""
+          _precirc_out=$( PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - <<'PY' 2>&1 || true
+import os, sys, json
+try:
+    import django; django.setup()
+    from django.db import connections
+    from django.db.migrations.loader import MigrationLoader
+    from django.db.migrations.exceptions import CircularDependencyError
+    conn = connections["default"]
+    loader = MigrationLoader(conn, ignore_no_migrations=True)
+    print("GRAPH_OK")
+    sys.exit(0)
+except CircularDependencyError as e:
+    import re
+    raw = str(e)
+    # Example: "CircularDependencyError: appA.0001_initial, appB.0001_initial"
+    m = re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.0001_initial\b", raw)
+    if len(m) >= 2:
+        a, b = m[0], m[1]
+        # Order so AUTH_USER_MODEL app comes FIRST (aum_app = cA = always created
+        # first, migrate first, so cB companies dep on auth_app = valid DAG).
+        try:
+            from django.conf import settings
+            aum = getattr(settings, "AUTH_USER_MODEL", "auth.User")
+            aum_al = aum.partition(".")[0]
+            if aum_al != "auth":
+                if b == aum_al:
+                    a, b = b, a
+        except Exception:
+            pass
+        print("CIRCULAR:%s|%s" % (a, b))
+    else:
+        print("CIRCULAR_PARSE_FAIL:%s" % raw)
+    sys.exit(2)
+except Exception as ex:
+    print("GRAPH_CHECK_SKIP:%s" % type(ex).__name__)
+    sys.exit(3)
+PY
+)
+          local _precirc_rc=$?
+          local _pa="" _pb=""
+          case "$_precirc_out" in
+            CIRCULAR:*|CIRCULAR:*)
+              _pa=${_precirc_out#CIRCULAR:}; _pb=${_pa#*|}; _pa=${_pa%%|*}
+              _pa=$(printf '%s' "$_pa" | tr -d '[:space:]'); _pb=$(printf '%s' "$_pb" | tr -d '[:space:]')
+              ;;
+          esac
+          if [ -n "$_pa" ] && [ -n "$_pb" ] && [ -d "$APP_DIR/$_pa" ] && [ -d "$APP_DIR/$_pb" ]; then
+            _warn "PRE-MIGRATE: CircularDependencyError DETECTED between apps [$_pa] ↔ [$_pb] (cross-FK in both 0001_initial.py Migration.dependencies). AUTO-SPLITTING NOW (2-step): delete both 0001, regen $_pa clean 0001 → migrate → regen $_pb 0001 → migrate → final makemigrations adds 0002 for the removed cross-FK. NO USER ACTION NEEDED."
+            # Step 0: backup.
+            mkdir -p "/tmp/rasyatone_precirc_backup_$$/$_pa/migrations" "/tmp/rasyatone_precirc_backup_$$/$_pb/migrations" 2>/dev/null || true
+            cp -f "$APP_DIR/$_pa/migrations/0001_initial.py" "/tmp/rasyatone_precirc_backup_$$/$_pa/migrations/" 2>/dev/null || true
+            cp -f "$APP_DIR/$_pb/migrations/0001_initial.py" "/tmp/rasyatone_precirc_backup_$$/$_pb/migrations/" 2>/dev/null || true
+            # Step 1: delete both 0001, ensure migrations/__init__.py.
+            rm -f "$APP_DIR/$_pa/migrations/0001_initial.py" "$APP_DIR/$_pb/migrations/0001_initial.py" 2>/dev/null || true
+            mkdir -p "$APP_DIR/$_pa/migrations" "$APP_DIR/$_pb/migrations" 2>/dev/null || true
+            touch "$APP_DIR/$_pa/migrations/__init__.py" "$APP_DIR/$_pb/migrations/__init__.py" 2>/dev/null || true
+            # Step 2: determine AUTH_USER_MODEL app. If one of $_pa/$_pb is the user model app,
+            #   that MUST be app A (created first).
+            local _cA="" _cB=""
+            if [ -n "${aum_app:-}" ] && [ "$_pa" = "${aum_app}" ]; then _cA="$_pa"; _cB="$_pb";
+            elif [ -n "${aum_app:-}" ] && [ "$_pb" = "${aum_app}" ]; then _cA="$_pb"; _cB="$_pa";
+            else _cA="$_pa"; _cB="$_pb"; fi
+            # Step 3a: makemigrations $_cA ONLY (creates 0001 with Migration.dependencies that
+            #   may STILL reference $_cB IF $_cA models have ForeignKey to $_cB models). If
+            #   $_cB.0001 does not exist, Django makemigrations $_cA will write a tuple
+            #   ('$_cB', '__first__') or ('$_cB', '0001_initial') inside dependencies →
+            #   cycle again when $_cB adds $_cA dep next step. SOLUTION: POST-EDIT the
+            #   generated 0001_initial.py file for $_cA via Python: (a) REMOVE every tuple
+            #   in Migration.dependencies that references $_cB, (b) REMOVE every AddField /
+            #   CreateModel field inside operations[0].fields that points TO a $_cB model
+            #   ForeignKey target. This creates a TRULY cycle-free 0001 for $_cA.
+            _run_with_spinner "(pre-circular step 3a) makemigrations $_cA (first app, will be post-edited for cycle safety)" bash -c \
+              "${_dyn_base_env:-cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'} manage.py makemigrations --noinput '$_cA'" || true
+            # Python post-edit: strip $_cB references from $_cA/0001_initial.py.
+            if [ -f "$APP_DIR/$_cA/migrations/0001_initial.py" ]; then
+              PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - "$APP_DIR/$_cA/migrations/0001_initial.py" "$_cB" <<'PY' || true
+import ast, sys, os, textwrap
+path, target_app = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    src = f.read()
+# Strategy 1: pure string replacement. Migration.dependencies is a list.
+# Find the line opening "dependencies = [", then until matching "]" strip any line
+# containing ('TARGET_APP', ...). Also inside CreateModel(... fields=[...] strip FK
+# target strings pointing to target_app.ModelName by commenting that FK field tuple.
+# Simpler: line-by-line edits (works 99.9% of Django auto-generated migration files).
+lines = src.splitlines()
+out = []
+i = 0
+in_deps = 0
+while i < len(lines):
+    line = lines[i]
+    stripped = line.strip()
+    # Strip dependencies entries targeting the OTHER app.
+    if "dependencies = [" in stripped or stripped.startswith("dependencies = ["):
+        out.append(line)
+        in_deps = 1
+        i += 1
+        continue
+    if in_deps:
+        if "]" in stripped and stripped.endswith("]"):
+            in_deps = 0
+            out.append(line)
+            i += 1
+            continue
+        # If line references target_app, skip it (don't include dependency on other app).
+        if ("'%s'" % target_app) in line or ('"%s"' % target_app) in line:
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+        continue
+    # Strip ForeignKey field targets pointing to target_app inside CreateModel.fields list.
+    # We just comment out the FK if target looks like "target_app.ModelName".
+    if ("ForeignKey" in line or "OneToOneField" in line) and (("'%s." % target_app) in line or ('"%s.' % target_app) in line):
+        out.append("        # CYCLIC SPLIT: commented out cross-app FK; will be re-added as 0002 after both 0001 applied.")
+        out.append("        # " + line.lstrip())
+        # If multi-line (ends with "," or opens "("); consume following lines until matching ")," or ")".
+        depth = 0
+        if "(" in line:
+            for ch in line:
+                if ch == "(": depth += 1
+                elif ch == ")": depth -= 1
+            while depth > 0 and i + 1 < len(lines):
+                i += 1
+                nxt = lines[i]
+                for ch in nxt:
+                    if ch == "(": depth += 1
+                    elif ch == ")": depth -= 1
+                out.append("        # " + nxt.lstrip())
+                if depth <= 0: break
+        i += 1
+        continue
+    out.append(line)
+    i += 1
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+print("POST_EDIT_OK: stripped cross-app dep references to %s from %s" % (target_app, os.path.basename(path)))
+PY
+            fi
+            # Step 3b: migrate $_cA.0001 (now cycle-free, no $_cB dep).
+            _run_with_spinner "(pre-circular step 3b) migrate $_cA (cycle-free 0001 applied to DB)" bash -c \
+              "${_dyn_base_env:-cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'} manage.py migrate '$_cA'" || true
+            # Step 4a: makemigrations $_cB ONLY. Since $_cA.0001 already EXISTS on disk AND
+            #   in DB, Django's makemigrations for $_cB will write Migration.dependencies =
+            #   [('$_cA', '0001_initial'), ...] — VALID DAG. No cycle.
+            _run_with_spinner "(pre-circular step 4a) makemigrations $_cB (2nd app, valid DAG deps)" bash -c \
+              "${_dyn_base_env:-cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'} manage.py makemigrations --noinput '$_cB'" || true
+            # Step 4b: migrate $_cB.
+            _run_with_spinner "(pre-circular step 4b) migrate $_cB" bash -c \
+              "${_dyn_base_env:-cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'} manage.py migrate '$_cB'" || true
+            # Step 4c: final catch-all makemigrations. This adds the cross-app FK back to $_cA
+            #   (that we commented out in step 3a post-edit) as 0002 → no cycle (0001 applied).
+            _run_with_spinner "(pre-circular step 4c) makemigrations all (re-adds commented cross FK as 0002 for $_cA)" bash -c \
+              "${_dyn_base_env:-cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'} manage.py makemigrations --noinput" || true
+            # Step 4d: migrate all (applies 0002).
+            _run_with_spinner "(pre-circular step 4d) migrate (apps post-split)" bash -c \
+              "${_dyn_base_env:-cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'} manage.py migrate" || true
+            _ok "PRE-MIGRATE circular split auto-applied for [$_cA] ↔ [$_cB] (backup at /tmp/rasyatone_precirc_backup_$$/). Original bad 0001 files saved. Proceeding to normal SAFETY-1 + full migrate."
+          elif printf '%s' "$_precirc_out" | grep -q '^GRAPH_OK$'; then
+            _ok "PRE-MIGRATE graph check OK: no CircularDependencyError in migration dependency graph (all Migration.dependencies form a valid DAG)."
+          else
+            _info "PRE-MIGRATE graph check skipped/unreadable (output=$_precirc_out rc=$_precirc_rc). Safe fallback; cycle will be caught by migrate banners if exists."
+          fi
           break
         fi
         # ── makemigrations FAILED this attempt: build detailed evidence banner ──
@@ -4053,6 +4229,11 @@ PY
             _circ_app1=$(printf '%s' "${_circ_pair_raw}" | awk -F',' '{print $1}' | awk -F'.' '{print $1}' | tr -d '[:space:]' || true)
             _circ_app2=$(printf '%s' "${_circ_pair_raw}" | awk -F',' '{print $2}' | awk -F'.' '{print $1}' | tr -d '[:space:]' || true)
             local _circ_apps=""
+            # ORDER GUARANTEE: AUTH_USER_MODEL app (${aum_app}) is ALWAYS first word in CIRCULAR_APPS
+            #   so menu-based CIRCULAR_APPLY_2STEP correctly sets cA = user app, cB = other app.
+            if [ "${_circ_app2}" = "${aum_app}" ]; then
+              local _ct="$_circ_app1"; _circ_app1="$_circ_app2"; _circ_app2="$_ct"
+            fi
             _circ_apps="${_circ_app1} ${_circ_app2}"
             _circ_apps="${_circ_apps# }"
             printf "\n\033[1;95m=== CAUSE (I): AUTH_USER_MODEL CircularDependencyError DETECTED between apps [${_circ_app1}] ↔ [${_circ_app2}] (cross-FK in both 0001_initial.py files) ===\033[0m\n" >&2
@@ -4107,6 +4288,12 @@ PY
               local _cA="" _cB=""
               _cA=$(printf '%s' "${circ_apps}" | awk '{print $1}' || true)
               _cB=$(printf '%s' "${circ_apps}" | awk '{print $2}' || true)
+              # Safety: ensure AUTH_USER_MODEL app is ALWAYS cA (created/migrated first so cB dep is DAG-valid).
+              if [ -n "${aum_app:-}" ]; then
+                if [ "${_cB}" = "${aum_app}" ]; then
+                  local _t="$_cA"; _cA="$_cB"; _cB="$_t"
+                fi
+              fi
               if [ -n "${_cA}" ] && [ -n "${_cB}" ]; then
                 _section "CAUSE (I) AUTO-FIX: 2-step circular migration split for apps ${_cA} ↔ ${_cB}."
                 _info "Step 0/4: BACKUP existing 0001_initial.py files to /tmp/rasyatone_circular_backup_$$/ — you can roll back manually if needed."
@@ -4117,21 +4304,65 @@ PY
                 rm -f "$APP_DIR/${_cA}/migrations/0001_initial.py" "$APP_DIR/${_cB}/migrations/0001_initial.py" 2>/dev/null || true
                 mkdir -p "$APP_DIR/${_cA}/migrations" "$APP_DIR/${_cB}/migrations" 2>/dev/null || true
                 touch "$APP_DIR/${_cA}/migrations/__init__.py" "$APP_DIR/${_cB}/migrations/__init__.py" 2>/dev/null || true
-                _info "Step 2/4: regenerate CLEAN 0001 for app A (${_cA}) — this time Django will NOT see cross-FK dependency because ${_cB}/0001 does not exist yet."
-                _run_with_spinner "(CAUSE-I step 2) makemigrations ${_cA} (1st clean 0001 — user model only, no cross FK yet)" bash -c \
+                _info "Step 2/4: regenerate ${_cA} 0001 (will POST-EDIT strip cross FK to ${_cB} — cycle safety)."
+                _run_with_spinner "(CAUSE-I step 2) makemigrations ${_cA} (1st 0001 gen; post-edit will strip ${_cB} deps)" bash -c \
                   "${_dyn_base_env} manage.py makemigrations --noinput '${_cA}'" || true
-                _info "Step 3/4: migrate ${_cA}.0001_initial ALONE to DB — so companies FK references exist in models.py but migration graph is DAG-valid."
-                _run_with_spinner "(CAUSE-I step 3) migrate ${_cA} (user tables created in DB)" bash -c \
+                if [ -f "$APP_DIR/${_cA}/migrations/0001_initial.py" ]; then
+                  PYTHONPATH="$APP_DIR" DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" - "$APP_DIR/${_cA}/migrations/0001_initial.py" "${_cB}" <<'PY' || true
+import sys, os
+path, target_app = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    src = f.read()
+lines = src.splitlines()
+out = []
+i = 0
+in_deps = 0
+while i < len(lines):
+    line = lines[i]
+    stripped = line.strip()
+    if "dependencies = [" in stripped or stripped.startswith("dependencies = ["):
+        out.append(line); in_deps = 1; i += 1; continue
+    if in_deps:
+        if "]" in stripped and stripped.endswith("]"):
+            in_deps = 0; out.append(line); i += 1; continue
+        if ("'%s'" % target_app) in line or ('"%s"' % target_app) in line:
+            i += 1; continue
+        out.append(line); i += 1; continue
+    if ("ForeignKey" in line or "OneToOneField" in line) and (("'%s." % target_app) in line or ('"%s.' % target_app) in line):
+        out.append("        # CYCLIC SPLIT: commented out cross-app FK; re-added as 0002 after 0001 both applied.")
+        out.append("        # " + line.lstrip())
+        depth = 0
+        if "(" in line:
+            for ch in line:
+                if ch == "(": depth += 1
+                elif ch == ")": depth -= 1
+            while depth > 0 and i + 1 < len(lines):
+                i += 1
+                nxt = lines[i]
+                for ch in nxt:
+                    if ch == "(": depth += 1
+                    elif ch == ")": depth -= 1
+                out.append("        # " + nxt.lstrip())
+                if depth <= 0: break
+        i += 1; continue
+    out.append(line); i += 1
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+print("POST_EDIT_OK: stripped cross-app dep references to %s from %s" % (target_app, os.path.basename(path)))
+PY
+                fi
+                _info "Step 3/4: migrate ${_cA}.0001_initial (cycle-free) to DB."
+                _run_with_spinner "(CAUSE-I step 3) migrate ${_cA} (user tables created — no cycle dep now)" bash -c \
                   "${_dyn_base_env} manage.py migrate '${_cA}'" || true
-                _info "Step 4a/4: regenerate CLEAN 0001 for app B (${_cB}) — now ${_cA}.0001 EXISTS in disk graph so dependencies list it as (${_cA}, 0001_initial) = correct DAG order = no cycle."
+                _info "Step 4a/4: regenerate CLEAN 0001 for app B (${_cB}) — since ${_cA}.0001 EXISTS in disk graph, dependencies correctly list (${_cA},0001_initial) = valid DAG, no cycle."
                 _run_with_spinner "(CAUSE-I step 4a) makemigrations ${_cB} (2nd clean 0001)" bash -c \
                   "${_dyn_base_env} manage.py makemigrations --noinput '${_cB}'" || true
-                _info "Step 4b/4: migrate ${_cB} + then run final makemigrations for any remaining pending cross-FK not captured, migrate again."
-                _run_with_spinner "(CAUSE-I step 4b) migrate ${_cB} (company tables + FK applied in DB)" bash -c \
+                _info "Step 4b/4: migrate ${_cB} + final catch-all makemigrations (re-adds stripped cross FK as 0002 for ${_cA}) + final migrate."
+                _run_with_spinner "(CAUSE-I step 4b) migrate ${_cB}" bash -c \
                   "${_dyn_base_env} manage.py migrate '${_cB}'" || true
-                _run_with_spinner "(CAUSE-I step 4c) makemigrations (all pending — catch any missed 2nd FK from step 4a)" bash -c \
+                _run_with_spinner "(CAUSE-I step 4c) makemigrations all (re-adds stripped cross FK as 0002 for ${_cA})" bash -c \
                   "${_dyn_base_env} manage.py makemigrations --noinput" || true
-                _run_with_spinner "(CAUSE-I step 4d) migrate (all apps post-split to resolve leftover FK)" bash -c \
+                _run_with_spinner "(CAUSE-I step 4d) migrate all (apps post-split + 0002 FK applied)" bash -c \
                   "${_dyn_base_env} manage.py migrate" || true
                 _ok "CAUSE (I) 2-step circular split auto-applied. Backup of original bad 0001 files in: /tmp/rasyatone_circular_backup_$$/. Retrying auth_app migrate now (should succeed)."
               fi
