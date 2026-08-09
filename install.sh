@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1530-live-migrate-progress"
+SCRIPT_VERSION_BUILD="2026-08-06T1600-completion-report"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -5681,6 +5681,28 @@ FULL migrate bash -c env (for debugging leaks):
       printf "  Port 127.0.0.1:%s NOT listening yet (gunicorn may still be starting)\n" "$bind_port"
     fi
   fi
+  local public_ips=""
+  public_ips=$(hostname -I 2>/dev/null || true)
+  public_ips=$(printf '%s' "$public_ips" | tr -s ' ' | sed -E 's/^ //; s/ $//' || true)
+  if [ -n "${public_ips}" ]; then
+    printf "  Server IPs=%s\n" "$public_ips"
+    local oneip=""
+    for oneip in $public_ips; do
+      case "$oneip" in
+        127.*|::1) continue ;;
+      esac
+      printf "  URL=http://%s:%s/\n" "$oneip" "$bind_port"
+    done
+  fi
+  printf "\n\033[1;97mUseful commands:\033[0m\n"
+  if command -v systemctl >/dev/null 2>&1; then
+    printf "  - systemctl status --no-pager '%s'\n" "$SERVICE_NAME"
+    printf "  - journalctl -u '%s' -n 200 --no-pager\n" "$SERVICE_NAME"
+    printf "  - systemctl restart '%s'\n" "$SERVICE_NAME"
+  fi
+  printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py createsuperuser\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
+  printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py showmigrations --list\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
+  printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py check --deploy\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
   printf "\nDone.\n"
 }
 
