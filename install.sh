@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T2130-certbot-autorenew"
+SCRIPT_VERSION_BUILD="2026-08-06T2230-optional-prompts"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -119,6 +119,9 @@ DEF_DJANGO_SETTINGS_MODULE="rasyatone.settings"
 DEF_GUNICORN_BIND="0.0.0.0:8000"
 DEF_SERVICE="rasyatone"
 DEF_SERVICE_ACCOUNT="rasyatone_app_user"
+DEF_USE_UNIX_SOCKET="n"
+DEF_ENABLE_SYSTEMD_HARDENING="n"
+DEF_ENABLE_NGINX_LOGROTATE="n"
 MIN_PYTHON_MAJOR=3
 MIN_PYTHON_MINOR=10
 declare -g PYTHON_BIN=""
@@ -2396,6 +2399,7 @@ load_env_file() {
   DB_HOST="$DEF_DB_HOST"; DB_PORT="$DEF_DB_PORT"; LISTEN_ADDRESSES="$DEF_LISTEN_ADDRESSES"
   APP_DIR="$DEF_APP_DIR"; GIT_URL=""; GIT_BRANCH="$DEF_GIT_BRANCH"
   DJANGO_SETTINGS_MODULE="$DEF_DJANGO_SETTINGS_MODULE"; GUNICORN_BIND="$DEF_GUNICORN_BIND"; SERVICE_NAME="$DEF_SERVICE"; SERVICE_ACCOUNT="$DEF_SERVICE_ACCOUNT"
+  USE_UNIX_SOCKET="$DEF_USE_UNIX_SOCKET"; ENABLE_SYSTEMD_HARDENING="$DEF_ENABLE_SYSTEMD_HARDENING"; ENABLE_NGINX_LOGROTATE="$DEF_ENABLE_NGINX_LOGROTATE"
   if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
     _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
     set -a; . "$ENV_FILE" || true; set +a
@@ -2405,6 +2409,7 @@ load_env_file() {
     APP_DIR="${APP_DIR:-$DEF_APP_DIR}"; GIT_BRANCH="${GIT_BRANCH:-$DEF_GIT_BRANCH}"
     DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
     GUNICORN_BIND="${GUNICORN_BIND:-$DEF_GUNICORN_BIND}"; SERVICE_NAME="${SERVICE_NAME:-$DEF_SERVICE}"; SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
+    USE_UNIX_SOCKET="${USE_UNIX_SOCKET:-$DEF_USE_UNIX_SOCKET}"; ENABLE_SYSTEMD_HARDENING="${ENABLE_SYSTEMD_HARDENING:-$DEF_ENABLE_SYSTEMD_HARDENING}"; ENABLE_NGINX_LOGROTATE="${ENABLE_NGINX_LOGROTATE:-$DEF_ENABLE_NGINX_LOGROTATE}"
     return 0
   fi
   return 1
@@ -3404,17 +3409,29 @@ install_app() {
   SERVICE_ACCOUNT=$(prompt_w_retry "Service account username (non-root, runs gunicorn)" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}" 3 _validator_linux_username "Invalid Linux username. Use lowercase letters/numbers/underscore/dash, must start with letter or underscore (max 32 chars). Example: rasyatone_app_user.")
   local _bind_port_raw=""
   _bind_port_raw=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}' 2>/dev/null || true)
+  if ! printf "%s" "$_bind_port_raw" | grep -Eq '^[0-9]+$' 2>/dev/null; then
+    _bind_port_raw=$(printf "%s" "$DEF_GUNICORN_BIND" | awk -F: '{print $NF}' 2>/dev/null || echo "8000")
+  fi
   local do_nginx=""
   do_nginx=$(prompt_yn "Configure nginx reverse proxy + Let's Encrypt HTTPS for a domain now? [Y/n] (Recommended for 80/443 + domain)" "y")
   if [ "$do_nginx" = "y" ]; then
     nginx_https=1
     nginx_domain=$(prompt_w_retry "Domain name (DNS A/AAAA must point to THIS server)" "${nginx_domain:-}" 3 _validator_nonempty "Domain name cannot be empty. Example: rasyatone.example.com")
     nginx_email=$(prompt_w_retry "Let's Encrypt email (for renewal notices)" "${nginx_email:-}" 3 _validator_nonempty "Email cannot be empty.")
+    USE_UNIX_SOCKET=$(prompt_yn "Use unix socket between nginx and gunicorn (hardening)? [y/N]" "${USE_UNIX_SOCKET:-$DEF_USE_UNIX_SOCKET}")
+    ENABLE_NGINX_LOGROTATE=$(prompt_yn "Install nginx logrotate rules if missing? [y/N]" "${ENABLE_NGINX_LOGROTATE:-$DEF_ENABLE_NGINX_LOGROTATE}")
     if [ -n "${_bind_port_raw:-}" ]; then
-      GUNICORN_BIND="127.0.0.1:${_bind_port_raw}"
-      _ok "Gunicorn bind changed to '${GUNICORN_BIND}' (nginx will serve 80/443; Gunicorn stays localhost-only)."
+      if [ "$USE_UNIX_SOCKET" = "y" ]; then
+        GUNICORN_BIND="unix:/run/${SERVICE_NAME}/gunicorn.sock"
+        _ok "Gunicorn bind changed to '${GUNICORN_BIND}' (nginx will serve 80/443; Gunicorn stays localhost-only via unix socket)."
+      else
+        GUNICORN_BIND="127.0.0.1:${_bind_port_raw}"
+        _ok "Gunicorn bind changed to '${GUNICORN_BIND}' (nginx will serve 80/443; Gunicorn stays localhost-only)."
+      fi
     fi
   fi
+
+  ENABLE_SYSTEMD_HARDENING=$(prompt_yn "Enable systemd hardening (safe flags)? [y/N]" "${ENABLE_SYSTEMD_HARDENING:-$DEF_ENABLE_SYSTEMD_HARDENING}")
 
   printf "\n"
   github_auth_private_repo   # rewrites GIT_URL in-place if GitHub private repo
@@ -3462,6 +3479,9 @@ install_app() {
     "GIT_BRANCH='${GIT_BRANCH}'" \
     "DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}'" \
     "GUNICORN_BIND='${GUNICORN_BIND}'" \
+    "USE_UNIX_SOCKET='${USE_UNIX_SOCKET}'" \
+    "ENABLE_SYSTEMD_HARDENING='${ENABLE_SYSTEMD_HARDENING}'" \
+    "ENABLE_NGINX_LOGROTATE='${ENABLE_NGINX_LOGROTATE}'" \
     "SERVICE_ACCOUNT='${SERVICE_ACCOUNT}'" \
     "SERVICE_NAME='${SERVICE_NAME}'" \
     | sudo tee "$ENV_FILE" >/dev/null
@@ -5712,27 +5732,53 @@ FULL migrate bash -c env (for debugging leaks):
     local unit_file="/etc/systemd/system/${SERVICE_NAME}.service"
     local workers="${GUNICORN_WORKERS:-2}"
     local wsgi_module="${DJANGO_SETTINGS_MODULE%.*}.wsgi:application"
-    printf '%s\n' \
-      "[Unit]" \
-      "Description=RaSYaTone application server (gunicorn)" \
-      "After=network.target postgresql.service" \
-      "" \
-      "[Service]" \
-      "Type=notify" \
-      "User=${_svc_user}" \
-      "Group=${_svc_group}" \
-      "WorkingDirectory=$APP_DIR" \
-      "EnvironmentFile=-$ENV_FILE" \
-      "Environment=\"DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE\"" \
-      "Environment=\"HOME=$APP_DIR\"" \
-      "ExecStart=$APP_DIR/.venv/bin/gunicorn --workers $workers --bind $GUNICORN_BIND --chdir $APP_DIR $wsgi_module" \
-      "ExecReload=/bin/kill -s HUP \$MAINPID" \
-      "Restart=always" \
-      "RestartSec=3" \
-      "" \
-      "[Install]" \
-      "WantedBy=multi-user.target" \
-      | sudo tee "$unit_file" >/dev/null
+    local _exec_umask=""
+    local _svc_runtime_dir=""
+    local _svc_runtime_mode=""
+    local _hard_no_new_priv=""
+    local _hard_private_tmp=""
+    local _hard_protect_system=""
+    local _hard_protect_home=""
+    if [ "${USE_UNIX_SOCKET:-$DEF_USE_UNIX_SOCKET}" = "y" ]; then
+      _exec_umask=" --umask 007"
+      _svc_runtime_dir="${SERVICE_NAME}"
+      _svc_runtime_mode="0750"
+    fi
+    if [ "${ENABLE_SYSTEMD_HARDENING:-$DEF_ENABLE_SYSTEMD_HARDENING}" = "y" ]; then
+      _hard_no_new_priv="NoNewPrivileges=true"
+      _hard_private_tmp="PrivateTmp=true"
+      _hard_protect_system="ProtectSystem=full"
+      _hard_protect_home="ProtectHome=true"
+    fi
+    {
+      printf '%s\n' \
+        "[Unit]" \
+        "Description=RaSYaTone application server (gunicorn)" \
+        "After=network.target postgresql.service" \
+        "" \
+        "[Service]" \
+        "Type=notify" \
+        "User=${_svc_user}" \
+        "Group=${_svc_group}" \
+        "WorkingDirectory=$APP_DIR" \
+        "EnvironmentFile=-$ENV_FILE" \
+        "Environment=\"DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE\"" \
+        "Environment=\"HOME=$APP_DIR\""
+      if [ -n "${_svc_runtime_dir:-}" ]; then printf "RuntimeDirectory=%s\n" "$_svc_runtime_dir"; fi
+      if [ -n "${_svc_runtime_mode:-}" ]; then printf "RuntimeDirectoryMode=%s\n" "$_svc_runtime_mode"; fi
+      if [ -n "${_hard_no_new_priv:-}" ]; then printf "%s\n" "$_hard_no_new_priv"; fi
+      if [ -n "${_hard_private_tmp:-}" ]; then printf "%s\n" "$_hard_private_tmp"; fi
+      if [ -n "${_hard_protect_system:-}" ]; then printf "%s\n" "$_hard_protect_system"; fi
+      if [ -n "${_hard_protect_home:-}" ]; then printf "%s\n" "$_hard_protect_home"; fi
+      printf '%s\n' \
+        "ExecStart=$APP_DIR/.venv/bin/gunicorn --workers $workers --bind $GUNICORN_BIND${_exec_umask} --chdir $APP_DIR $wsgi_module" \
+        "ExecReload=/bin/kill -s HUP \$MAINPID" \
+        "Restart=always" \
+        "RestartSec=3" \
+        "" \
+        "[Install]" \
+        "WantedBy=multi-user.target"
+    } | sudo tee "$unit_file" >/dev/null
     _run_with_spinner "systemd daemon-reload (re-read unit files)" sudo systemctl daemon-reload || true
     _run_with_spinner "systemctl enable --now $SERVICE_NAME (start app)" sudo systemctl enable --now "$SERVICE_NAME" || \
       _warn "systemctl enable --now returned non-zero — app may still be starting (RestartSec=3). Run: systemctl status '$SERVICE_NAME' in 10s to verify."
@@ -5759,15 +5805,39 @@ FULL migrate bash -c env (for debugging leaks):
     if command -v systemctl >/dev/null 2>&1; then
       _run_with_spinner "systemctl enable --now nginx" sudo systemctl enable --now nginx || true
     fi
+    local _svc_group_for_ng=""
+    _svc_group_for_ng="${SERVICE_ACCOUNT_GROUP:-${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}}"
+    local _ng_user=""
+    _ng_user=$(sudo awk '$1=="user"{print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';' || true)
+    if [ -z "${_ng_user:-}" ]; then
+      if id -u www-data >/dev/null 2>&1; then _ng_user="www-data"
+      elif id -u nginx >/dev/null 2>&1; then _ng_user="nginx"
+      fi
+    fi
+    if [ "${USE_UNIX_SOCKET:-$DEF_USE_UNIX_SOCKET}" = "y" ] && [ -n "${_ng_user:-}" ]; then
+      set +e
+      sudo usermod -a -G "${_svc_group_for_ng}" "${_ng_user}" >/dev/null 2>&1
+      set -e
+    fi
     local nginx_conf="/etc/nginx/conf.d/${SERVICE_NAME}.conf"
+    local nginx_conf_bak=""
+    nginx_conf_bak="${nginx_conf}.bak-$(date +%Y%m%d%H%M%S 2>/dev/null || echo now)"
+    if sudo test -f "$nginx_conf" 2>/dev/null; then
+      sudo cp -f "$nginx_conf" "$nginx_conf_bak" 2>/dev/null || true
+    fi
     sudo mkdir -p "$(dirname "$nginx_conf")" 2>/dev/null || true
+    local _nginx_upstream=""
+    _nginx_upstream="http://127.0.0.1:${_bind_port_raw}"
+    if [ "${USE_UNIX_SOCKET:-$DEF_USE_UNIX_SOCKET}" = "y" ]; then
+      _nginx_upstream="http://unix:/run/${SERVICE_NAME}/gunicorn.sock"
+    fi
     printf '%s\n' \
       "server {" \
       "  listen 80;" \
       "  server_name ${nginx_domain};" \
       "  client_max_body_size 50m;" \
       "  location / {" \
-      "    proxy_pass http://127.0.0.1:${_bind_port_raw};" \
+      "    proxy_pass ${_nginx_upstream};" \
       "    proxy_set_header Host \$host;" \
       "    proxy_set_header X-Real-IP \$remote_addr;" \
       "    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;" \
@@ -5775,9 +5845,48 @@ FULL migrate bash -c env (for debugging leaks):
       "  }" \
       "}" \
       | sudo tee "$nginx_conf" >/dev/null
-    _run_with_spinner "nginx config test" sudo nginx -t || true
+    local _nginx_ok=0
+    set +e
+    sudo nginx -t >/dev/null 2>&1
+    _nginx_ok=$?
+    set -e
+    if [ "$_nginx_ok" -ne 0 ]; then
+      _warn "nginx config test FAILED after writing ${nginx_conf}. Restoring backup (if present) and keeping nginx unchanged."
+      if sudo test -f "$nginx_conf_bak" 2>/dev/null; then
+        sudo cp -f "$nginx_conf_bak" "$nginx_conf" 2>/dev/null || true
+        _run_with_spinner "nginx config test (restored backup)" sudo nginx -t || true
+      fi
+    else
+      _ok "nginx config test OK"
+    fi
     if command -v systemctl >/dev/null 2>&1; then
-      _run_with_spinner "systemctl reload nginx" sudo systemctl reload nginx || true
+      if [ "$_nginx_ok" -eq 0 ]; then
+        _run_with_spinner "systemctl reload nginx" sudo systemctl reload nginx || true
+      else
+        _warn "nginx reload skipped (config test failed)"
+      fi
+    fi
+    if [ "${ENABLE_NGINX_LOGROTATE:-$DEF_ENABLE_NGINX_LOGROTATE}" = "y" ]; then
+      if sudo test -f "/etc/logrotate.d/nginx" 2>/dev/null; then
+        _ok "nginx logrotate already present: /etc/logrotate.d/nginx"
+      else
+        printf '%s\n' \
+          "/var/log/nginx/*.log {" \
+          "  daily" \
+          "  missingok" \
+          "  rotate 14" \
+          "  compress" \
+          "  delaycompress" \
+          "  notifempty" \
+          "  create 0640 root adm" \
+          "  sharedscripts" \
+          "  postrotate" \
+          "    [ -s /run/nginx.pid ] && kill -USR1 \`cat /run/nginx.pid\`" \
+          "  endscript" \
+          "}" \
+          | sudo tee "/etc/logrotate.d/nginx" >/dev/null
+        _ok "nginx logrotate installed: /etc/logrotate.d/nginx"
+      fi
     fi
     local resolved_ip=""
     resolved_ip=$(getent hosts "$nginx_domain" 2>/dev/null | awk '{print $1}' | head -n 1 || true)
@@ -5814,6 +5923,9 @@ FULL migrate bash -c env (for debugging leaks):
   _section "Enable system firewall (Option 4 firewall step)"
   local bind_port do_fw="" do_webfw=""
   bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
+  if ! printf "%s" "$bind_port" | grep -Eq '^[0-9]+$' 2>/dev/null; then
+    bind_port=$(printf "%s" "$DEF_GUNICORN_BIND" | awk -F: '{print $NF}' 2>/dev/null || echo "8000")
+  fi
   if [ "$nginx_https" -eq 1 ]; then
     do_fw=$(prompt_yn "Enable firewall and open needed ports (HTTP 80/tcp + HTTPS 443/tcp + SSH 22/tcp)? [Y/n]" "y")
   else
@@ -5930,16 +6042,36 @@ FULL migrate bash -c env (for debugging leaks):
     fi
     local bind_port
     bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
+    if ! printf "%s" "$bind_port" | grep -Eq '^[0-9]+$' 2>/dev/null; then
+      bind_port=""
+    fi
     printf "\n\033[1;97mHTTP (local):\033[0m\n"
+    if printf "%s" "$GUNICORN_BIND" | grep -Eq '^unix:' 2>/dev/null; then
+      printf "  Gunicorn unix socket=%s\n" "$GUNICORN_BIND"
+      local _sock_path=""
+      _sock_path="${GUNICORN_BIND#unix:}"
+      if [ -n "${_sock_path}" ] && sudo test -S "${_sock_path}" 2>/dev/null; then
+        printf "  Socket exists: %s\n" "$_sock_path"
+      else
+        printf "  Socket missing: %s\n" "$_sock_path"
+      fi
+    fi
     if command -v curl >/dev/null 2>&1; then
       local http_code
-      http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${bind_port}/" 2>/dev/null || echo "000")
-      printf "  HTTP 127.0.0.1:%s status %s\n" "$bind_port" "$http_code"
+      if [ -n "${bind_port}" ]; then
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${bind_port}/" 2>/dev/null || echo "000")
+        printf "  HTTP 127.0.0.1:%s status %s\n" "$bind_port" "$http_code"
+      elif [ "$nginx_https" -eq 1 ]; then
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1/" 2>/dev/null || echo "000")
+        printf "  HTTP 127.0.0.1:80 status %s\n" "$http_code"
+      fi
     elif command -v nc >/dev/null 2>&1; then
-      if nc -z -w3 "127.0.0.1" "$bind_port" 2>/dev/null; then
-        printf "  Port 127.0.0.1:%s LISTENING (bind=$GUNICORN_BIND)\n" "$bind_port"
-      else
-        printf "  Port 127.0.0.1:%s NOT listening yet (gunicorn may still be starting)\n" "$bind_port"
+      if [ -n "${bind_port}" ]; then
+        if nc -z -w3 "127.0.0.1" "$bind_port" 2>/dev/null; then
+          printf "  Port 127.0.0.1:%s LISTENING (bind=$GUNICORN_BIND)\n" "$bind_port"
+        else
+          printf "  Port 127.0.0.1:%s NOT listening yet (gunicorn may still be starting)\n" "$bind_port"
+        fi
       fi
     fi
     local public_ips=""
@@ -5953,7 +6085,11 @@ FULL migrate bash -c env (for debugging leaks):
         case "$oneip" in
           127.*|::1) continue ;;
         esac
-        printf "  URL=http://%s:%s/\n" "$oneip" "$bind_port"
+        if [ -n "${bind_port}" ]; then
+          printf "  URL=http://%s:%s/\n" "$oneip" "$bind_port"
+        else
+          printf "  URL=http://%s/\n" "$oneip"
+        fi
       done
     fi
     if [ "$nginx_https" -eq 1 ]; then
@@ -5981,9 +6117,11 @@ FULL migrate bash -c env (for debugging leaks):
     if command -v ss >/dev/null 2>&1; then
       printf "\n\033[1;97mListeners:\033[0m\n"
       ss -ltnp 2>/dev/null | grep -E ":(80|443)\\b" 2>/dev/null | sed 's/^/  /' || printf "  80/443: (no listener detected)\n"
-      ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null | sed 's/^/  /' || printf "  %s: (no listener detected)\n" "$bind_port"
+      if [ -n "${bind_port}" ]; then
+        ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null | sed 's/^/  /' || printf "  %s: (no listener detected)\n" "$bind_port"
+      fi
     fi
-    if command -v curl >/dev/null 2>&1 && [ -n "${public_ips}" ]; then
+    if command -v curl >/dev/null 2>&1 && [ -n "${public_ips}" ] && [ -n "${bind_port}" ]; then
       printf "\n\033[1;97mReachability checks (from this server):\033[0m\n"
       local rip="" rcode=""
       for rip in $public_ips; do
@@ -6048,6 +6186,101 @@ FULL migrate bash -c env (for debugging leaks):
   printf "\nDone.\n"
 }
 
+doctor_report() {
+  load_env_file >/dev/null 2>&1 || true
+  detect_pm >/dev/null 2>&1 || true
+  firewall_detect >/dev/null 2>&1 || true
+  local bind_port=""
+  bind_port=$(printf "%s" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}" | awk -F: '{print $NF}' 2>/dev/null || echo "8000")
+  local svc="${SERVICE_NAME:-$DEF_SERVICE}"
+  local app_dir="${APP_DIR:-$DEF_APP_DIR}"
+  local env_file="${ENV_FILE:-/etc/rasyatone.env}"
+  _section "RaSYaTone Doctor (no changes)"
+  printf "\n\033[1;97mCore:\033[0m\n"
+  printf "  APP_DIR=%s\n" "$app_dir"
+  printf "  ENV_FILE=%s\n" "$env_file"
+  printf "  SERVICE=%s\n" "$svc"
+  printf "  SERVICE_ACCOUNT=%s\n" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
+  printf "  DJANGO_SETTINGS_MODULE=%s\n" "${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
+  printf "  GUNICORN_BIND=%s\n" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}"
+  printf "\n\033[1;97mListeners:\033[0m\n"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E ":(80|443|${bind_port})\\b" 2>/dev/null | sed 's/^/  /' || printf "  (no listener detected for ports 80/443/%s)\n" "$bind_port"
+  else
+    printf "  ss not available\n"
+  fi
+  printf "\n\033[1;97mHTTP checks:\033[0m\n"
+  if command -v curl >/dev/null 2>&1; then
+    local c1=""
+    c1=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${bind_port}/" 2>/dev/null || echo "000")
+    printf "  http://127.0.0.1:%s/ -> %s\n" "$bind_port" "$c1"
+  else
+    printf "  curl not available\n"
+  fi
+  printf "\n\033[1;97mService:\033[0m\n"
+  if command -v systemctl >/dev/null 2>&1; then
+    printf "  %s state=" "$svc"
+    systemctl is-active "$svc" 2>/dev/null || true
+    systemctl status --no-pager -n 12 "$svc" 2>/dev/null | sed 's/^/  /' || true
+  else
+    printf "  systemctl not available\n"
+  fi
+  printf "\n\033[1;97mNginx:\033[0m\n"
+  local nginx_conf="/etc/nginx/conf.d/${svc}.conf"
+  local nginx_domain=""
+  if sudo test -f "$nginx_conf" 2>/dev/null; then
+    nginx_domain=$(sudo awk '/server_name[[:space:]]+/{print $2; exit}' "$nginx_conf" 2>/dev/null | tr -d ';' || true)
+    printf "  conf=%s\n" "$nginx_conf"
+    [ -n "${nginx_domain}" ] && printf "  server_name=%s\n" "$nginx_domain"
+  else
+    printf "  conf=%s (missing)\n" "$nginx_conf"
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    set +e
+    sudo nginx -t >/dev/null 2>&1
+    local nt_rc=$?
+    set -e
+    if [ "$nt_rc" -eq 0 ]; then
+      printf "  nginx -t: OK\n"
+    else
+      printf "  nginx -t: FAIL\n"
+      sudo nginx -t 2>&1 | tail -n 8 | sed 's/^/  /' || true
+    fi
+  else
+    printf "  nginx not installed\n"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    printf "  nginx state="
+    systemctl is-active nginx 2>/dev/null || true
+  fi
+  printf "\n\033[1;97mCertbot:\033[0m\n"
+  if command -v certbot >/dev/null 2>&1; then
+    certbot certificates 2>/dev/null | sed 's/^/  /' | head -n 40 || true
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -Eq '^certbot\.timer'; then
+      printf "  auto-renew=systemd timer\n"
+      systemctl is-enabled certbot.timer 2>/dev/null | sed 's/^/  /' || true
+      systemctl list-timers --all 2>/dev/null | grep -i certbot 2>/dev/null | sed 's/^/  /' || true
+    else
+      printf "  auto-renew=cron (if installed)\n"
+      sudo crontab -l 2>/dev/null | grep -i certbot 2>/dev/null | sed 's/^/  /' || printf "  (no certbot cron lines found)\n"
+    fi
+  else
+    printf "  certbot not installed\n"
+  fi
+  printf "\n\033[1;97mFirewall:\033[0m\n"
+  if command -v ufw >/dev/null 2>&1; then
+    sudo ufw status 2>/dev/null | sed 's/^/  /' || true
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    sudo firewall-cmd --state 2>/dev/null | sed 's/^/  /' || true
+    sudo firewall-cmd --list-services 2>/dev/null | sed 's/^/  services: /' || true
+  elif command -v iptables >/dev/null 2>&1; then
+    sudo iptables -S 2>/dev/null | grep -E "dport (80|443|${bind_port})" 2>/dev/null | sed 's/^/  /' || printf "  (no matching iptables rules found)\n"
+  else
+    printf "  firewall tool not detected\n"
+  fi
+  printf "\n"
+}
+
 # =========================================================
 # Main interactive menu
 # =========================================================
@@ -6110,8 +6343,10 @@ elif [ "${1:-}" = "--precheck-db" ]; then
   precheck_db_prereqs; exit $?
 elif [ "${1:-}" = "--precheck-app" ]; then
   precheck_app_prereqs; exit $?
+elif [ "${1:-}" = "--doctor" ]; then
+  doctor_report; exit 0
 elif [ -n "${1:-}" ]; then
-  _die "Unknown arg: $1 (use no args for interactive menu, or --precheck-db | --precheck-app | --install-db | --install-app)"
+  _die "Unknown arg: $1 (use no args for interactive menu, or --precheck-db | --precheck-app | --install-db | --install-app | --doctor)"
 else
   main_menu
 fi
