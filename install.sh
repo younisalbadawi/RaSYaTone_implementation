@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1600-completion-report"
+SCRIPT_VERSION_BUILD="2026-08-06T1700-nginx-https-auto"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -3297,6 +3297,7 @@ install_app() {
   _section "Install RaSYaTone Application Server"
   detect_pm
   load_env_file || true
+  local nginx_https=0 nginx_domain="" nginx_email="" nginx_tls_ok=0
 
   printf "\nEnter RaSYaTone app server settings (press Enter to keep default in [brackets]):\n"
   printf "  (Database settings — Enter keeps current value from %s)\n" "$ENV_FILE"
@@ -3313,6 +3314,19 @@ install_app() {
   #       This is why there is no Step 1 prompt for it: we cannot detect it from an empty APP_DIR; detection uses the cloned manage.py + filesystem.
   GUNICORN_BIND=$(prompt_w_retry "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}" 3 _validator_nonempty "Gunicorn bind CANNOT be empty. Formats: '0.0.0.0:8000' (all), '127.0.0.1:8000' (local only), 'unix:/tmp/rasyatone.sock' (nginx upstream).")
   SERVICE_NAME=$(prompt_w_retry "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}" 3 _validator_nonempty "systemd service name CANNOT be empty. Example: rasyatone (becomes systemctl status rasyatone.service).")
+  local _bind_port_raw=""
+  _bind_port_raw=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}' 2>/dev/null || true)
+  local do_nginx=""
+  do_nginx=$(prompt_yn "Configure nginx reverse proxy + Let's Encrypt HTTPS for a domain now? [Y/n] (Recommended for 80/443 + domain)" "y")
+  if [ "$do_nginx" = "y" ]; then
+    nginx_https=1
+    nginx_domain=$(prompt_w_retry "Domain name (DNS A/AAAA must point to THIS server)" "${nginx_domain:-}" 3 _validator_nonempty "Domain name cannot be empty. Example: rasyatone.example.com")
+    nginx_email=$(prompt_w_retry "Let's Encrypt email (for renewal notices)" "${nginx_email:-}" 3 _validator_nonempty "Email cannot be empty.")
+    if [ -n "${_bind_port_raw:-}" ]; then
+      GUNICORN_BIND="127.0.0.1:${_bind_port_raw}"
+      _ok "Gunicorn bind changed to '${GUNICORN_BIND}' (nginx will serve 80/443; Gunicorn stays localhost-only)."
+    fi
+  fi
 
   printf "\n"
   github_auth_private_repo   # rewrites GIT_URL in-place if GitHub private repo
@@ -5626,33 +5640,119 @@ FULL migrate bash -c env (for debugging leaks):
     _warn "systemd not present — skipped service install (run gunicorn manually)"
   fi
 
+  if [ "$nginx_https" -eq 1 ]; then
+    _section "Install nginx reverse proxy + HTTPS (Let's Encrypt)"
+    set +e
+    case "$PM" in
+      apt)
+        _run_with_spinner "Install nginx+certbot (apt)" sudo bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx certbot python3-certbot-nginx" || true
+        ;;
+      dnf)
+        _run_with_spinner "Install nginx+certbot (dnf)" sudo bash -c "dnf install -y -q nginx certbot python3-certbot-nginx" || true
+        ;;
+      apk)
+        _run_with_spinner "Install nginx+certbot (apk)" sudo apk add -q nginx certbot || true
+        ;;
+    esac
+    set -e
+    if command -v systemctl >/dev/null 2>&1; then
+      _run_with_spinner "systemctl enable --now nginx" sudo systemctl enable --now nginx || true
+    fi
+    local nginx_conf="/etc/nginx/conf.d/${SERVICE_NAME}.conf"
+    sudo mkdir -p "$(dirname "$nginx_conf")" 2>/dev/null || true
+    printf '%s\n' \
+      "server {" \
+      "  listen 80;" \
+      "  server_name ${nginx_domain};" \
+      "  client_max_body_size 50m;" \
+      "  location / {" \
+      "    proxy_pass http://127.0.0.1:${_bind_port_raw};" \
+      "    proxy_set_header Host \$host;" \
+      "    proxy_set_header X-Real-IP \$remote_addr;" \
+      "    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;" \
+      "    proxy_set_header X-Forwarded-Proto \$scheme;" \
+      "  }" \
+      "}" \
+      | sudo tee "$nginx_conf" >/dev/null
+    _run_with_spinner "nginx config test" sudo nginx -t || true
+    if command -v systemctl >/dev/null 2>&1; then
+      _run_with_spinner "systemctl reload nginx" sudo systemctl reload nginx || true
+    fi
+    local resolved_ip=""
+    resolved_ip=$(getent hosts "$nginx_domain" 2>/dev/null | awk '{print $1}' | head -n 1 || true)
+    local public_ips=""
+    public_ips=$(hostname -I 2>/dev/null || true)
+    public_ips=$(printf '%s' "$public_ips" | tr -s ' ' | sed -E 's/^ //; s/ $//' || true)
+    local server_pub=""
+    local iptok=""
+    for iptok in $public_ips; do
+      case "$iptok" in
+        127.*|::1|10.*|192.168.*) continue ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) continue ;;
+      esac
+      server_pub="$iptok"
+      break
+    done
+    if [ -n "${resolved_ip:-}" ] && [ -n "${server_pub:-}" ] && [ "$resolved_ip" != "$server_pub" ]; then
+      _warn "DNS for ${nginx_domain} resolves to ${resolved_ip}, but this server public IP looks like ${server_pub}. Certbot will fail until DNS points to this server."
+    else
+      set +e
+      _run_with_spinner "certbot nginx HTTPS for ${nginx_domain}" sudo certbot --nginx --non-interactive --agree-tos -m "$nginx_email" -d "$nginx_domain" --redirect || true
+      if sudo test -f "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null; then
+        nginx_tls_ok=1
+        _ok "Let's Encrypt certificate installed for ${nginx_domain}."
+      else
+        _warn "Certbot did not produce a certificate under /etc/letsencrypt/live/${nginx_domain}/. Site will remain HTTP until DNS/ports are fixed."
+      fi
+      set -e
+    fi
+  fi
+
   # ================ Firewall enable + app + web ports ================
   _section "Enable system firewall (Option 4 firewall step)"
   local bind_port do_fw="" do_webfw=""
   bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
-  do_fw=$(prompt_yn "Enable firewall and open needed ports (Gunicorn ${bind_port}/tcp + SSH 22/tcp)? [Y/n] — SSH 22 is ALWAYS opened first so you won't be locked out" "y")
+  if [ "$nginx_https" -eq 1 ]; then
+    do_fw=$(prompt_yn "Enable firewall and open needed ports (HTTP 80/tcp + HTTPS 443/tcp + SSH 22/tcp)? [Y/n]" "y")
+  else
+    do_fw=$(prompt_yn "Enable firewall and open needed ports (Gunicorn ${bind_port}/tcp + SSH 22/tcp)? [Y/n] — SSH 22 is ALWAYS opened first so you won't be locked out" "y")
+  fi
   if [ "$do_fw" = "y" ]; then
     firewall_detect || true
     _ok "Detected firewall backend: ${FW_BACKEND}"
     if firewall_install_and_enable; then
       _ok "Firewall installed/enabled; SSH 22/tcp already open"
-      if firewall_add_port tcp "$bind_port" "Gunicorn / RaSYaTone app (${SERVICE_NAME})"; then
-        _ok "Firewall rule added: Gunicorn ${bind_port}/tcp"
-      else
-        _warn "Could not add Gunicorn ${bind_port}/tcp firewall rule — add manually if needed."
-      fi
-      do_webfw=$(prompt_yn "Also open HTTP (80/tcp) and HTTPS (443/tcp) for a future nginx reverse proxy / Let's Encrypt? [y/N]" "n")
-      if [ "$do_webfw" = "y" ]; then
+      if [ "$nginx_https" -eq 1 ]; then
         firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"  || true
         firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)" || true
         _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+      else
+        if firewall_add_port tcp "$bind_port" "Gunicorn / RaSYaTone app (${SERVICE_NAME})"; then
+          _ok "Firewall rule added: Gunicorn ${bind_port}/tcp"
+        else
+          _warn "Could not add Gunicorn ${bind_port}/tcp firewall rule — add manually if needed."
+        fi
+        do_webfw=$(prompt_yn "Also open HTTP (80/tcp) and HTTPS (443/tcp) for a future nginx reverse proxy / Let's Encrypt? [y/N]" "n")
+        if [ "$do_webfw" = "y" ]; then
+          firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"  || true
+          firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)" || true
+          _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+        fi
       fi
       firewall_summary
     else
-      _warn "Could not install/enable firewall (backend=${FW_BACKEND}). Review manually — SSH 22/tcp and Gunicorn ${bind_port}/tcp visibility depend on existing network rules."
+      if [ "$nginx_https" -eq 1 ]; then
+        _warn "Could not install/enable firewall (backend=${FW_BACKEND}). Review manually — SSH 22/tcp and ports 80/443 visibility depend on existing network rules."
+      else
+        _warn "Could not install/enable firewall (backend=${FW_BACKEND}). Review manually — SSH 22/tcp and Gunicorn ${bind_port}/tcp visibility depend on existing network rules."
+      fi
     fi
   else
-    _warn "Firewall skipped by user choice. SSH 22/tcp and Gunicorn ${bind_port}/tcp visibility depend on existing network/firewall rules."
+    if [ "$nginx_https" -eq 1 ]; then
+      _warn "Firewall skipped by user choice. SSH 22/tcp and ports 80/443 visibility depend on existing network/firewall rules."
+    else
+      _warn "Firewall skipped by user choice. SSH 22/tcp and Gunicorn ${bind_port}/tcp visibility depend on existing network/firewall rules."
+    fi
   fi
 
   _section "RaSYaTone app install POST-INSTALL SUMMARY"
@@ -5694,11 +5794,45 @@ FULL migrate bash -c env (for debugging leaks):
       printf "  URL=http://%s:%s/\n" "$oneip" "$bind_port"
     done
   fi
+  if [ "$nginx_https" -eq 1 ]; then
+    if [ "$nginx_tls_ok" -eq 1 ]; then
+      printf "  URL=https://%s/\n" "$nginx_domain"
+    else
+      printf "  URL=http://%s/\n" "$nginx_domain"
+    fi
+    printf "  Note: Gunicorn is localhost-only (%s). nginx serves 80/443.\n" "$GUNICORN_BIND"
+  else
+    printf "  Note: Gunicorn is running directly on port %s. If you want to use a domain on :80/:443 (or HTTPS), install a reverse proxy (nginx) and TLS.\n" "$bind_port"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    printf "\n\033[1;97mListening sockets:\033[0m\n"
+    ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null || printf "  (No listener detected for port %s)\n" "$bind_port"
+    if ! ss -ltnp 2>/dev/null | grep -Eq ":(80|443)\\b" 2>/dev/null; then
+      printf "  (No listener on 80/443 detected — HTTPS/standard domain access will time out unless you set up nginx)\n"
+    fi
+  fi
+  if command -v curl >/dev/null 2>&1 && [ -n "${public_ips}" ]; then
+    printf "\n\033[1;97mReachability checks (from this server):\033[0m\n"
+    local rip="" rcode=""
+    for rip in $public_ips; do
+      case "$rip" in
+        127.*|::1|10.*|192.168.*) continue ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) continue ;;
+      esac
+      rcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "http://${rip}:${bind_port}/" 2>/dev/null || echo "000")
+      printf "  HTTP %s:%s status %s\n" "$rip" "$bind_port" "$rcode"
+    done
+  fi
   printf "\n\033[1;97mUseful commands:\033[0m\n"
   if command -v systemctl >/dev/null 2>&1; then
     printf "  - systemctl status --no-pager '%s'\n" "$SERVICE_NAME"
     printf "  - journalctl -u '%s' -n 200 --no-pager\n" "$SERVICE_NAME"
     printf "  - systemctl restart '%s'\n" "$SERVICE_NAME"
+    if [ "$nginx_https" -eq 1 ]; then
+      printf "  - systemctl status --no-pager nginx\n"
+      printf "  - nginx -t\n"
+      printf "  - certbot renew --dry-run\n"
+    fi
   fi
   printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py createsuperuser\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
   printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py showmigrations --list\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
