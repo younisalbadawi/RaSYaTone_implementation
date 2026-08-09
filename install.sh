@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1700-nginx-https-auto"
+SCRIPT_VERSION_BUILD="2026-08-06T1730-firewall-443-verify"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -5723,9 +5723,29 @@ FULL migrate bash -c env (for debugging leaks):
     if firewall_install_and_enable; then
       _ok "Firewall installed/enabled; SSH 22/tcp already open"
       if [ "$nginx_https" -eq 1 ]; then
-        firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"  || true
-        firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)" || true
-        _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+        local _fw80_rc=0 _fw443_rc=0
+        set +e
+        firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"
+        _fw80_rc=$?
+        firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)"
+        _fw443_rc=$?
+        set -e
+        if [ "$_fw80_rc" -eq 0 ] && [ "$_fw443_rc" -eq 0 ]; then
+          _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+        else
+          _warn "Firewall port-open step incomplete (80 rc=${_fw80_rc}, 443 rc=${_fw443_rc})."
+          case "$FW_BACKEND" in
+            ufw)
+              printf "  Try manually:\n    sudo ufw allow 80/tcp\n    sudo ufw allow 443/tcp\n    sudo ufw status\n"
+              ;;
+            firewalld)
+              printf "  Try manually:\n    sudo firewall-cmd --permanent --add-service=http --zone=public\n    sudo firewall-cmd --permanent --add-service=https --zone=public\n    sudo firewall-cmd --reload\n"
+              ;;
+            iptables)
+              printf "  Try manually:\n    sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT\n    sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT\n"
+              ;;
+          esac
+        fi
       else
         if firewall_add_port tcp "$bind_port" "Gunicorn / RaSYaTone app (${SERVICE_NAME})"; then
           _ok "Firewall rule added: Gunicorn ${bind_port}/tcp"
@@ -5734,9 +5754,29 @@ FULL migrate bash -c env (for debugging leaks):
         fi
         do_webfw=$(prompt_yn "Also open HTTP (80/tcp) and HTTPS (443/tcp) for a future nginx reverse proxy / Let's Encrypt? [y/N]" "n")
         if [ "$do_webfw" = "y" ]; then
-          firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"  || true
-          firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)" || true
-          _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+          local _fw80_rc=0 _fw443_rc=0
+          set +e
+          firewall_add_port tcp 80 "HTTP (nginx / reverse proxy)"
+          _fw80_rc=$?
+          firewall_add_port tcp 443 "HTTPS TLS (nginx / Let's Encrypt)"
+          _fw443_rc=$?
+          set -e
+          if [ "$_fw80_rc" -eq 0 ] && [ "$_fw443_rc" -eq 0 ]; then
+            _ok "Firewall rules added: 80/tcp (HTTP), 443/tcp (HTTPS)"
+          else
+            _warn "Firewall port-open step incomplete (80 rc=${_fw80_rc}, 443 rc=${_fw443_rc})."
+            case "$FW_BACKEND" in
+              ufw)
+                printf "  Try manually:\n    sudo ufw allow 80/tcp\n    sudo ufw allow 443/tcp\n    sudo ufw status\n"
+                ;;
+              firewalld)
+                printf "  Try manually:\n    sudo firewall-cmd --permanent --add-service=http --zone=public\n    sudo firewall-cmd --permanent --add-service=https --zone=public\n    sudo firewall-cmd --reload\n"
+                ;;
+              iptables)
+                printf "  Try manually:\n    sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT\n    sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT\n"
+                ;;
+            esac
+          fi
         fi
       fi
       firewall_summary
