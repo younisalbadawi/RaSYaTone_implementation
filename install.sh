@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T2030-git-safe-directory"
+SCRIPT_VERSION_BUILD="2026-08-06T2130-certbot-autorenew"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -2000,6 +2000,38 @@ _git_run_as_service() {
     sudo chown -R "${u}:${g}" "$appdir" 2>/dev/null || true
   fi
   sudo -H -u "$u" git -c safe.directory="$appdir" -C "$appdir" "$@"
+}
+
+_configure_certbot_autorenew() {
+  if ! command -v certbot >/dev/null 2>&1; then
+    _warn "certbot not found — skipping auto-renew configuration"
+    return 1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -Eq '^certbot\.timer'; then
+      _run_with_spinner "Enable certbot.timer (auto-renew)" sudo systemctl enable --now certbot.timer || true
+      if systemctl is-active certbot.timer >/dev/null 2>&1; then
+        _ok "certbot auto-renew enabled via systemd timer"
+        return 0
+      fi
+    fi
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    local cron_line="0 3,15 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx' >/dev/null 2>&1"
+    local tmp="/tmp/rasyatone_certbot_cron_$$.txt"
+    set +e
+    sudo crontab -l 2>/dev/null >"$tmp"
+    if ! grep -Fq "certbot renew --quiet" "$tmp" 2>/dev/null; then
+      printf "%s\n" "$cron_line" >>"$tmp"
+      sudo crontab "$tmp" 2>/dev/null || true
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    set -e
+    _ok "certbot auto-renew configured via root cron (03:00 and 15:00)"
+    return 0
+  fi
+  _warn "Could not configure certbot auto-renew (no systemd timer and no crontab command)."
+  return 1
 }
 
 # --- Package install wrappers (used by _run_with_spinner for multi-word globals)
@@ -5770,6 +5802,7 @@ FULL migrate bash -c env (for debugging leaks):
       if sudo test -f "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null; then
         nginx_tls_ok=1
         _ok "Let's Encrypt certificate installed for ${nginx_domain}."
+        _configure_certbot_autorenew || true
       else
         _warn "Certbot did not produce a certificate under /etc/letsencrypt/live/${nginx_domain}/. Site will remain HTTP until DNS/ports are fixed."
       fi
@@ -5864,134 +5897,154 @@ FULL migrate bash -c env (for debugging leaks):
     fi
   fi
 
-  _section "RaSYaTone app install POST-INSTALL SUMMARY"
-  printf "\n\033[1;97mCore:\033[0m\n"
-  printf "  APP_DIR=%s\n" "$APP_DIR"
-  printf "  VENV_PYTHON=%s\n" "$APP_DIR/.venv/bin/python"
-  if [ -x "$APP_DIR/.venv/bin/python" ]; then
-    printf "  VENV_PYTHON_VERSION=%s\n" "$("$APP_DIR/.venv/bin/python" --version 2>&1 | head -n1)"
-  fi
-  printf "  DJANGO_SETTINGS_MODULE=%s\n" "$DJANGO_SETTINGS_MODULE"
-  printf "  ENV_FILE=%s\n" "$ENV_FILE"
-  printf "  SERVICE_ACCOUNT=%s\n" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
-  if command -v systemctl >/dev/null 2>&1; then
-    printf "\n\033[1;97mService:\033[0m\n"
-    printf "  SERVICE=%s state=" "$SERVICE_NAME"
-    systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
-    local _spid=""
-    _spid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null | tr -d '[:space:]' || true)
-    if [ -n "${_spid}" ] && [ "${_spid}" != "0" ]; then
-      printf "  MainPID=%s\n" "$_spid"
-      if command -v ps >/dev/null 2>&1; then
-        ps -o user=,group=,pid=,etimes=,cmd= -p "$_spid" 2>/dev/null | sed 's/^/  /' || true
-      fi
+  local script_dir="" report_log="" report_tmp=""
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd 2>/dev/null || echo ".")"
+  report_log="${script_dir}/rasyatone_post_install_summary.log"
+  report_tmp="/tmp/rasyatone_post_install_summary_${$}.log"
+  set +e
+  {
+    printf "\n\033[1;97m=== RaSYaTone app install POST-INSTALL SUMMARY ===\033[0m\n"
+    printf "Generated: %s\n" "$(date -Is 2>/dev/null || date 2>/dev/null || echo "unknown")"
+    printf "\n\033[1;97mCore:\033[0m\n"
+    printf "  APP_DIR=%s\n" "$APP_DIR"
+    printf "  VENV_PYTHON=%s\n" "$APP_DIR/.venv/bin/python"
+    if [ -x "$APP_DIR/.venv/bin/python" ]; then
+      printf "  VENV_PYTHON_VERSION=%s\n" "$("$APP_DIR/.venv/bin/python" --version 2>&1 | head -n1)"
     fi
-    systemctl status --no-pager -n 5 "$SERVICE_NAME" 2>/dev/null | sed 's/^/  /' || true
-  fi
-  local bind_port
-  bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
-  printf "\n\033[1;97mHTTP (local):\033[0m\n"
-  if command -v curl >/dev/null 2>&1; then
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${bind_port}/" 2>/dev/null || echo "000")
-    printf "  HTTP 127.0.0.1:%s status %s\n" "$bind_port" "$http_code"
-  elif command -v nc >/dev/null 2>&1; then
-    if nc -z -w3 "127.0.0.1" "$bind_port" 2>/dev/null; then
-      printf "  Port 127.0.0.1:%s LISTENING (bind=$GUNICORN_BIND)\n" "$bind_port"
-    else
-      printf "  Port 127.0.0.1:%s NOT listening yet (gunicorn may still be starting)\n" "$bind_port"
-    fi
-  fi
-  local public_ips=""
-  public_ips=$(hostname -I 2>/dev/null || true)
-  public_ips=$(printf '%s' "$public_ips" | tr -s ' ' | sed -E 's/^ //; s/ $//' || true)
-  if [ -n "${public_ips}" ]; then
-    printf "\n\033[1;97mNetwork:\033[0m\n"
-    printf "  Server IPs=%s\n" "$public_ips"
-    local oneip=""
-    for oneip in $public_ips; do
-      case "$oneip" in
-        127.*|::1) continue ;;
-      esac
-      printf "  URL=http://%s:%s/\n" "$oneip" "$bind_port"
-    done
-  fi
-  if [ "$nginx_https" -eq 1 ]; then
-    printf "\n\033[1;97mNginx/TLS:\033[0m\n"
-    if [ "$nginx_tls_ok" -eq 1 ]; then
-      printf "  URL=https://%s/\n" "$nginx_domain"
-    else
-      printf "  URL=http://%s/\n" "$nginx_domain"
-    fi
-    printf "  Note: Gunicorn is localhost-only (%s). nginx serves 80/443.\n" "$GUNICORN_BIND"
+    printf "  DJANGO_SETTINGS_MODULE=%s\n" "$DJANGO_SETTINGS_MODULE"
+    printf "  ENV_FILE=%s\n" "$ENV_FILE"
+    printf "  SERVICE_ACCOUNT=%s\n" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
     if command -v systemctl >/dev/null 2>&1; then
-      printf "  nginx state="
-      systemctl is-active nginx 2>/dev/null || true
+      printf "\n\033[1;97mService:\033[0m\n"
+      printf "  SERVICE=%s state=" "$SERVICE_NAME"
+      systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
+      local _spid=""
+      _spid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null | tr -d '[:space:]' || true)
+      if [ -n "${_spid}" ] && [ "${_spid}" != "0" ]; then
+        printf "  MainPID=%s\n" "$_spid"
+        if command -v ps >/dev/null 2>&1; then
+          ps -o user=,group=,pid=,etimes=,cmd= -p "$_spid" 2>/dev/null | sed 's/^/  /' || true
+        fi
+      fi
+      systemctl status --no-pager -n 5 "$SERVICE_NAME" 2>/dev/null | sed 's/^/  /' || true
     fi
-    if [ -n "${nginx_domain:-}" ] && sudo test -f "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null; then
-      if command -v openssl >/dev/null 2>&1; then
-        local _cert_end=""
-        _cert_end=$(sudo openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null || true)
-        [ -n "${_cert_end}" ] && printf "  TLS %s\n" "$_cert_end"
+    local bind_port
+    bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
+    printf "\n\033[1;97mHTTP (local):\033[0m\n"
+    if command -v curl >/dev/null 2>&1; then
+      local http_code
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${bind_port}/" 2>/dev/null || echo "000")
+      printf "  HTTP 127.0.0.1:%s status %s\n" "$bind_port" "$http_code"
+    elif command -v nc >/dev/null 2>&1; then
+      if nc -z -w3 "127.0.0.1" "$bind_port" 2>/dev/null; then
+        printf "  Port 127.0.0.1:%s LISTENING (bind=$GUNICORN_BIND)\n" "$bind_port"
+      else
+        printf "  Port 127.0.0.1:%s NOT listening yet (gunicorn may still be starting)\n" "$bind_port"
       fi
     fi
-  else
-    printf "  Note: Gunicorn is running directly on port %s. If you want to use a domain on :80/:443 (or HTTPS), install a reverse proxy (nginx) and TLS.\n" "$bind_port"
-  fi
-  if command -v ss >/dev/null 2>&1; then
-    printf "\n\033[1;97mListeners:\033[0m\n"
-    ss -ltnp 2>/dev/null | grep -E ":(80|443)\\b" 2>/dev/null | sed 's/^/  /' || printf "  80/443: (no listener detected)\n"
-    ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null | sed 's/^/  /' || printf "  %s: (no listener detected)\n" "$bind_port"
-  fi
-  if command -v curl >/dev/null 2>&1 && [ -n "${public_ips}" ]; then
-    printf "\n\033[1;97mReachability checks (from this server):\033[0m\n"
-    local rip="" rcode=""
-    for rip in $public_ips; do
-      case "$rip" in
-        127.*|::1|10.*|192.168.*) continue ;;
-        172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) continue ;;
-      esac
-      rcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "http://${rip}:${bind_port}/" 2>/dev/null || echo "000")
-      printf "  HTTP %s:%s status %s\n" "$rip" "$bind_port" "$rcode"
-    done
-  fi
-  if command -v psql >/dev/null 2>&1; then
-    printf "\n\033[1;97mDatabase:\033[0m\n"
-    local _db_ok=0 _db_err="/tmp/rasyatone_postinstall_dbcheck_$$.log"
-    : >"$_db_err" 2>/dev/null || true
-    local _row=""
-    _row=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>"$_db_err" | tr -d '[:space:]' || true)
-    if [ "$_row" = "1" ]; then
-      _db_ok=1
-      printf "  psql SELECT 1: OK (%s@%s:%s/%s)\n" "$DB_USER" "$DB_HOST" "$DB_PORT" "$DB_NAME"
-    else
-      printf "  psql SELECT 1: FAIL (%s@%s:%s/%s)\n" "$DB_USER" "$DB_HOST" "$DB_PORT" "$DB_NAME"
-      tail -n 3 "$_db_err" 2>/dev/null | sed 's/^/  /' || true
+    local public_ips=""
+    public_ips=$(hostname -I 2>/dev/null || true)
+    public_ips=$(printf '%s' "$public_ips" | tr -s ' ' | sed -E 's/^ //; s/ $//' || true)
+    if [ -n "${public_ips}" ]; then
+      printf "\n\033[1;97mNetwork:\033[0m\n"
+      printf "  Server IPs=%s\n" "$public_ips"
+      local oneip=""
+      for oneip in $public_ips; do
+        case "$oneip" in
+          127.*|::1) continue ;;
+        esac
+        printf "  URL=http://%s:%s/\n" "$oneip" "$bind_port"
+      done
     fi
-    rm -f "$_db_err" 2>/dev/null || true
-  fi
-  printf "\n\033[1;97mResources:\033[0m\n"
-  if command -v df >/dev/null 2>&1; then
-    df -h / "$APP_DIR" 2>/dev/null | awk 'NR==1||NR==2||NR==3{print}' | sed 's/^/  /' || true
-  fi
-  if command -v free >/dev/null 2>&1; then
-    free -h 2>/dev/null | awk 'NR==1||NR==2{print}' | sed 's/^/  /' || true
-  fi
-  printf "\n\033[1;97mUseful commands:\033[0m\n"
-  if command -v systemctl >/dev/null 2>&1; then
-    printf "  - systemctl status --no-pager '%s'\n" "$SERVICE_NAME"
-    printf "  - journalctl -u '%s' -n 200 --no-pager\n" "$SERVICE_NAME"
-    printf "  - systemctl restart '%s'\n" "$SERVICE_NAME"
     if [ "$nginx_https" -eq 1 ]; then
-      printf "  - systemctl status --no-pager nginx\n"
-      printf "  - nginx -t\n"
-      printf "  - certbot renew --dry-run\n"
-      printf "  - certbot certificates\n"
+      printf "\n\033[1;97mNginx/TLS:\033[0m\n"
+      if [ "$nginx_tls_ok" -eq 1 ]; then
+        printf "  URL=https://%s/\n" "$nginx_domain"
+      else
+        printf "  URL=http://%s/\n" "$nginx_domain"
+      fi
+      printf "  Note: Gunicorn is localhost-only (%s). nginx serves 80/443.\n" "$GUNICORN_BIND"
+      if command -v systemctl >/dev/null 2>&1; then
+        printf "  nginx state="
+        systemctl is-active nginx 2>/dev/null || true
+      fi
+      if [ -n "${nginx_domain:-}" ] && sudo test -f "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null; then
+        if command -v openssl >/dev/null 2>&1; then
+          local _cert_end=""
+          _cert_end=$(sudo openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null || true)
+          [ -n "${_cert_end}" ] && printf "  TLS %s\n" "$_cert_end"
+        fi
+      fi
+    else
+      printf "  Note: Gunicorn is running directly on port %s. If you want to use a domain on :80/:443 (or HTTPS), install a reverse proxy (nginx) and TLS.\n" "$bind_port"
     fi
-  fi
-  printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py createsuperuser\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
-  printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py showmigrations --list\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
-  printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py check --deploy\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
+    if command -v ss >/dev/null 2>&1; then
+      printf "\n\033[1;97mListeners:\033[0m\n"
+      ss -ltnp 2>/dev/null | grep -E ":(80|443)\\b" 2>/dev/null | sed 's/^/  /' || printf "  80/443: (no listener detected)\n"
+      ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null | sed 's/^/  /' || printf "  %s: (no listener detected)\n" "$bind_port"
+    fi
+    if command -v curl >/dev/null 2>&1 && [ -n "${public_ips}" ]; then
+      printf "\n\033[1;97mReachability checks (from this server):\033[0m\n"
+      local rip="" rcode=""
+      for rip in $public_ips; do
+        case "$rip" in
+          127.*|::1|10.*|192.168.*) continue ;;
+          172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) continue ;;
+        esac
+        rcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "http://${rip}:${bind_port}/" 2>/dev/null || echo "000")
+        printf "  HTTP %s:%s status %s\n" "$rip" "$bind_port" "$rcode"
+      done
+    fi
+    if command -v psql >/dev/null 2>&1; then
+      printf "\n\033[1;97mDatabase:\033[0m\n"
+      local _db_err="/tmp/rasyatone_postinstall_dbcheck_$$.log"
+      : >"$_db_err" 2>/dev/null || true
+      local _row=""
+      _row=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>"$_db_err" | tr -d '[:space:]' || true)
+      if [ "$_row" = "1" ]; then
+        printf "  psql SELECT 1: OK (%s@%s:%s/%s)\n" "$DB_USER" "$DB_HOST" "$DB_PORT" "$DB_NAME"
+      else
+        printf "  psql SELECT 1: FAIL (%s@%s:%s/%s)\n" "$DB_USER" "$DB_HOST" "$DB_PORT" "$DB_NAME"
+        tail -n 3 "$_db_err" 2>/dev/null | sed 's/^/  /' || true
+      fi
+      rm -f "$_db_err" 2>/dev/null || true
+    fi
+    printf "\n\033[1;97mResources:\033[0m\n"
+    if command -v df >/dev/null 2>&1; then
+      df -h / "$APP_DIR" 2>/dev/null | awk 'NR==1||NR==2||NR==3{print}' | sed 's/^/  /' || true
+    fi
+    if command -v free >/dev/null 2>&1; then
+      free -h 2>/dev/null | awk 'NR==1||NR==2{print}' | sed 's/^/  /' || true
+    fi
+    printf "\n\033[1;97mUseful commands:\033[0m\n"
+    if command -v systemctl >/dev/null 2>&1; then
+      printf "  - systemctl status --no-pager '%s'\n" "$SERVICE_NAME"
+      printf "  - journalctl -u '%s' -n 200 --no-pager\n" "$SERVICE_NAME"
+      printf "  - systemctl restart '%s'\n" "$SERVICE_NAME"
+      if [ "$nginx_https" -eq 1 ]; then
+        printf "  - systemctl status --no-pager nginx\n"
+        printf "  - nginx -t\n"
+        printf "  - certbot renew --dry-run\n"
+        printf "  - certbot certificates\n"
+      if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -Eq '^certbot\.timer'; then
+        printf "  - systemctl status --no-pager certbot.timer\n"
+        printf "  - systemctl list-timers --all | grep certbot\n"
+      else
+        printf "  - sudo crontab -l | grep certbot\n"
+      fi
+      fi
+    fi
+    printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py createsuperuser\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
+    printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py showmigrations --list\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
+    printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py check --deploy\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
+    printf "\n"
+  } | tee "$report_tmp"
+  set -e
+  sudo mkdir -p "$script_dir" 2>/dev/null || true
+  sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' "$report_tmp" 2>/dev/null | sudo tee -a "$report_log" >/dev/null 2>/dev/null || true
+  sudo chmod 0644 "$report_log" 2>/dev/null || true
+  rm -f "$report_tmp" 2>/dev/null || true
+  _ok "Post-install summary saved: $report_log"
   printf "\nDone.\n"
 }
 
