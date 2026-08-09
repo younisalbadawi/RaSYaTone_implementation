@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1800-ufw-443-fallback"
+SCRIPT_VERSION_BUILD="2026-08-06T1900-service-account"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -118,6 +118,7 @@ DEF_GIT_BRANCH="main"
 DEF_DJANGO_SETTINGS_MODULE="rasyatone.settings"
 DEF_GUNICORN_BIND="0.0.0.0:8000"
 DEF_SERVICE="rasyatone"
+DEF_SERVICE_ACCOUNT="rasyatone_app_user"
 MIN_PYTHON_MAJOR=3
 MIN_PYTHON_MINOR=10
 declare -g PYTHON_BIN=""
@@ -1470,6 +1471,10 @@ prompt_edit_multiple() {
 _validator_nonempty() {
   local v="$1"; [ -n "${v:-}" ]
 }
+_validator_linux_username() {
+  local v="$1"
+  [[ "$v" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
 _validator_dir_writable_or_parent_exists() {
   local d="$1"
   [ -z "${d:-}" ] && return 1
@@ -2320,7 +2325,7 @@ load_env_file() {
   DB_NAME="$DEF_DB_NAME"; DB_USER="$DEF_DB_USER"; DB_PASSWORD=""
   DB_HOST="$DEF_DB_HOST"; DB_PORT="$DEF_DB_PORT"; LISTEN_ADDRESSES="$DEF_LISTEN_ADDRESSES"
   APP_DIR="$DEF_APP_DIR"; GIT_URL=""; GIT_BRANCH="$DEF_GIT_BRANCH"
-  DJANGO_SETTINGS_MODULE="$DEF_DJANGO_SETTINGS_MODULE"; GUNICORN_BIND="$DEF_GUNICORN_BIND"; SERVICE_NAME="$DEF_SERVICE"
+  DJANGO_SETTINGS_MODULE="$DEF_DJANGO_SETTINGS_MODULE"; GUNICORN_BIND="$DEF_GUNICORN_BIND"; SERVICE_NAME="$DEF_SERVICE"; SERVICE_ACCOUNT="$DEF_SERVICE_ACCOUNT"
   if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
     _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
     set -a; . "$ENV_FILE" || true; set +a
@@ -2329,7 +2334,7 @@ load_env_file() {
     LISTEN_ADDRESSES="${LISTEN_ADDRESSES:-$DEF_LISTEN_ADDRESSES}"
     APP_DIR="${APP_DIR:-$DEF_APP_DIR}"; GIT_BRANCH="${GIT_BRANCH:-$DEF_GIT_BRANCH}"
     DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
-    GUNICORN_BIND="${GUNICORN_BIND:-$DEF_GUNICORN_BIND}"; SERVICE_NAME="${SERVICE_NAME:-$DEF_SERVICE}"
+    GUNICORN_BIND="${GUNICORN_BIND:-$DEF_GUNICORN_BIND}"; SERVICE_NAME="${SERVICE_NAME:-$DEF_SERVICE}"; SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
     return 0
   fi
   return 1
@@ -3326,6 +3331,7 @@ install_app() {
   #       This is why there is no Step 1 prompt for it: we cannot detect it from an empty APP_DIR; detection uses the cloned manage.py + filesystem.
   GUNICORN_BIND=$(prompt_w_retry "Gunicorn bind address" "${GUNICORN_BIND:-$DEF_GUNICORN_BIND}" 3 _validator_nonempty "Gunicorn bind CANNOT be empty. Formats: '0.0.0.0:8000' (all), '127.0.0.1:8000' (local only), 'unix:/tmp/rasyatone.sock' (nginx upstream).")
   SERVICE_NAME=$(prompt_w_retry "systemd service name" "${SERVICE_NAME:-$DEF_SERVICE}" 3 _validator_nonempty "systemd service name CANNOT be empty. Example: rasyatone (becomes systemctl status rasyatone.service).")
+  SERVICE_ACCOUNT=$(prompt_w_retry "Service account username (non-root, runs gunicorn)" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}" 3 _validator_linux_username "Invalid Linux username. Use lowercase letters/numbers/underscore/dash, must start with letter or underscore (max 32 chars). Example: rasyatone_app_user.")
   local _bind_port_raw=""
   _bind_port_raw=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}' 2>/dev/null || true)
   local do_nginx=""
@@ -3386,6 +3392,7 @@ install_app() {
     "GIT_BRANCH='${GIT_BRANCH}'" \
     "DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}'" \
     "GUNICORN_BIND='${GUNICORN_BIND}'" \
+    "SERVICE_ACCOUNT='${SERVICE_ACCOUNT}'" \
     "SERVICE_NAME='${SERVICE_NAME}'" \
     | sudo tee "$ENV_FILE" >/dev/null
   sudo chmod 0640 "$ENV_FILE" 2>/dev/null || true
@@ -5620,6 +5627,41 @@ FULL migrate bash -c env (for debugging leaks):
   _ok "Django migrate OK"
 
   if command -v systemctl >/dev/null 2>&1; then
+    local _svc_user="${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
+    local _svc_group=""
+    local _svc_shell=""
+    if [ -x /usr/sbin/nologin ]; then _svc_shell="/usr/sbin/nologin"
+    elif [ -x /sbin/nologin ]; then _svc_shell="/sbin/nologin"
+    else _svc_shell="/bin/false"
+    fi
+    if id "${_svc_user}" >/dev/null 2>&1; then
+      _svc_group="$(id -gn "${_svc_user}" 2>/dev/null || echo "${_svc_user}")"
+      _ok "Service account exists: ${_svc_user} (group=${_svc_group})"
+    else
+      _section "Create service account: ${_svc_user}"
+      set +e
+      if command -v groupadd >/dev/null 2>&1; then
+        sudo groupadd --system "${_svc_user}" >/dev/null 2>&1 || true
+      fi
+      if command -v useradd >/dev/null 2>&1; then
+        sudo useradd --system --no-create-home --home-dir "${APP_DIR}" --shell "${_svc_shell}" --gid "${_svc_user}" "${_svc_user}" >/dev/null 2>&1 || \
+        sudo useradd --system --no-create-home --home-dir "${APP_DIR}" --shell "${_svc_shell}" "${_svc_user}" >/dev/null 2>&1 || true
+      elif command -v adduser >/dev/null 2>&1; then
+        sudo adduser -S -H -h "${APP_DIR}" -s "${_svc_shell}" "${_svc_user}" >/dev/null 2>&1 || true
+      fi
+      set -e
+      if ! id "${_svc_user}" >/dev/null 2>&1; then
+        _die "Could not create service account '${_svc_user}'. Create it manually then rerun Option 4."
+      fi
+      _svc_group="$(id -gn "${_svc_user}" 2>/dev/null || echo "${_svc_user}")"
+      _ok "Service account created: ${_svc_user} (group=${_svc_group})"
+    fi
+    _run_with_spinner "Chown APP_DIR to service account (${_svc_user})" sudo chown -R "${_svc_user}:${_svc_group}" "$APP_DIR" || true
+    if [ -f "$ENV_FILE" ]; then
+      sudo chown "root:${_svc_group}" "$ENV_FILE" 2>/dev/null || true
+      sudo chmod 0640 "$ENV_FILE" 2>/dev/null || true
+      _ok "ENV_FILE permissions set: root:${_svc_group} 0640 (service can read)"
+    fi
     _section "Install systemd service: $SERVICE_NAME"
     local unit_file="/etc/systemd/system/${SERVICE_NAME}.service"
     local workers="${GUNICORN_WORKERS:-2}"
@@ -5631,11 +5673,12 @@ FULL migrate bash -c env (for debugging leaks):
       "" \
       "[Service]" \
       "Type=notify" \
-      "User=root" \
-      "Group=root" \
+      "User=${_svc_user}" \
+      "Group=${_svc_group}" \
       "WorkingDirectory=$APP_DIR" \
       "EnvironmentFile=-$ENV_FILE" \
       "Environment=\"DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE\"" \
+      "Environment=\"HOME=$APP_DIR\"" \
       "ExecStart=$APP_DIR/.venv/bin/gunicorn --workers $workers --bind $GUNICORN_BIND --chdir $APP_DIR $wsgi_module" \
       "ExecReload=/bin/kill -s HUP \$MAINPID" \
       "Restart=always" \
@@ -5815,6 +5858,7 @@ FULL migrate bash -c env (for debugging leaks):
   fi
   printf "  DJANGO_SETTINGS_MODULE=%s\n" "$DJANGO_SETTINGS_MODULE"
   printf "  ENV_FILE=%s\n" "$ENV_FILE"
+  printf "  SERVICE_ACCOUNT=%s\n" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
   if command -v systemctl >/dev/null 2>&1; then
     printf "  SERVICE=%s state=" "$SERVICE_NAME"
     systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
