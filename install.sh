@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1730-firewall-443-verify"
+SCRIPT_VERSION_BUILD="2026-08-06T1800-ufw-443-fallback"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -2256,10 +2256,22 @@ firewall_add_port() {
   case "$FW_BACKEND" in
     ufw)
       if [ -n "$comment" ]; then
-        sudo ufw allow "${port}/${proto}" comment "$comment" >/dev/null 2>&1 || return 1
-      else
-        sudo ufw allow "${port}/${proto}" >/dev/null 2>&1 || return 1
+        sudo ufw allow "${port}/${proto}" comment "$comment" >/dev/null 2>&1 || true
+        if sudo ufw status 2>/dev/null | grep -Eq "^${port}/${proto}\\b" 2>/dev/null; then
+          return 0
+        fi
       fi
+      sudo ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
+      if sudo ufw status 2>/dev/null | grep -Eq "^${port}/${proto}\\b" 2>/dev/null; then
+        return 0
+      fi
+      if [ "$proto" = "tcp" ] && [ "$port" = "443" ]; then
+        sudo ufw allow https >/dev/null 2>&1 || true
+        if sudo ufw status 2>/dev/null | grep -Eq "^(443/tcp|https)\\b" 2>/dev/null; then
+          return 0
+        fi
+      fi
+      return 1
       ;;
     firewalld)
       sudo firewall-cmd --permanent --add-port="${port}/${proto}" --zone=public >/dev/null 2>&1 || return 1
