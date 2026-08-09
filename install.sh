@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1900-service-account"
+SCRIPT_VERSION_BUILD="2026-08-06T2000-admin-report"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -5851,6 +5851,7 @@ FULL migrate bash -c env (for debugging leaks):
   fi
 
   _section "RaSYaTone app install POST-INSTALL SUMMARY"
+  printf "\n\033[1;97mCore:\033[0m\n"
   printf "  APP_DIR=%s\n" "$APP_DIR"
   printf "  VENV_PYTHON=%s\n" "$APP_DIR/.venv/bin/python"
   if [ -x "$APP_DIR/.venv/bin/python" ]; then
@@ -5860,12 +5861,22 @@ FULL migrate bash -c env (for debugging leaks):
   printf "  ENV_FILE=%s\n" "$ENV_FILE"
   printf "  SERVICE_ACCOUNT=%s\n" "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
   if command -v systemctl >/dev/null 2>&1; then
+    printf "\n\033[1;97mService:\033[0m\n"
     printf "  SERVICE=%s state=" "$SERVICE_NAME"
     systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
-    systemctl status --no-pager -n 5 "$SERVICE_NAME" 2>/dev/null || true
+    local _spid=""
+    _spid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -n "${_spid}" ] && [ "${_spid}" != "0" ]; then
+      printf "  MainPID=%s\n" "$_spid"
+      if command -v ps >/dev/null 2>&1; then
+        ps -o user=,group=,pid=,etimes=,cmd= -p "$_spid" 2>/dev/null | sed 's/^/  /' || true
+      fi
+    fi
+    systemctl status --no-pager -n 5 "$SERVICE_NAME" 2>/dev/null | sed 's/^/  /' || true
   fi
   local bind_port
   bind_port=$(printf "%s" "$GUNICORN_BIND" | awk -F: '{print $NF}')
+  printf "\n\033[1;97mHTTP (local):\033[0m\n"
   if command -v curl >/dev/null 2>&1; then
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${bind_port}/" 2>/dev/null || echo "000")
@@ -5881,6 +5892,7 @@ FULL migrate bash -c env (for debugging leaks):
   public_ips=$(hostname -I 2>/dev/null || true)
   public_ips=$(printf '%s' "$public_ips" | tr -s ' ' | sed -E 's/^ //; s/ $//' || true)
   if [ -n "${public_ips}" ]; then
+    printf "\n\033[1;97mNetwork:\033[0m\n"
     printf "  Server IPs=%s\n" "$public_ips"
     local oneip=""
     for oneip in $public_ips; do
@@ -5891,21 +5903,31 @@ FULL migrate bash -c env (for debugging leaks):
     done
   fi
   if [ "$nginx_https" -eq 1 ]; then
+    printf "\n\033[1;97mNginx/TLS:\033[0m\n"
     if [ "$nginx_tls_ok" -eq 1 ]; then
       printf "  URL=https://%s/\n" "$nginx_domain"
     else
       printf "  URL=http://%s/\n" "$nginx_domain"
     fi
     printf "  Note: Gunicorn is localhost-only (%s). nginx serves 80/443.\n" "$GUNICORN_BIND"
+    if command -v systemctl >/dev/null 2>&1; then
+      printf "  nginx state="
+      systemctl is-active nginx 2>/dev/null || true
+    fi
+    if [ -n "${nginx_domain:-}" ] && sudo test -f "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null; then
+      if command -v openssl >/dev/null 2>&1; then
+        local _cert_end=""
+        _cert_end=$(sudo openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${nginx_domain}/fullchain.pem" 2>/dev/null || true)
+        [ -n "${_cert_end}" ] && printf "  TLS %s\n" "$_cert_end"
+      fi
+    fi
   else
     printf "  Note: Gunicorn is running directly on port %s. If you want to use a domain on :80/:443 (or HTTPS), install a reverse proxy (nginx) and TLS.\n" "$bind_port"
   fi
   if command -v ss >/dev/null 2>&1; then
-    printf "\n\033[1;97mListening sockets:\033[0m\n"
-    ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null || printf "  (No listener detected for port %s)\n" "$bind_port"
-    if ! ss -ltnp 2>/dev/null | grep -Eq ":(80|443)\\b" 2>/dev/null; then
-      printf "  (No listener on 80/443 detected — HTTPS/standard domain access will time out unless you set up nginx)\n"
-    fi
+    printf "\n\033[1;97mListeners:\033[0m\n"
+    ss -ltnp 2>/dev/null | grep -E ":(80|443)\\b" 2>/dev/null | sed 's/^/  /' || printf "  80/443: (no listener detected)\n"
+    ss -ltnp 2>/dev/null | grep -E "[:.]${bind_port}\\b" 2>/dev/null | sed 's/^/  /' || printf "  %s: (no listener detected)\n" "$bind_port"
   fi
   if command -v curl >/dev/null 2>&1 && [ -n "${public_ips}" ]; then
     printf "\n\033[1;97mReachability checks (from this server):\033[0m\n"
@@ -5919,6 +5941,28 @@ FULL migrate bash -c env (for debugging leaks):
       printf "  HTTP %s:%s status %s\n" "$rip" "$bind_port" "$rcode"
     done
   fi
+  if command -v psql >/dev/null 2>&1; then
+    printf "\n\033[1;97mDatabase:\033[0m\n"
+    local _db_ok=0 _db_err="/tmp/rasyatone_postinstall_dbcheck_$$.log"
+    : >"$_db_err" 2>/dev/null || true
+    local _row=""
+    _row=$(PGPASSWORD="$DB_PASSWORD" timeout 6 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT 1" 2>"$_db_err" | tr -d '[:space:]' || true)
+    if [ "$_row" = "1" ]; then
+      _db_ok=1
+      printf "  psql SELECT 1: OK (%s@%s:%s/%s)\n" "$DB_USER" "$DB_HOST" "$DB_PORT" "$DB_NAME"
+    else
+      printf "  psql SELECT 1: FAIL (%s@%s:%s/%s)\n" "$DB_USER" "$DB_HOST" "$DB_PORT" "$DB_NAME"
+      tail -n 3 "$_db_err" 2>/dev/null | sed 's/^/  /' || true
+    fi
+    rm -f "$_db_err" 2>/dev/null || true
+  fi
+  printf "\n\033[1;97mResources:\033[0m\n"
+  if command -v df >/dev/null 2>&1; then
+    df -h / "$APP_DIR" 2>/dev/null | awk 'NR==1||NR==2||NR==3{print}' | sed 's/^/  /' || true
+  fi
+  if command -v free >/dev/null 2>&1; then
+    free -h 2>/dev/null | awk 'NR==1||NR==2{print}' | sed 's/^/  /' || true
+  fi
   printf "\n\033[1;97mUseful commands:\033[0m\n"
   if command -v systemctl >/dev/null 2>&1; then
     printf "  - systemctl status --no-pager '%s'\n" "$SERVICE_NAME"
@@ -5928,6 +5972,7 @@ FULL migrate bash -c env (for debugging leaks):
       printf "  - systemctl status --no-pager nginx\n"
       printf "  - nginx -t\n"
       printf "  - certbot renew --dry-run\n"
+      printf "  - certbot certificates\n"
     fi
   fi
   printf "  - cd '%s' && PYTHONPATH='%s' DJANGO_SETTINGS_MODULE='%s' '%s' manage.py createsuperuser\n" "$APP_DIR" "$APP_DIR" "$DJANGO_SETTINGS_MODULE" "$APP_DIR/.venv/bin/python"
