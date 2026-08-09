@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T2000-admin-report"
+SCRIPT_VERSION_BUILD="2026-08-06T2030-git-safe-directory"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -1951,6 +1951,7 @@ _run_with_progress() {
 
 # --- package manager auto-detect --------------------------------------------
 declare -g PM="" PKG_INSTALL="" PKG_UPDATE="" FW_BACKEND="none"
+declare -g SERVICE_ACCOUNT_GROUP=""
 detect_pm() {
   if [ -n "$PM" ]; then return 0; fi
   if command -v apt-get >/dev/null 2>&1; then
@@ -1962,6 +1963,43 @@ detect_pm() {
   else
     _die "Could not detect package manager (apt/dnf/apk). Install prerequisites manually first."
   fi
+}
+
+_ensure_service_account_ready() {
+  local u="$1"
+  local appdir="$2"
+  local shell=""
+  if [ -x /usr/sbin/nologin ]; then shell="/usr/sbin/nologin"
+  elif [ -x /sbin/nologin ]; then shell="/sbin/nologin"
+  else shell="/bin/false"
+  fi
+  if ! id "$u" >/dev/null 2>&1; then
+    set +e
+    if command -v groupadd >/dev/null 2>&1; then
+      sudo groupadd --system "$u" >/dev/null 2>&1 || true
+    fi
+    if command -v useradd >/dev/null 2>&1; then
+      sudo useradd --system --no-create-home --home-dir "$appdir" --shell "$shell" --gid "$u" "$u" >/dev/null 2>&1 || \
+      sudo useradd --system --no-create-home --home-dir "$appdir" --shell "$shell" "$u" >/dev/null 2>&1 || true
+    elif command -v adduser >/dev/null 2>&1; then
+      sudo adduser -S -H -h "$appdir" -s "$shell" "$u" >/dev/null 2>&1 || true
+    fi
+    set -e
+  fi
+  if ! id "$u" >/dev/null 2>&1; then
+    _die "Could not create service account '${u}'. Create it manually then rerun."
+  fi
+  SERVICE_ACCOUNT_GROUP="$(id -gn "$u" 2>/dev/null || echo "$u")"
+}
+
+_git_run_as_service() {
+  local appdir="$1"; shift
+  local u="${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
+  local g="${SERVICE_ACCOUNT_GROUP:-$u}"
+  if [ -d "$appdir" ]; then
+    sudo chown -R "${u}:${g}" "$appdir" 2>/dev/null || true
+  fi
+  sudo -H -u "$u" git -c safe.directory="$appdir" -C "$appdir" "$@"
 }
 
 # --- Package install wrappers (used by _run_with_spinner for multi-word globals)
@@ -3551,8 +3589,9 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
   else _warn "psql client not installed — skipping DB credential SELECT 1 pre-validate"; fi
 
   _section "Prepare app directory: $APP_DIR"
+  _ensure_service_account_ready "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}" "$APP_DIR"
   sudo mkdir -p "$APP_DIR"
-  sudo chown "$(id -u):$(id -g)" "$APP_DIR" 2>/dev/null || true
+  sudo chown "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}:${SERVICE_ACCOUNT_GROUP:-${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}}" "$APP_DIR" 2>/dev/null || true
   if [ ! -d "${APP_DIR}/.git" ]; then
     if [ -n "$(ls -A "$APP_DIR" 2>/dev/null | head -n1)" ]; then
       local do_over=""
@@ -3568,12 +3607,12 @@ breaks too many pinned sdists (PyWeakref_GetObject symbol removed). What to do:
       _die "$APP_DIR is still not empty after wipe attempt. Remove contents manually and try again."
     fi
     _info "Running git clone (branch=$GIT_BRANCH, depth=1) — spinner shows activity during clone; token redacted from final stdout."
-    _run_with_spinner "git clone branch=$GIT_BRANCH depth=1 into $APP_DIR" bash -c "git clone -b '$GIT_BRANCH' --depth 1 '$GIT_URL' '$APP_DIR'" || \
+    _run_with_spinner "git clone branch=$GIT_BRANCH depth=1 into $APP_DIR" sudo -H -u "${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}" git clone -b "$GIT_BRANCH" --depth 1 "$GIT_URL" "$APP_DIR" || \
       _die "git clone FAILED (rc=$?). See /tmp/rasyatone_spin_*.log for the exact git error. Common causes: (1) private repo PAT expired — rerun, wizard will get a NEW token; (2) branch '$GIT_BRANCH' does not exist — re-check; (3) DNS/network to github.com down."
   else
     _ok "App dir already has .git — fetching latest origin/$GIT_BRANCH instead of fresh clone"
-    _run_with_spinner "git fetch depth=1 origin/$GIT_BRANCH" bash -c "git -C '$APP_DIR' fetch --depth 1 origin '$GIT_BRANCH' || true" || true
-    _run_with_spinner "git reset --hard origin/$GIT_BRANCH" bash -c "git -C '$APP_DIR' reset --hard 'origin/$GIT_BRANCH'" || \
+    _run_with_spinner "git fetch depth=1 origin/$GIT_BRANCH" _git_run_as_service "$APP_DIR" fetch --depth 1 origin "$GIT_BRANCH" || true
+    _run_with_spinner "git reset --hard origin/$GIT_BRANCH" _git_run_as_service "$APP_DIR" reset --hard "origin/$GIT_BRANCH" || \
       _die "git reset --hard origin/$GIT_BRANCH FAILED. Manual intervention: cd $APP_DIR ; git status ; git stash ; git reset --hard HEAD"
   fi
   [ -d "$APP_DIR" ] || _die "App dir $APP_DIR missing after clone"
@@ -5628,34 +5667,9 @@ FULL migrate bash -c env (for debugging leaks):
 
   if command -v systemctl >/dev/null 2>&1; then
     local _svc_user="${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
-    local _svc_group=""
-    local _svc_shell=""
-    if [ -x /usr/sbin/nologin ]; then _svc_shell="/usr/sbin/nologin"
-    elif [ -x /sbin/nologin ]; then _svc_shell="/sbin/nologin"
-    else _svc_shell="/bin/false"
-    fi
-    if id "${_svc_user}" >/dev/null 2>&1; then
-      _svc_group="$(id -gn "${_svc_user}" 2>/dev/null || echo "${_svc_user}")"
-      _ok "Service account exists: ${_svc_user} (group=${_svc_group})"
-    else
-      _section "Create service account: ${_svc_user}"
-      set +e
-      if command -v groupadd >/dev/null 2>&1; then
-        sudo groupadd --system "${_svc_user}" >/dev/null 2>&1 || true
-      fi
-      if command -v useradd >/dev/null 2>&1; then
-        sudo useradd --system --no-create-home --home-dir "${APP_DIR}" --shell "${_svc_shell}" --gid "${_svc_user}" "${_svc_user}" >/dev/null 2>&1 || \
-        sudo useradd --system --no-create-home --home-dir "${APP_DIR}" --shell "${_svc_shell}" "${_svc_user}" >/dev/null 2>&1 || true
-      elif command -v adduser >/dev/null 2>&1; then
-        sudo adduser -S -H -h "${APP_DIR}" -s "${_svc_shell}" "${_svc_user}" >/dev/null 2>&1 || true
-      fi
-      set -e
-      if ! id "${_svc_user}" >/dev/null 2>&1; then
-        _die "Could not create service account '${_svc_user}'. Create it manually then rerun Option 4."
-      fi
-      _svc_group="$(id -gn "${_svc_user}" 2>/dev/null || echo "${_svc_user}")"
-      _ok "Service account created: ${_svc_user} (group=${_svc_group})"
-    fi
+    _ensure_service_account_ready "${_svc_user}" "$APP_DIR"
+    local _svc_group="${SERVICE_ACCOUNT_GROUP:-${_svc_user}}"
+    _ok "Service account: ${_svc_user} (group=${_svc_group})"
     _run_with_spinner "Chown APP_DIR to service account (${_svc_user})" sudo chown -R "${_svc_user}:${_svc_group}" "$APP_DIR" || true
     if [ -f "$ENV_FILE" ]; then
       sudo chown "root:${_svc_group}" "$ENV_FILE" 2>/dev/null || true
