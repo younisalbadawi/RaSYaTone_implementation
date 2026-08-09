@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T1500-nonnullable-hardstop"
+SCRIPT_VERSION_BUILD="2026-08-06T1530-live-migrate-progress"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -714,7 +714,7 @@ _run_migrate_autoheal() {
         "${_rma_base_env} manage.py migrate '${_rma_label}'"
       _rma_rc=$?
     else
-      _run_with_spinner "(autoheal round $_rma_round) manage.py migrate (all apps)" bash -c \
+      _run_with_progress "(autoheal round $_rma_round) manage.py migrate (all apps)" bash -c \
         "${_rma_base_env} manage.py migrate"
       _rma_rc=$?
     fi
@@ -1910,6 +1910,37 @@ _run_with_spinner() {
   fi
   # restore cursor explicitly (trap also fires but belt+braces)
   printf '\033[?25h' >/dev/tty 2>/dev/null || true
+  return "$rc"
+}
+
+_run_with_progress() {
+  local label="$1"; shift
+  local logfile="/tmp/rasyatone_spin_$$_$(printf '%s' "$label" | tr -c 'A-Za-z0-9_' '_' | cut -c1-40).log"
+  : > "$logfile" 2>/dev/null || true
+  _spinner_setup_trap
+  local tty_on=1
+  [ -t 1 ] 2>/dev/null || tty_on=0
+  local st et secs rc
+  st=$(date +%s 2>/dev/null || echo 0)
+  if [ "$tty_on" -eq 0 ]; then
+    "$@" >"$logfile" 2>&1
+    rc=$?
+  else
+    printf "  \033[96m>\033[0m %s\n" "$label" >&2
+    set +e
+    ( "$@" ) 2>&1 | tee "$logfile"
+    rc=$?
+    set -e
+  fi
+  et=$(date +%s 2>/dev/null || echo 0)
+  secs=$((et - st)); [ "$secs" -lt 0 ] && secs=0
+  if [ "$rc" -eq 0 ]; then
+    _ok "${label} (elapsed $(_human_elapsed "$secs"))"
+  else
+    _nok "${label} FAILED (rc=${rc}, elapsed $(_human_elapsed "$secs")). Log: ${logfile}. Last 30 lines:"
+    tail -n 30 "$logfile" 2>/dev/null | sed 's/^/    | /' || true
+    printf "    Full log: \033[1m%s\033[0m\n" "$logfile" >&2
+  fi
   return "$rc"
 }
 
