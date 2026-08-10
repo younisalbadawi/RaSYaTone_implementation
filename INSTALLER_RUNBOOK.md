@@ -44,6 +44,7 @@ bash install.sh --precheck-db
 bash install.sh --precheck-app
 bash install.sh --install-db
 bash install.sh --install-app
+bash install.sh --upgrade-app
 ```
   
 ### Diagnostic Mode (no changes)
@@ -272,6 +273,15 @@ Recommended approach for upgrades:
    - systemd service is healthy
    - Nginx config is valid and reloaded
    - HTTPS is still valid (if enabled)
+
+Alternative (admin-focused) upgrade path:
+
+1. Run the dedicated upgrade option (interactive menu Option 5, or `--upgrade-app`).
+2. Confirm/edit the loaded settings from the env file when prompted.
+3. Validate:
+   - `systemctl status <service> --no-pager`
+   - `journalctl -u <service> -n 200 --no-pager`
+   - `curl -Ik https://<domain>/` (if Nginx+TLS is enabled)
   
 If an upgrade includes DB schema changes:
 - Confirm `makemigrations` is already done in CI/dev and committed.

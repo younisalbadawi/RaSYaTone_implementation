@@ -7,6 +7,7 @@
 #   2) PRE-CHECK App install prerequisites
 #   3) Install PostgreSQL database
 #   4) Install RaSYaTone application server
+#   5) Upgrade/Update RaSYaTone application server
 #   Q) Quit
 #
 # Tested package managers: apt (Debian/Ubuntu/Raspbian), dnf (RHEL/Rocky/Alma/Fedora), apk (Alpine)
@@ -16,9 +17,10 @@
 #   bash install.sh --precheck-app    # run option 2, exit with precheck rc
 #   bash install.sh --install-db      # run option 3 interactive prompts then exit
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
+#   bash install.sh --upgrade-app     # run option 5 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T2300-nginx-proxy-buffers"
+SCRIPT_VERSION_BUILD="2026-08-10T-upgrade-option"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -6191,6 +6193,129 @@ FULL migrate bash -c env (for debugging leaks):
   printf "\nDone.\n"
 }
 
+upgrade_app() {
+  _section "Upgrade/Update RaSYaTone Application Server"
+  detect_pm
+  load_env_file
+  _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
+  set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+
+  prompt_edit_multiple \
+    "Upgrade settings (loaded from ENV_FILE). Edit fields if needed before upgrade:" \
+    "APP_DIR GIT_URL GIT_BRANCH SERVICE_NAME SERVICE_ACCOUNT DJANGO_SETTINGS_MODULE GUNICORN_BIND DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT" \
+    "Proceed with upgrade now?" \
+    "y"
+
+  _sanitize_env_file_circular_sentinels "$ENV_FILE" 2>/dev/null || true
+  set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
+
+  export APP_DIR="${APP_DIR:-$DEF_APP_DIR}"
+  export GIT_BRANCH="${GIT_BRANCH:-$DEF_GIT_BRANCH}"
+  export SERVICE_NAME="${SERVICE_NAME:-$DEF_SERVICE}"
+  export SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-$DEF_SERVICE_ACCOUNT}"
+  export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-$DEF_DJANGO_SETTINGS_MODULE}"
+  export GUNICORN_BIND="${GUNICORN_BIND:-$DEF_GUNICORN_BIND}"
+
+  [ -d "${APP_DIR}/.git" ] || _die "Upgrade requires an existing git clone at APP_DIR=${APP_DIR}. No ${APP_DIR}/.git found. Run Option 4 (Install app) first."
+
+  _ensure_service_account_ready "${SERVICE_ACCOUNT}" "$APP_DIR"
+
+  local before_rev=""
+  before_rev=$(_git_run_as_service "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+  _section "Update source code from origin/${GIT_BRANCH}"
+  _run_with_spinner "git fetch depth=1 origin/$GIT_BRANCH" _git_run_as_service "$APP_DIR" fetch --depth 1 origin "$GIT_BRANCH" || true
+  _run_with_spinner "git reset --hard origin/$GIT_BRANCH" _git_run_as_service "$APP_DIR" reset --hard "origin/$GIT_BRANCH" || \
+    _die "git reset --hard origin/$GIT_BRANCH FAILED. Manual intervention: cd $APP_DIR ; git status ; git stash ; git reset --hard HEAD"
+
+  local after_rev=""
+  after_rev=$(_git_run_as_service "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+  _ok "Git updated: ${before_rev} -> ${after_rev} (branch=${GIT_BRANCH})"
+
+  _section "Update Python virtualenv + dependencies"
+  _install_compatible_python_runtime || true
+  _detect_compatible_python3 2>/dev/null || true
+  if [ -z "${PYTHON_BIN:-}" ]; then
+    if command -v python3 >/dev/null 2>&1; then PYTHON_BIN="$(command -v python3)"; fi
+  fi
+  [ -n "${PYTHON_BIN:-}" ] || _die "Could not detect a usable python3 on this server. Run Option 4 to install a compatible Python runtime."
+
+  if [ ! -x "${APP_DIR}/.venv/bin/python" ]; then
+    _validate_and_bootstrap_py_venv_pip "$PYTHON_BIN" || true
+    _run_with_spinner "Create venv: ${APP_DIR}/.venv (PYTHON_BIN=${PYTHON_BIN##*/})" bash -c "'$PYTHON_BIN' -m venv '$APP_DIR/.venv'" || \
+      _die "Failed to create venv at ${APP_DIR}/.venv. Run Option 4 to rebuild the environment."
+  fi
+
+  local venv_bin="${APP_DIR}/.venv/bin"
+  local active_py="${venv_bin}/python"
+  [ -x "$active_py" ] || _die "Venv python missing at $active_py. Run Option 4 to rebuild the environment."
+  set +u
+  . "${APP_DIR}/.venv/bin/activate" 2>/dev/null || true
+  set -u
+  case ":$PATH:" in
+    *":$venv_bin:"*) : ;;
+    *) export PATH="$venv_bin:$PATH" ;;
+  esac
+  export VIRTUAL_ENV="${VIRTUAL_ENV:-${APP_DIR}/.venv}"
+
+  _run_with_spinner "pip upgrade (pip+setuptools+wheel in venv)" bash -c "python -m pip install --quiet --upgrade pip setuptools wheel" || \
+    _die "pip upgrade failed inside venv. Run Option 4 to diagnose and auto-heal python/venv issues."
+
+  if [ -f "${APP_DIR}/requirements.txt" ]; then
+    local pip_log="/tmp/rasyatone_pip_upgrade_$$.log"
+    : >"$pip_log" 2>/dev/null || true
+    set +e
+    _run_with_spinner "pip install -r requirements.txt" bash -c "python -m pip install -r '${APP_DIR}/requirements.txt' >'$pip_log' 2>&1"
+    local prc=$?
+    set -e
+    if [ "$prc" -ne 0 ]; then
+      _nok "pip install FAILED (rc=$prc). Last 60 lines:"
+      tail -n 60 "$pip_log" 2>/dev/null | sed 's/^/  /' >&2 || true
+      _die "Upgrade aborted due to pip install failure. Full log: $pip_log"
+    fi
+    _ok "pip install requirements.txt OK"
+  else
+    _warn "No ${APP_DIR}/requirements.txt found — skipping pip install -r"
+  fi
+
+  _section "Run Django collectstatic + migrate"
+  local base_env=""
+  base_env="cd '$APP_DIR' && PYTHONPATH='$APP_DIR' DJANGO_SETTINGS_MODULE='${DJANGO_SETTINGS_MODULE}' '$APP_DIR/.venv/bin/python'"
+
+  set +e
+  _run_with_spinner "manage.py collectstatic --noinput" bash -c "${base_env} manage.py collectstatic --noinput >/dev/null 2>&1" || true
+  set -e
+
+  local mig_rc=0
+  set +e
+  _run_migrate_autoheal "$APP_DIR" "${DJANGO_SETTINGS_MODULE}" "$APP_DIR/.venv/bin/python" "${base_env}" "" || mig_rc=$?
+  set -e
+  [ "$mig_rc" -eq 0 ] || _die "manage.py migrate FAILED during upgrade (rc=$mig_rc). Fix the underlying issue and rerun Option 5."
+
+  if command -v systemctl >/dev/null 2>&1; then
+    _section "Restart application service: ${SERVICE_NAME}"
+    _run_with_spinner "systemctl restart ${SERVICE_NAME}" sudo systemctl restart "${SERVICE_NAME}" || true
+    sudo systemctl is-active "${SERVICE_NAME}" >/dev/null 2>&1 && _ok "${SERVICE_NAME} is active" || _warn "${SERVICE_NAME} is not active (check: systemctl status ${SERVICE_NAME})"
+  else
+    _warn "systemctl not available — skipping service restart. Restart gunicorn manually if applicable."
+  fi
+
+  local script_dir=""
+  script_dir="$(cd "$(dirname "$0")" && pwd -P 2>/dev/null || pwd)"
+  local report_log="${script_dir}/rasyatone_post_install_summary.log"
+  {
+    printf "\n=== RaSYaTone app UPGRADE SUMMARY ===\n"
+    printf "Timestamp: %s\n" "$(date -Is 2>/dev/null || date 2>/dev/null || echo unknown)"
+    printf "APP_DIR: %s\n" "$APP_DIR"
+    printf "SERVICE: %s\n" "$SERVICE_NAME"
+    printf "Branch: %s\n" "$GIT_BRANCH"
+    printf "Git: %s -> %s\n" "$before_rev" "$after_rev"
+  } | sudo tee -a "$report_log" >/dev/null 2>/dev/null || true
+  sudo chmod 0644 "$report_log" 2>/dev/null || true
+  _ok "Upgrade summary appended: $report_log"
+  printf "\nDone.\n"
+}
+
 doctor_report() {
   load_env_file >/dev/null 2>&1 || true
   detect_pm >/dev/null 2>&1 || true
@@ -6298,9 +6423,10 @@ main_menu() {
     printf "  2) PRE-CHECK App install prerequisites (12 checks BEFORE installing RaSYaTone app)\n"
     printf "  3) Install PostgreSQL database\n"
     printf "  4) Install RaSYaTone application server\n"
+    printf "  5) Upgrade/Update RaSYaTone application server\n"
     printf "  Q) Quit\n"
     local choice=""
-    printf "\nChoose [1/2/3/4/Q]: "
+    printf "\nChoose [1/2/3/4/5/Q]: "
     IFS= read -r choice || choice=""
     case "$choice" in
       1) if precheck_db_prereqs; then
@@ -6333,6 +6459,8 @@ main_menu() {
            fi
          fi
          install_app ;;
+      5) _section "Option 5 — Upgrade/Update RaSYaTone application server"
+         upgrade_app ;;
       q|Q|"") echo "Quit."; exit 0 ;;
       *)   printf "Unknown choice: %s. Try again.\n" "$choice" ;;
     esac
@@ -6344,6 +6472,8 @@ if [ "${1:-}" = "--install-db" ]; then
   install_db; exit 0
 elif [ "${1:-}" = "--install-app" ]; then
   install_app; exit 0
+elif [ "${1:-}" = "--upgrade-app" ]; then
+  upgrade_app; exit 0
 elif [ "${1:-}" = "--precheck-db" ]; then
   precheck_db_prereqs; exit $?
 elif [ "${1:-}" = "--precheck-app" ]; then
@@ -6351,7 +6481,7 @@ elif [ "${1:-}" = "--precheck-app" ]; then
 elif [ "${1:-}" = "--doctor" ]; then
   doctor_report; exit 0
 elif [ -n "${1:-}" ]; then
-  _die "Unknown arg: $1 (use no args for interactive menu, or --precheck-db | --precheck-app | --install-db | --install-app | --doctor)"
+  _die "Unknown arg: $1 (use no args for interactive menu, or --precheck-db | --precheck-app | --install-db | --install-app | --upgrade-app | --doctor)"
 else
   main_menu
 fi
