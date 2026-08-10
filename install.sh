@@ -18,7 +18,7 @@
 #   bash install.sh --install-app     # run option 4 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-06T2230-optional-prompts"
+SCRIPT_VERSION_BUILD="2026-08-06T2300-nginx-proxy-buffers"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -5838,6 +5838,11 @@ FULL migrate bash -c env (for debugging leaks):
       "  client_max_body_size 50m;" \
       "  location / {" \
       "    proxy_pass ${_nginx_upstream};" \
+      "    proxy_buffer_size 16k;" \
+      "    proxy_buffers 8 16k;" \
+      "    proxy_busy_buffers_size 32k;" \
+      "    proxy_read_timeout 120s;" \
+      "    proxy_send_timeout 120s;" \
       "    proxy_set_header Host \$host;" \
       "    proxy_set_header X-Real-IP \$remote_addr;" \
       "    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;" \
