@@ -20,7 +20,7 @@
 #   bash install.sh --upgrade-app     # run option 5 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-10T-upgrade-option"
+SCRIPT_VERSION_BUILD="2026-08-10T-upgrade-option-piplog"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -6265,12 +6265,40 @@ upgrade_app() {
     local pip_log="/tmp/rasyatone_pip_upgrade_$$.log"
     : >"$pip_log" 2>/dev/null || true
     set +e
-    _run_with_spinner "pip install -r requirements.txt" bash -c "python -m pip install -r '${APP_DIR}/requirements.txt' >'$pip_log' 2>&1"
+    _run_with_spinner "pip install -r requirements.txt (log: $pip_log)" bash -c "python -m pip install -r '${APP_DIR}/requirements.txt' >'$pip_log' 2>&1"
     local prc=$?
     set -e
     if [ "$prc" -ne 0 ]; then
-      _nok "pip install FAILED (rc=$prc). Last 60 lines:"
-      tail -n 60 "$pip_log" 2>/dev/null | sed 's/^/  /' >&2 || true
+      _nok "pip install FAILED (rc=$prc). Evidence follows (primary log: $pip_log)."
+      local pip_sz=0
+      pip_sz=$(wc -c <"$pip_log" 2>/dev/null | tr -d '[:space:]' || echo 0)
+      if [ "${pip_sz:-0}" -gt 0 ] 2>/dev/null; then
+        printf "  pip_log_size=%s bytes\n" "$pip_sz" >&2
+        tail -n 80 "$pip_log" 2>/dev/null | sed 's/^/  /' >&2 || true
+      else
+        _warn "pip log is EMPTY (size=0). Capturing additional evidence from the most recent spinner log and a verbose re-run log."
+        local pip_spin_log=""
+        local _gl=""
+        for _gl in $(ls -1t /tmp/rasyatone_spin_*_*pip_install* 2>/dev/null | head -n 6); do
+          [ -f "$_gl" ] || continue
+          pip_spin_log="$_gl"
+          break
+        done
+        if [ -n "${pip_spin_log:-}" ] && [ -f "${pip_spin_log:-}" ]; then
+          printf "  spinner_log=%s (size=%s bytes)\n" "$pip_spin_log" "$(wc -c <"$pip_spin_log" 2>/dev/null | tr -d '[:space:]' || echo 0)" >&2
+          tail -n 80 "$pip_spin_log" 2>/dev/null | sed 's/^/  /' >&2 || true
+        else
+          printf "  (no spinner log found matching /tmp/rasyatone_spin_*pip_install*)\n" >&2
+        fi
+        local pip_log2="/tmp/rasyatone_pip_upgrade_rerun_$$.log"
+        : >"$pip_log2" 2>/dev/null || true
+        set +e
+        bash -c "python -m pip -vvv install -r '${APP_DIR}/requirements.txt' >'$pip_log2' 2>&1" || true
+        set -e
+        printf "  verbose_rerun_log=%s (size=%s bytes)\n" "$pip_log2" "$(wc -c <"$pip_log2" 2>/dev/null | tr -d '[:space:]' || echo 0)" >&2
+        tail -n 120 "$pip_log2" 2>/dev/null | sed 's/^/  /' >&2 || true
+        _die "Upgrade aborted due to pip install failure. Logs: $pip_log (primary), ${pip_spin_log:-<none>} (spinner), $pip_log2 (verbose rerun)."
+      fi
       _die "Upgrade aborted due to pip install failure. Full log: $pip_log"
     fi
     _ok "pip install requirements.txt OK"
