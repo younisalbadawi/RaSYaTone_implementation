@@ -20,7 +20,7 @@
 #   bash install.sh --upgrade-app     # run option 5 interactive prompts then exit
 #
 # --- VERSION STAMP (server copy cross-check: run: grep 'SCRIPT_VERSION_BUILD=' install.sh) ---
-SCRIPT_VERSION_BUILD="2026-08-10T-upgrade-option-piplog"
+SCRIPT_VERSION_BUILD="2026-08-10T-upgrade-option-piplog-winfilter"
 EXPECTED_VERSION_MARKER="$SCRIPT_VERSION_BUILD"
 
 # --- BANNER: runs FIRST, before set -e, before any logic, impossible to miss.
@@ -6262,10 +6262,70 @@ upgrade_app() {
     _die "pip upgrade failed inside venv. Run Option 4 to diagnose and auto-heal python/venv issues."
 
   if [ -f "${APP_DIR}/requirements.txt" ]; then
+    _filter_linux_requirements_for_upgrade() {
+      local src="$1" dst="$2" skipped="" pkg="" line="" stripped=""
+      local -a WIN_ONLY_PKGS=(
+        pywin32 pypiwin32 "pywin32-ctypes"
+        windows-curses win-unicode-console
+        colorama wmi pywinauto pyad
+        comtypes pyttsx3 pywinrm win32core win32ctypes
+      )
+      : >"$dst"
+      while IFS= read -r line || [ -n "$line" ]; do
+        stripped="$(printf '%s' "$line" | sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+        if [ -z "$stripped" ] || [[ "$line" == \#* ]]; then
+          printf '%s\n' "$line" >>"$dst"
+          continue
+        fi
+        local matched=0
+        for pkg in "${WIN_ONLY_PKGS[@]}"; do
+          if printf '%s' "$stripped" | grep -Ei "^${pkg}([\[\=<>~!\ ]|$)" >/dev/null 2>&1; then
+            matched=1
+            break
+          fi
+        done
+        if [ "$matched" -eq 1 ]; then
+          if [ -z "$skipped" ]; then skipped="$line"; else skipped="${skipped}|${line}"; fi
+        else
+          printf '%s\n' "$line" >>"$dst"
+        fi
+      done <"$src"
+      printf '%s' "$skipped"
+    }
+
+    local req_src="${APP_DIR}/requirements.txt"
+    local req_filtered="${APP_DIR}/requirements.linux-filtered.txt"
+    local req_bak="${APP_DIR}/requirements.txt.bak"
+    local skipped_lines="" dropped_count=0
+    if ! cp -f "$req_src" "$req_bak" 2>/dev/null; then
+      req_bak=""
+    fi
+    skipped_lines="$(_filter_linux_requirements_for_upgrade "$req_src" "$req_filtered")"
+    if [ -n "$skipped_lines" ]; then
+      local IFS_SAVE="$IFS"
+      IFS='|'
+      local -a drops=( $skipped_lines )
+      IFS="$IFS_SAVE"
+      dropped_count="${#drops[@]}"
+      _warn "requirements.txt contains ${dropped_count} WINDOWS-ONLY pinned packages that have NO Linux wheels. Using filtered copy for install."
+      local dl
+      for dl in "${drops[@]}"; do
+        printf "  - %s\n" "$dl" >&2
+      done
+      _info "Original backed up to: ${req_bak:-<backup unavailable>}  Filtered copy: $req_filtered"
+    fi
+
     local pip_log="/tmp/rasyatone_pip_upgrade_$$.log"
     : >"$pip_log" 2>/dev/null || true
     set +e
-    _run_with_spinner "pip install -r requirements.txt (log: $pip_log)" bash -c "python -m pip install -r '${APP_DIR}/requirements.txt' >'$pip_log' 2>&1"
+    local req_label=""
+    if [ "$dropped_count" -gt 0 ]; then
+      req_label="pip install -r requirements.linux-filtered.txt (${dropped_count} Windows deps removed) (log: $pip_log)"
+      _run_with_spinner "$req_label" bash -c "python -m pip install -r '$req_filtered' >'$pip_log' 2>&1"
+    else
+      req_label="pip install -r requirements.txt (log: $pip_log)"
+      _run_with_spinner "$req_label" bash -c "python -m pip install -r '$req_src' >'$pip_log' 2>&1"
+    fi
     local prc=$?
     set -e
     if [ "$prc" -ne 0 ]; then
